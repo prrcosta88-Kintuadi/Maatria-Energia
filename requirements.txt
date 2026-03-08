@@ -7,12 +7,4 @@ plotly>=5.17.0
 matplotlib>=3.7.0
 scipy>=1.11.0
 openpyxl>=3.1.0
-<<<<<<< HEAD
-<<<<<<< HEAD
 duckdb>=1.0.0
-=======
-duckdb>=1.0.0
->>>>>>> 48a05742d9eb08ed8b387ae5cc7ad5f37297048e
-=======
-duckdb>=1.0.0
->>>>>>> e34fb27402e5dd39744c06e22cb75b27693d7ce2
