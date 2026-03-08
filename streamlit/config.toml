@@ -1,0 +1,60 @@
+[theme]
+base = "dark"
+primaryColor = "forestGreen"
+font = "sans serif"
+
+[theme.sidebar]
+primaryColor="darkGoldrod"
+
+[server]
+maxUploadSize = 1000
+
+[browser]
+gatherUsageStats = false
+
+# ===============================
+# CUSTOM CSS VIA TOML
+# ===============================
+
+[client]
+# Isso será interpretado pelo Streamlit
+
+[custom_css]
+# ===============================
+# GLOBAL STYLES
+# ===============================
+base = "dark"
+global_background = "#020617"
+global_text_color = "#e5e7eb"
+sidebar_background = "#020f2a"
+topbar_background = "#020f2a"
+
+# ===============================
+# FONT SIZES
+# ===============================
+h1_size = "1.8rem"
+h3_size = "1.3rem"
+metric_label_size = "1rem"
+metric_value_size = "1.8rem"
+card_title_size = "1.1rem"
+section_title_size = "1.4rem"
+
+# ===============================
+# COLORS
+# ===============================
+success_color = "#22c55e"
+warning_color = "#f59e0b"
+critical_color = "#ef4444"
+info_color = "#3b82f6"
+kpi_gradient_start = "#38bdf8"
+kpi_gradient_end = "#0ea5e9"
+
+# ===============================
+# BORDERS AND SHADOWS
+# ===============================
+card_border_radius = "10px"
+card_border_color = "rgba(255,255,255,0.08)"
+card_success_border = "#22c55e"
+card_warning_border = "#f59e0b"
+card_critical_border = "#ef4444"
+card_info_border = "#3b82f6"

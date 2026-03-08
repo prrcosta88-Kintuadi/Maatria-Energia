@@ -1,0 +1,36 @@
+name: Decompress 7z File
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '**.7z'
+
+jobs:
+  decompress:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Install 7zip
+        run: sudo apt-get install -y p7zip-full
+      
+      - name: Decompress 7z file
+        run: |
+          # Encontra o arquivo .7z
+          for file in $(find . -name "*.7z" -type f); do
+            echo "Descompactando: $file"
+            7z x "$file" -o"data/"
+          done
+      
+      - name: Remove 7z file
+        run: find . -name "*.7z" -type f -delete
+      
+      - name: Commit decompressed file
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add data/core_analysis_latest.json
+          git remove --cached "*.7z" || true
+          git commit -m "Decompress JSON file" || echo "No changes"
+          git push
