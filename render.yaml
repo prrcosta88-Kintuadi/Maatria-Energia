@@ -1,16 +1,270 @@
-# render.yaml - NA RAIZ DO PROJETO
+# render.yaml - Configuração otimizada para Render.com
+#
+# Deploy: git push (auto-deploy ativo)
+# Monitorar: https://dashboard.render.com/
+#
+# Plano recomendado: Standard (512MB RAM) ou Pro (2GB RAM)
+# Plano mínimo: Free (pode dar timeout com 410MB JSON)
+
 services:
   - type: web
     name: kintuadi-energy
+    
+    # ========================================================================
+    # CONFIGURAÇÕES BÁSICAS
+    # ========================================================================
+    
     env: docker
-    dockerfilePath: ./Dockerfile
-    plan: free
+    dockerfilePath: ./Dockerfile.optimized
+    
+    # Plano de preço
+    # - free: 0.5GB RAM (⚠️ arriscado com 410MB JSON)
+    # - standard: 512MB RAM (✅ RECOMENDADO)
+    # - pro: 2GB RAM (✅ MELHOR)
+    plan: standard
+    
+    # Auto-build e deploy quando faz git push
+    autoDeploy: true
+    
+    # Branch para fazer deploy (padrão: main)
+    branch: main
+    
+    
+    # ========================================================================
+    # RESOURCE LIMITS (Importante!)
+    # ========================================================================
+    
+    # Timeout para inicialização do app
+    # Padrão: 30s (pode não ser suficiente com 410MB)
+    # Aumentar para 60-90s é seguro
+    
+    # Memória RAM alocada (default 512MB para standard)
+    # Pode deixar como default ou aumentar se tiver orçamento
+    
+    
+    # ========================================================================
+    # HEALTH CHECK (Crítico!)
+    # ========================================================================
+    
+    # Render verifica esse endpoint periodicamente
+    # Se falhar, tenta restart do container
     healthCheckPath: /_stcore/health
+    
+    # Intervalo entre health checks (segundos)
+    healthCheckInterval: 30
+    
+    # Timeout para responder (segundos)
+    healthCheckTimeout: 10
+    
+    # Aguarda esse tempo antes do primeiro health check
+    # IMPORTANTE: Aumentar para 60s (tempo de descompactar JSON)
+    startPeriod: 60
+    
+    # Número de falhas antes de restart
+    retries: 3
+    
+    
+    # ========================================================================
+    # BUILD COMMAND (Customizado)
+    # ========================================================================
+    
+    # Executado antes do Docker build
+    # Útil para validações, cleanup, etc.
+    
+    buildCommand: |
+      echo "🔍 Validando arquivo JSON gzip..."
+      if [ ! -f "core_analysis_latest.json.gz" ]; then
+        echo "❌ ERRO: core_analysis_latest.json.gz não encontrado!"
+        echo "Por favor, faça upload do arquivo antes de fazer push"
+        exit 1
+      fi
+      
+      echo "✅ Arquivo encontrado"
+      ls -lh core_analysis_latest.json.gz
+      
+      echo "💡 Dica: Este arquivo será descompactado durante o Docker build"
+      echo "   (Leva ~30-60 segundos, mas só acontece uma vez)"
+    
+    
+    # ========================================================================
+    # START COMMAND (Customizado)
+    # ========================================================================
+    
+    # Comando executado para iniciar o app
+    # Pode adicionar flags adicionais aqui
+    
+    startCommand: streamlit run app.py --logger.level=warning --client.showErrorDetails=false
+    
+    
+    # ========================================================================
+    # VARIÁVEIS DE AMBIENTE
+    # ========================================================================
+    
     envVars:
+      # Streamlit - Obrigatório
       - key: STREAMLIT_SERVER_PORT
-        value: 8501
+        value: "8501"
+      
       - key: STREAMLIT_SERVER_ADDRESS
-        value: 0.0.0.0
+        value: "0.0.0.0"
+      
+      - key: STREAMLIT_SERVER_HEADLESS
+        value: "true"
+      
+      - key: STREAMLIT_SERVER_ENABLEXSRFPROTECTION
+        value: "false"
+      
+      # Performance
+      - key: STREAMLIT_LOGGER_LEVEL
+        value: "warning"
+      
+      - key: STREAMLIT_CLIENT_SHOWERRORDETAILS
+        value: "false"
+      
       - key: PYTHONUNBUFFERED
-        value: 1
-    autoDeploy: true  # Deploy automático ao fazer push no GitHub
+        value: "1"
+      
+      # App-specific
+      - key: APP_ENV
+        value: "production"
+      
+      # Cache
+      - key: STREAMLIT_CACHE_TTLSECONDS
+        value: "3600"
+      
+      # Se precisar de credenciais ONS (NUNCA commitar no Git!)
+      # - key: ONS_USERNAME
+      #   sync: false  # ← Significa: não puxar do Git, configurar manualmente
+      # 
+      # - key: ONS_PASSWORD
+      #   sync: false
+      # 
+      # Configure essas variáveis no dashboard: https://dashboard.render.com/
+    
+    
+    # ========================================================================
+    # RECURSOS & PERFORMANCE
+    # ========================================================================
+    
+    # Render oferece opcionalmente:
+    # - Aumento de memória
+    # - CPU dedicada
+    # - Disk permanente
+    
+    # Para seu caso, Standard é suficiente
+    # Se precisar de mais performance depois, pode upgradear
+    
+    # ========================================================================
+    # VOLUMES (Persistent Disk - Opcional)
+    # ========================================================================
+    
+    # Se quiser GUARDAR dados entre deploys (logs, dados baixados)
+    # Descomente isso:
+    
+    # mounts:
+    #   - path: /app/data
+    #     mountPath: /app/data
+    #   
+    #   - path: /app/logs
+    #     mountPath: /app/logs
+    
+    # ⚠️  OBS: Você provavelmente NÃO quer isso, porque:
+    # - JSON já vem no Docker build
+    # - Logs podem ficar enormes
+    # - Disk permanente custa extra
+    
+    
+    # ========================================================================
+    # NOTIFICATIONS (Opcional)
+    # ========================================================================
+    
+    # Alertas quando build falha ou app fica down
+    # Configure no dashboard depois
+    
+    
+    # ========================================================================
+    # REDIRECTS (Opcional)
+    # ========================================================================
+    
+    # Se quiser redirecionar URLs customizadas
+    # Exemplo: redirecionar /analytics para /_stcore/analytics
+    
+    # routes: []
+    
+    
+# ============================================================================
+# DEPLOYMENT CHECKLIST
+# ============================================================================
+#
+# Antes de fazer git push:
+#
+# ☐ core_analysis_latest.json.gz está no root do projeto
+# ☐ Dockerfile.optimized está no root
+# ☐ requirements.txt está atualizado
+# ☐ Testou localmente: docker build -t kintuadi . && docker run -p 8501:8501 kintuadi
+# ☐ Conectou Render ao repositório GitHub
+# ☐ render.yaml está no root do projeto
+# ☐ Branch main está atualizada
+#
+# Depois de fazer git push:
+#
+# ☐ Acompanhar em https://dashboard.render.com/
+# ☐ Ver logs: Render Dashboard → Service Logs
+# ☐ Testar saúde: curl https://seu-dominio/_stcore/health
+# ☐ Testar app: https://seu-dominio
+#
+# Se der timeout (HTTP 502):
+#
+# ☐ Aumentar startPeriod de 60 para 90 segundos
+# ☐ Aumentar plano para Pro (2GB RAM)
+# ☐ Verificar tamanho do JSON (pode ser > 410MB?)
+# ☐ Considerar refatorar para Opção 4 (DuckDB + Parquet)
+#
+# ============================================================================
+
+# ============================================================================
+# TROUBLESHOOTING - ERROS COMUNS
+# ============================================================================
+#
+# Erro: "HTTP 502 Bad Gateway"
+# Causa: App não respondendo em 30s
+# Solução: Aumentar startPeriod, plano, ou usar DuckDB
+#
+# Erro: "Dockerfile not found"
+# Causa: dockerfilePath incorreto
+# Solução: Verificar caminho (./Dockerfile.optimized)
+#
+# Erro: "core_analysis_latest.json.gz not found"
+# Causa: Arquivo não versionado no Git
+# Solução: git add core_analysis_latest.json.gz && git commit && git push
+#
+# Erro: "No service available"
+# Causa: Build falhou silenciosamente
+# Solução: Ver logs do build no dashboard
+#
+# Erro: "Memory exceeded"
+# Causa: 410MB JSON + Streamlit > 512MB RAM
+# Solução: Aumentar para Pro (2GB) ou usar DuckDB (50MB)
+#
+# ============================================================================
+
+# ============================================================================
+# MONITORAMENTO PÓS-DEPLOY
+# ============================================================================
+#
+# Health Check Manual:
+# curl -v https://seu-dominio/_stcore/health
+#
+# Ver Logs em Tempo Real:
+# - Dashboard → Service → Logs
+# - Ou: tail -f render.log (se salvar logs)
+#
+# Monitorar Performance:
+# - Dashboard → Service → Metrics
+# - Ver CPU, memória, requests
+#
+# Backup de Dados:
+# - Se configurar volumes, fazer backup regularmente
+# - Render não faz backup automático de dados
+#
+# ============================================================================
