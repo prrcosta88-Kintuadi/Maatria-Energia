@@ -1,3 +1,18 @@
+---
+title: MAATria Energia
+emoji: ⚡
+colorFrom: yellow
+colorTo: purple
+sdk: gradio
+sdk_version: "4.44.0"
+python_version: "3.10"
+app_file: app.py
+pinned: false
+---
+
+# MAATria Energia
+
+Space para análise energética usando Kintuadi.
 # Kintuadi Energy v2
 
 Plataforma de coleta, integração e análise de dados do setor elétrico brasileiro
