@@ -311,6 +311,35 @@ def _ensure_hourly(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _latest_operational_dates(core: Dict[str, Any]) -> Dict[str, Optional[date]]:
+    oper = core.get("operacao", {}) if isinstance(core, dict) else {}
+
+    def _max_date_from_records(records: Any) -> Optional[date]:
+        if not isinstance(records, list) or not records:
+            return None
+        df = pd.DataFrame(records)
+        if "instante" not in df.columns:
+            return None
+        ts = pd.to_datetime(df["instante"], errors="coerce")
+        ts = ts.dropna()
+        if ts.empty:
+            return None
+        return ts.max().date()
+
+    load_records = ((oper.get("load", {}) or {}).get("sin", {}) or {}).get("serie", [])
+    load_day = _max_date_from_records(load_records)
+
+    generation = oper.get("generation", {}) or {}
+    gen_days = []
+    for payload in generation.values():
+        day = _max_date_from_records((payload or {}).get("serie", []))
+        if day is not None:
+            gen_days.append(day)
+    generation_day = max(gen_days) if gen_days else None
+
+    return {"load": load_day, "generation": generation_day}
+
+
 def main():
     st.set_page_config(page_title="MAÁTria Energia", layout="wide", initial_sidebar_state="collapsed")
 
@@ -466,6 +495,7 @@ def main():
         else:
             st.session_state["date_start"] = dt_start
             st.session_state["date_end"] = dt_end
+            st.rerun()
 
     selected_start = st.session_state.get("date_start", default_day)
     selected_end = st.session_state.get("date_end", default_day)
@@ -475,7 +505,9 @@ def main():
         st.warning("Não há dados para o período selecionado.")
         return
 
-    photo_day = min(max_d, date.today() - pd.Timedelta(days=1))
+    latest_operational = _latest_operational_dates(core)
+    available_reference_days = [d for d in [latest_operational.get("load"), latest_operational.get("generation")] if d is not None]
+    photo_day = max(available_reference_days) if available_reference_days else max_d
     if photo_day < selected_start or photo_day > selected_end:
         photo_day = selected_end
     dff_photo = dff[dff.index.date == photo_day].copy()
@@ -555,7 +587,11 @@ def main():
         st.dataframe(_plot_df(dff[card_cols]), width="stretch", height=320)
 
     with tabs[0]:
-        st.caption(f"Fotografia operativa do dia **{photo_day}** (D-1 por padrão).")
+        load_ref = latest_operational.get("load")
+        gen_ref = latest_operational.get("generation")
+        load_txt = load_ref.strftime("%d/%m/%Y") if load_ref else "N/D"
+        gen_txt = gen_ref.strftime("%d/%m/%Y") if gen_ref else "N/D"
+        st.caption(f"Dados extraídos até o dia **{load_txt}** (load) e **{gen_txt}** (generation).")
         st.caption("Montagem: séries horárias observadas de geração por fonte + carga e carga líquida (`Carga - (Solar + Eólica)`).")
         st.write(_system_text(current))
         fig = go.Figure()
