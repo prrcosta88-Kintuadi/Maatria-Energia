@@ -9,32 +9,43 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 import requests
-import gzip
+import duckdb
 
 
 @st.cache_data
 def _load_core() -> Dict[str, Any]:
 
-    paths = [
-        Path("data/core_analysis_latest.json"),
-        Path("core_analysis_latest.json"),
-        Path("data/core_analysis_latest.json.gz"),
-        Path("core_analysis_latest.json.gz"),
+    parquet_paths = [
+        Path("data/core_analysis_latest.parquet"),
+        Path("core_analysis_latest.parquet"),
     ]
 
-    for p in paths:
+    for p in parquet_paths:
+        if not p.exists():
+            continue
+        try:
+            con = duckdb.connect()
+            try:
+                row = con.execute(
+                    "SELECT core_json FROM read_parquet(?) LIMIT 1",
+                    [str(p)],
+                ).fetchone()
+            finally:
+                con.close()
 
+            if row and row[0]:
+                return row[0] if isinstance(row[0], dict) else json.loads(row[0])
+        except Exception:
+            continue
+
+    json_paths = [
+        Path("data/core_analysis_latest.json"),
+        Path("core_analysis_latest.json"),
+    ]
+    for p in json_paths:
         if p.exists():
-
-            # Caso seja gzip
-            if p.suffix == ".gz":
-                with gzip.open(p, "rt", encoding="utf-8") as f:
-                    return json.load(f)
-
-            # Caso seja json normal
-            else:
-                with p.open("r", encoding="utf-8") as f:
-                    return json.load(f)
+            with p.open("r", encoding="utf-8") as f:
+                return json.load(f)
 
     return {}
 
@@ -300,6 +311,35 @@ def _ensure_hourly(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _latest_operational_dates(core: Dict[str, Any]) -> Dict[str, Optional[date]]:
+    oper = core.get("operacao", {}) if isinstance(core, dict) else {}
+
+    def _max_date_from_records(records: Any) -> Optional[date]:
+        if not isinstance(records, list) or not records:
+            return None
+        df = pd.DataFrame(records)
+        if "instante" not in df.columns:
+            return None
+        ts = pd.to_datetime(df["instante"], errors="coerce")
+        ts = ts.dropna()
+        if ts.empty:
+            return None
+        return ts.max().date()
+
+    load_records = ((oper.get("load", {}) or {}).get("sin", {}) or {}).get("serie", [])
+    load_day = _max_date_from_records(load_records)
+
+    generation = oper.get("generation", {}) or {}
+    gen_days = []
+    for payload in generation.values():
+        day = _max_date_from_records((payload or {}).get("serie", []))
+        if day is not None:
+            gen_days.append(day)
+    generation_day = max(gen_days) if gen_days else None
+
+    return {"load": load_day, "generation": generation_day}
+
+
 def main():
     st.set_page_config(page_title="MAÁTria Energia", layout="wide", initial_sidebar_state="collapsed")
 
@@ -328,7 +368,7 @@ def main():
 
     core = _load_core()
     if not core:
-        st.warning("⚠️ core_analysis_latest.json não encontrado. Gerando nova análise...")
+        st.warning("⚠️ core_analysis_latest.parquet/json não encontrado. Gerando nova análise...")
         
         # IMPORTANTE: Você precisa ter os dados brutos em algum lugar!
         # Opção 1: Se os dados brutos estão em um arquivo
@@ -428,9 +468,9 @@ def main():
             """, unsafe_allow_html=True)
             c1, c2, c3 = st.columns([1.05, 1.05, 0.8])
             with c1:
-                dt_start = st.date_input("DE", value=st.session_state["date_start"], min_value=min_d, max_value=max_d)
+                dt_start = st.date_input("DE", value=st.session_state["date_start"], min_value=min_d, max_value=max_d, format="DD/MM/YYYY")
             with c2:
-                dt_end = st.date_input("ATÉ", value=st.session_state["date_end"], min_value=min_d, max_value=max_d)
+                dt_end = st.date_input("ATÉ", value=st.session_state["date_end"], min_value=min_d, max_value=max_d, format="DD/MM/YYYY")
             with c3:
                 st.markdown("<div style='height:1.65rem;'></div>", unsafe_allow_html=True)
                 analyze_clicked = st.form_submit_button("ANALISAR", use_container_width=True)
@@ -455,6 +495,7 @@ def main():
         else:
             st.session_state["date_start"] = dt_start
             st.session_state["date_end"] = dt_end
+            st.rerun()
 
     selected_start = st.session_state.get("date_start", default_day)
     selected_end = st.session_state.get("date_end", default_day)
@@ -464,7 +505,9 @@ def main():
         st.warning("Não há dados para o período selecionado.")
         return
 
-    photo_day = min(max_d, date.today() - pd.Timedelta(days=1))
+    latest_operational = _latest_operational_dates(core)
+    available_reference_days = [d for d in [latest_operational.get("load"), latest_operational.get("generation")] if d is not None]
+    photo_day = max(available_reference_days) if available_reference_days else max_d
     if photo_day < selected_start or photo_day > selected_end:
         photo_day = selected_end
     dff_photo = dff[dff.index.date == photo_day].copy()
@@ -544,7 +587,11 @@ def main():
         st.dataframe(_plot_df(dff[card_cols]), width="stretch", height=320)
 
     with tabs[0]:
-        st.caption(f"Fotografia operativa do dia **{photo_day}** (D-1 por padrão).")
+        load_ref = latest_operational.get("load")
+        gen_ref = latest_operational.get("generation")
+        load_txt = load_ref.strftime("%d/%m/%Y") if load_ref else "N/D"
+        gen_txt = gen_ref.strftime("%d/%m/%Y") if gen_ref else "N/D"
+        st.caption(f"Dados extraídos até o dia **{load_txt}** (load) e **{gen_txt}** (generation).")
         st.caption("Montagem: séries horárias observadas de geração por fonte + carga e carga líquida (`Carga - (Solar + Eólica)`).")
         st.write(_system_text(current))
         fig = go.Figure()
