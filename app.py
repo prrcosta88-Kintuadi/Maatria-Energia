@@ -368,7 +368,7 @@ def main():
 
     core = _load_core()
     if not core:
-        st.warning("⚠️ core_analysis_latest.json não encontrado. Gerando nova análise...")
+        st.warning("⚠️ core_analysis_latest.parquet/json não encontrado. Gerando nova análise...")
         
         # IMPORTANTE: Você precisa ter os dados brutos em algum lugar!
         # Opção 1: Se os dados brutos estão em um arquivo
@@ -468,9 +468,9 @@ def main():
             """, unsafe_allow_html=True)
             c1, c2, c3 = st.columns([1.05, 1.05, 0.8])
             with c1:
-                dt_start = st.date_input("DE", value=st.session_state["date_start"], min_value=min_d, max_value=max_d)
+                dt_start = st.date_input("DE", value=st.session_state["date_start"], min_value=min_d, max_value=max_d, format="DD/MM/YYYY")
             with c2:
-                dt_end = st.date_input("ATÉ", value=st.session_state["date_end"], min_value=min_d, max_value=max_d)
+                dt_end = st.date_input("ATÉ", value=st.session_state["date_end"], min_value=min_d, max_value=max_d, format="DD/MM/YYYY")
             with c3:
                 st.markdown("<div style='height:1.65rem;'></div>", unsafe_allow_html=True)
                 analyze_clicked = st.form_submit_button("ANALISAR", use_container_width=True)
