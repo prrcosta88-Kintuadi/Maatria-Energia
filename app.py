@@ -9,32 +9,43 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 import requests
-import gzip
+import duckdb
 
 
 @st.cache_data
 def _load_core() -> Dict[str, Any]:
 
-    paths = [
-        Path("data/core_analysis_latest.json"),
-        Path("core_analysis_latest.json"),
-        Path("data/core_analysis_latest.json.gz"),
-        Path("core_analysis_latest.json.gz"),
+    parquet_paths = [
+        Path("data/core_analysis_latest.parquet"),
+        Path("core_analysis_latest.parquet"),
     ]
 
-    for p in paths:
+    for p in parquet_paths:
+        if not p.exists():
+            continue
+        try:
+            con = duckdb.connect()
+            try:
+                row = con.execute(
+                    "SELECT core_json FROM read_parquet(?) LIMIT 1",
+                    [str(p)],
+                ).fetchone()
+            finally:
+                con.close()
 
+            if row and row[0]:
+                return row[0] if isinstance(row[0], dict) else json.loads(row[0])
+        except Exception:
+            continue
+
+    json_paths = [
+        Path("data/core_analysis_latest.json"),
+        Path("core_analysis_latest.json"),
+    ]
+    for p in json_paths:
         if p.exists():
-
-            # Caso seja gzip
-            if p.suffix == ".gz":
-                with gzip.open(p, "rt", encoding="utf-8") as f:
-                    return json.load(f)
-
-            # Caso seja json normal
-            else:
-                with p.open("r", encoding="utf-8") as f:
-                    return json.load(f)
+            with p.open("r", encoding="utf-8") as f:
+                return json.load(f)
 
     return {}
 
