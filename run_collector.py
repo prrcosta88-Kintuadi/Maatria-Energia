@@ -143,6 +143,38 @@ def run_core_analysis():
         return None
 
 
+def _get_current_branch() -> str:
+    return subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True).strip()
+
+
+def _get_default_remote() -> str:
+    remotes = subprocess.check_output(["git", "remote"], text=True).splitlines()
+    remotes = [r.strip() for r in remotes if r.strip()]
+    if not remotes:
+        raise RuntimeError("Nenhum remote git configurado.")
+    return "origin" if "origin" in remotes else remotes[0]
+
+
+def _has_upstream() -> bool:
+    probe = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        capture_output=True,
+        text=True,
+    )
+    return probe.returncode == 0
+
+
+def _push_with_upstream_fallback() -> None:
+    if _has_upstream():
+        subprocess.run(["git", "push"], check=True)
+        return
+
+    branch = _get_current_branch()
+    remote = _get_default_remote()
+    logger.info(f"Branch '{branch}' sem upstream; configurando tracking em {remote}/{branch}.")
+    subprocess.run(["git", "push", "--set-upstream", remote, branch], check=True)
+
+
 def publish_core_to_github(push: bool = True):
     src = Path("data") / "core_analysis_latest.parquet"
     dst = Path("core_analysis_latest.parquet")
@@ -165,22 +197,10 @@ def publish_core_to_github(push: bool = True):
 
         if push:
             try:
-                push_result = subprocess.run(["git", "push"], check=True, capture_output=True, text=True)
-                if push_result.stdout:
-                    logger.info(push_result.stdout.strip())
+                _push_with_upstream_fallback()
                 logger.info("Push para GitHub realizado com sucesso.")
-            except subprocess.CalledProcessError as e:
-                # Caso clássico: branch local sem upstream configurado
-                stderr = f'{e.stderr or ""}\n{e.stdout or ""}'.lower()
-                if "no upstream branch" in stderr:
-                    try:
-                        branch = subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True).strip()
-                        subprocess.run(["git", "push", "--set-upstream", "origin", branch], check=True)
-                        logger.info(f"Push com upstream configurado realizado com sucesso para origin/{branch}.")
-                    except Exception as push_e:
-                        logger.warning(f"Commit feito, mas push com upstream falhou: {push_e}")
-                else:
-                    logger.warning(f"Commit feito, mas push falhou: {e}")
+            except Exception as push_e:
+                logger.warning(f"Commit feito, mas push falhou: {push_e}")
         return True
     except Exception as e:
         logger.error(f"Falha ao commitar parquet no git: {e}")
