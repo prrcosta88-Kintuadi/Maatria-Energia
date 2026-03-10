@@ -5,6 +5,7 @@ Kintuadi Energy - Coletor Principal v2.0
 """
 
 import os
+import argparse
 import sys
 import subprocess
 import logging
@@ -138,44 +139,56 @@ def run_core_analysis():
         core = build_core_analysis(raw, output_dir="data")
         return core
     except Exception as e:
-        logger.error(f"Falha ao gerar core_analysis_latest.json: {e}")
+        logger.error(f"Falha ao gerar core_analysis_latest (json/parquet): {e}")
         return None
 
 
 def publish_core_to_github(push: bool = True):
-    src = Path("data") / "core_analysis_latest.json"
-    dst = Path("core_analysis_latest.json")
+    src = Path("data") / "core_analysis_latest.parquet"
+    dst = Path("core_analysis_latest.parquet")
     if not src.exists():
-        logger.error("core_analysis_latest.json não encontrado em data/.")
+        logger.error("core_analysis_latest.parquet não encontrado em data/.")
         return False
 
     shutil.copy2(src, dst)
 
     try:
-        subprocess.run(["git", "add", "core_analysis_latest.json"], check=True)
+        subprocess.run(["git", "add", "core_analysis_latest.parquet"], check=True)
         diff = subprocess.run(["git", "diff", "--cached", "--quiet"])
         if diff.returncode == 0:
-            logger.info("Sem alterações no core_analysis_latest.json para commit.")
+            logger.info("Sem alterações no core_analysis_latest.parquet para commit.")
             return True
 
-        msg = f"Atualiza core_analysis_latest.json [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
+        msg = f"Atualiza core_analysis_latest.parquet [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
         subprocess.run(["git", "commit", "-m", msg], check=True)
-        logger.info("Commit do core realizado com sucesso.")
+        logger.info("Commit do parquet realizado com sucesso.")
 
         if push:
             try:
-                subprocess.run(["git", "push"], check=True)
+                push_result = subprocess.run(["git", "push"], check=True, capture_output=True, text=True)
+                if push_result.stdout:
+                    logger.info(push_result.stdout.strip())
                 logger.info("Push para GitHub realizado com sucesso.")
-            except Exception as e:
-                logger.warning(f"Commit feito, mas push falhou: {e}")
+            except subprocess.CalledProcessError as e:
+                # Caso clássico: branch local sem upstream configurado
+                stderr = f'{e.stderr or ""}\n{e.stdout or ""}'.lower()
+                if "no upstream branch" in stderr:
+                    try:
+                        branch = subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True).strip()
+                        subprocess.run(["git", "push", "--set-upstream", "origin", branch], check=True)
+                        logger.info(f"Push com upstream configurado realizado com sucesso para origin/{branch}.")
+                    except Exception as push_e:
+                        logger.warning(f"Commit feito, mas push com upstream falhou: {push_e}")
+                else:
+                    logger.warning(f"Commit feito, mas push falhou: {e}")
         return True
     except Exception as e:
-        logger.error(f"Falha ao commitar core no git: {e}")
+        logger.error(f"Falha ao commitar parquet no git: {e}")
         return False
 
 
 def run_pipeline_and_publish(push: bool = True, persist_mode: str = "full"):
-    logger.info("Iniciando pipeline completo: coleta → integração → análise → publicação do core")
+    logger.info("Iniciando pipeline completo: coleta → integração → análise → publicação do parquet")
     collected = run_collector_v2(persist_mode=persist_mode)
     if not collected:
         logger.error("Coleta/integração falhou.")
@@ -187,6 +200,7 @@ def run_pipeline_and_publish(push: bool = True, persist_mode: str = "full"):
         return False
 
     return publish_core_to_github(push=push)
+
 def main():
     """Função principal"""
     
@@ -212,9 +226,9 @@ def main():
         print("3. Apenas abrir dashboard")
         print("4. Coleta incremental (somente ano/mês correntes)")
         print("5. Verificar sistema")
-        print("6. Pipeline completo + commit/push do core (persist completo)")
+        print("6. Pipeline completo + commit/push do parquet (persist completo)")
         print("7. Abrir dashboard_espelho.py")
-        print("8. Pipeline completo + commit/push do core (persist incremental)")
+        print("8. Pipeline completo + commit/push do parquet (persist incremental)")
         print("9. Sair")
         print("="*60)
         
@@ -246,7 +260,7 @@ def main():
             check_system()
         
         elif choice == "6":
-            print("\n🚀 Pipeline completo + publicação do core (persist completo)...")
+            print("\n🚀 Pipeline completo + publicação do parquet (persist completo)...")
             run_pipeline_and_publish(push=True, persist_mode="full")
 
         elif choice == "7":
@@ -257,7 +271,7 @@ def main():
                 print(f"❌ Erro ao executar dashboard_espelho: {e}")
 
         elif choice == "8":
-            print("\n🚀 Pipeline completo + publicação do core (persist incremental)...")
+            print("\n🚀 Pipeline completo + publicação do parquet (persist incremental)...")
             run_pipeline_and_publish(push=True, persist_mode="incremental")
 
         elif choice == "9":
@@ -281,7 +295,7 @@ def check_system():
             print(f"❌ {d}/ (não existe)")
     
     # Verifica arquivos principais
-    files = ["dashboard_integrado.py", "dashboard_espelho.py", "requirements.txt", "run_collector.py", "core_analysis_latest.json"]
+    files = ["dashboard_integrado.py", "dashboard_espelho.py", "requirements.txt", "run_collector.py", "core_analysis_latest.parquet"]
     for f in files:
         if os.path.exists(f):
             print(f"✅ {f}")
@@ -299,8 +313,21 @@ def check_system():
     
     print("-"*40)
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Kintuadi collector and parquet publisher")
+    parser.add_argument("--daily-parquet", action="store_true", help="Executa pipeline e publica apenas core_analysis_latest.parquet")
+    parser.add_argument("--persist-mode", choices=["full", "incremental"], default="incremental", help="Modo de persistência da coleta")
+    parser.add_argument("--no-push", action="store_true", help="Faz commit local sem push")
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
     try:
+        if args.daily_parquet:
+            setup_environment()
+            ok = run_pipeline_and_publish(push=not args.no_push, persist_mode=args.persist_mode)
+            sys.exit(0 if ok else 1)
         main()
     except KeyboardInterrupt:
         print("\n\n⏹️ Programa interrompido pelo usuário")
