@@ -9,7 +9,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 import requests
-import pyarrow.parquet as pq
+import duckdb
 
 
 def _core_cache_token() -> str:
@@ -50,6 +50,21 @@ def _core_file_diagnostics() -> list[str]:
     return msgs
 
 
+def _configure_duckdb_low_memory(con: duckdb.DuckDBPyConnection) -> None:
+    # Ajustes recomendados pelo próprio DuckDB para ambientes com RAM restrita (ex.: Render free)
+    try:
+        con.execute("SET threads=1")
+    except Exception:
+        pass
+    try:
+        con.execute("SET preserve_insertion_order=false")
+    except Exception:
+        pass
+    try:
+        con.execute("SET memory_limit='320MB'")
+    except Exception:
+        pass
+
 
 def _decode_parquet_row(row: Any, columns: list[str]) -> Dict[str, Any]:
     if not row:
@@ -79,7 +94,6 @@ def _decode_parquet_row(row: Any, columns: list[str]) -> Dict[str, Any]:
 
 @st.cache_data
 def _load_core(_token: str) -> Tuple[Dict[str, Any], List[str]]:
-    """Carrega o core a partir de parquet (via pyarrow, low-memory) ou JSON como fallback."""
 
     parquet_paths = [
         Path("data/core_analysis_latest.parquet"),
@@ -91,23 +105,26 @@ def _load_core(_token: str) -> Tuple[Dict[str, Any], List[str]]:
         if not p.exists():
             continue
         try:
-            # Abre o arquivo sem carregar dados na memória ainda
-            pf = pq.ParquetFile(str(p))
-            col_names = pf.schema_arrow.names
+            con = duckdb.connect()
+            try:
+                _configure_duckdb_low_memory(con)
+                quoted = str(p).replace("'", "''")
 
-            # Lê apenas o primeiro row group — muito mais leve que carregar tudo
-            first_batch = pf.read_row_group(0)
-            df_chunk = first_batch.to_pandas()
+                # Tentativa 1: API parametrizada (preferível)
+                try:
+                    cols = [c[0] for c in con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(p)]).fetchall()]
+                    row = con.execute("SELECT * FROM read_parquet(?) LIMIT 1", [str(p)]).fetchone()
+                except Exception:
+                    # Tentativa 2: SQL literal (compatibilidade com builds antigos do DuckDB)
+                    cols = [c[0] for c in con.execute(f"DESCRIBE SELECT * FROM read_parquet('{quoted}')").fetchall()]
+                    row = con.execute(f"SELECT * FROM read_parquet('{quoted}') LIMIT 1").fetchone()
+            finally:
+                con.close()
 
-            if df_chunk.empty:
-                errors.append(f"{p}: parquet lido via pyarrow, mas primeiro row group está vazio")
-                continue
-
-            row = df_chunk.iloc[0].tolist()
-            decoded = _decode_parquet_row(row, col_names)
+            decoded = _decode_parquet_row(row, cols)
             if decoded:
                 return decoded, errors
-            errors.append(f"{p}: parquet lido via pyarrow, mas estrutura não reconhecida (colunas={col_names[:8]})")
+            errors.append(f"{p}: parquet lido, mas estrutura não reconhecida (colunas={cols[:8]})")
         except Exception as e:
             errors.append(f"{p}: falha ao ler parquet ({type(e).__name__}: {e})")
             continue
@@ -122,6 +139,15 @@ def _load_core(_token: str) -> Tuple[Dict[str, Any], List[str]]:
                 return json.load(f), errors
 
     return {}, errors
+
+
+#@st.cache_data
+#def _load_core() -> Dict[str, Any]:
+#    for p in [Path("data/core_analysis_latest.json"), Path("core_analysis_latest.json")]:
+#        if p.exists():
+#            with p.open("r", encoding="utf-8") as f:
+#                return json.load(f)
+#    return {}
 
 
 def _series_from_hourly(d: Dict[str, Any], name: str) -> pd.Series:
