@@ -216,8 +216,7 @@ def _ensure_clean_git_state_for_sync(remote: str) -> str:
     if branch == "HEAD":
         raise RuntimeError("Não foi possível sair do estado detached HEAD automaticamente.")
     return branch
-=======
->>>>>>> main
+
 def _push_once(remote: str, branch: str, force_with_lease: bool = False) -> None:
     if _has_upstream():
         cmd = ["git", "push"]
