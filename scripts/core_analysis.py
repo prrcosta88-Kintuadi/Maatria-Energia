@@ -3271,7 +3271,7 @@ def build_core_analysis(raw_data: Dict[str, Any], output_dir: str = "data", forc
         # 4) Promover temp para definitivo de forma atômica quando possível
         os.replace(temp_path, final_path)
 
-        # 5) Exportar o mesmo payload em Parquet para consumo da aplicação
+        # 5) Exportar o mesmo payload completo em Parquet (legado)
         payload_df = pd.DataFrame([
             {
                 "timestamp": core.get("timestamp"),
@@ -3288,6 +3288,9 @@ def build_core_analysis(raw_data: Dict[str, Any], output_dir: str = "data", forc
             os.replace(temp_parquet_path, final_parquet_path)
         finally:
             con.close()
+
+        # 6) Exportar parquets segmentados por seção (carregamento lazy no app)
+        _persist_section_parquets(core, output_dir)
 
     except Exception as e:
         _core_log("PERSIST", "Falha ao salvar core_analysis_latest.json", final_path=final_path, erro=str(e))
@@ -3316,3 +3319,76 @@ def build_core_analysis(raw_data: Dict[str, Any], output_dir: str = "data", forc
         tamanho_bytes=os.path.getsize(final_parquet_path),
     )
     return core
+
+
+# =====================================================================
+# PERSISTÊNCIA SEGMENTADA — parquets por seção
+# =====================================================================
+
+_SECTION_KEYS = ["advanced_metrics", "economic", "operacao", "ccee", "renewables"]
+
+
+def _persist_section_parquets(core: Dict[str, Any], output_dir: str) -> None:
+    """
+    Gera um arquivo parquet independente para cada seção do core:
+      - core_section_advanced_metrics.parquet
+      - core_section_economic.parquet
+      - core_section_operacao.parquet
+      - core_section_ccee.parquet
+      - core_section_renewables.parquet
+
+    Cada arquivo contém apenas a chave 'timestamp' e o JSON da seção,
+    permitindo carregamento lazy e isolado no app.py.
+    """
+    ts = core.get("timestamp", datetime.now().isoformat())
+
+    # Caso especial: ccee pode estar aninhado como core["ccee"]["data"]
+    # Mantemos a estrutura completa de cada chave para fidelidade
+    section_payloads: Dict[str, Any] = {
+        "advanced_metrics": core.get("advanced_metrics", {}),
+        "economic": core.get("economic", {}),
+        "operacao": core.get("operacao", {}),
+        "ccee": core.get("ccee", {}),
+        "renewables": core.get("renewables", {}),
+    }
+
+    for section_name, section_data in section_payloads.items():
+        temp_path = os.path.join(output_dir, f"core_section_{section_name}_temp.parquet")
+        final_path = os.path.join(output_dir, f"core_section_{section_name}.parquet")
+        try:
+            df = pd.DataFrame([
+                {
+                    "timestamp": ts,
+                    "section": section_name,
+                    "section_json": json.dumps(section_data, ensure_ascii=False, default=str),
+                }
+            ])
+            con = duckdb.connect()
+            try:
+                con.register("section_payload", df)
+                con.execute(
+                    "COPY section_payload TO ? (FORMAT PARQUET, COMPRESSION ZSTD)",
+                    [temp_path],
+                )
+                os.replace(temp_path, final_path)
+            finally:
+                con.close()
+
+            _core_log(
+                "PERSIST",
+                f"Parquet de seção salvo: core_section_{section_name}.parquet",
+                path=final_path,
+                tamanho_bytes=os.path.getsize(final_path),
+            )
+        except Exception as e:
+            _core_log(
+                "PERSIST",
+                f"Falha ao salvar parquet de seção '{section_name}'",
+                erro=str(e),
+            )
+            for p in [temp_path, final_path]:
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
