@@ -12,44 +12,7 @@ import requests
 import duckdb
 
 
-# Seções que formam o core completo
-_SECTION_KEYS = ["advanced_metrics", "economic", "operacao", "ccee", "renewables"]
-_SECTION_PARQUET_DIRS = ["data", "."]
-
-
-def _is_lfs_pointer(p: Path) -> bool:
-    """True se o arquivo é um ponteiro Git LFS (objeto real não baixado)."""
-    try:
-        with p.open("rb") as f:
-            head = f.read(512)
-        return b"git-lfs.github.com/spec/v1" in head or b"oid sha256:" in head
-    except Exception:
-        return False
-
-
-def _section_parquet_path(section: str) -> Optional[Path]:
-    """Retorna o Path do parquet de seção se existir e não for LFS, senão None."""
-    for d in _SECTION_PARQUET_DIRS:
-        p = Path(d) / f"core_section_{section}.parquet"
-        if p.exists() and not _is_lfs_pointer(p):
-            return p
-    return None
-
-
-def _all_sections_available() -> bool:
-    """True se todos os 5 parquets de seção estão prontos para leitura."""
-    return all(_section_parquet_path(s) is not None for s in _SECTION_KEYS)
-
-
 def _core_cache_token() -> str:
-    """Token de cache: prioriza seções quando disponíveis, senão usa arquivos legados."""
-    if _all_sections_available():
-        parts = []
-        for s in _SECTION_KEYS:
-            p = _section_parquet_path(s)
-            stt = p.stat()
-            parts.append(f"{p}:{int(stt.st_mtime)}:{stt.st_size}")
-        return "sections|" + "|".join(parts)
     watched = [
         Path("data/core_analysis_latest.parquet"),
         Path("core_analysis_latest.parquet"),
@@ -68,29 +31,22 @@ def _core_cache_token() -> str:
 
 def _core_file_diagnostics() -> list[str]:
     msgs = []
-    for p in [
-        Path("data/core_analysis_latest.parquet"), Path("core_analysis_latest.parquet"),
-        Path("data/core_analysis_latest.json"),    Path("core_analysis_latest.json"),
-    ]:
+    for p in [Path("data/core_analysis_latest.parquet"), Path("core_analysis_latest.parquet")]:
         if not p.exists():
             msgs.append(f"{p}: ausente")
             continue
         size = p.stat().st_size
+        pointer = False
         try:
             with p.open("rb") as f:
-                head = f.read(512)
-            if b"git-lfs.github.com/spec/v1" in head or b"oid sha256:" in head:
-                msgs.append(f"{p}: ponteiro Git LFS — ignorado")
-                continue
+                head = f.read(200)
+            pointer = b"git-lfs.github.com/spec/v1" in head
         except Exception:
             pass
-        msgs.append(f"{p}: presente ({size:,} bytes)")
-    for sec in _SECTION_KEYS:
-        sp = _section_parquet_path(sec)
-        if sp:
-            msgs.append(f"{sp}: presente ({sp.stat().st_size:,} bytes) ✓")
+        if pointer:
+            msgs.append(f"{p}: presente ({size} bytes), mas é ponteiro Git LFS (objeto real não baixado)")
         else:
-            msgs.append(f"core_section_{sec}.parquet: ausente")
+            msgs.append(f"{p}: presente ({size} bytes)")
     return msgs
 
 
@@ -136,8 +92,16 @@ def _decode_parquet_row(row: Any, columns: list[str]) -> Dict[str, Any]:
     return {}
 
 
-def _read_section_parquet(p: Path) -> Optional[Dict[str, Any]]:
-    """Lê um parquet de seção e retorna o dict desserializado, ou None em caso de falha."""
+@st.cache_data
+def _load_section_cached(_token: str, section: str) -> Dict[str, Any]:
+    """
+    Carrega UMA seção do parquet correspondente e retorna o dict.
+    Cache por seção — cada uma ocupa memória independentemente.
+    Descarta o JSON bruto assim que o dict é construído.
+    """
+    p = _section_path(section)
+    if p is None:
+        return {}
     try:
         con = duckdb.connect()
         try:
@@ -149,112 +113,40 @@ def _read_section_parquet(p: Path) -> Optional[Dict[str, Any]]:
                 row = con.execute(f"SELECT section_json FROM read_parquet('{quoted}') LIMIT 1").fetchone()
         finally:
             con.close()
-        if row and row[0]:
-            val = row[0]
-            if isinstance(val, str) and val.strip():
-                loaded = json.loads(val)
-                if isinstance(loaded, (dict, list)):
-                    return loaded
-            elif isinstance(val, (dict, list)):
-                return val
+        if not (row and row[0]):
+            return {}
+        val = row[0]
+        loaded = json.loads(val) if isinstance(val, str) else val
+        return loaded if isinstance(loaded, dict) else {}
     except Exception:
-        pass
-    return None
+        return {}
+
+
+def _get_section(section: str) -> Dict[str, Any]:
+    """Retorna dados de uma seção, usando cache por seção."""
+    p = _section_path(section)
+    token = f"{p}:{int(p.stat().st_mtime)}" if p else f"{section}:missing"
+    return _load_section_cached(token, section)
 
 
 @st.cache_data
 def _load_core(_token: str) -> Tuple[Dict[str, Any], List[str]]:
+    """
+    Carrega o core completo — usado apenas para _build_hourly_df na inicialização.
+    Cada seção é carregada e descartada sequencialmente para minimizar pico de RAM.
+    """
     errors: List[str] = []
-
-    # ── PRIORIDADE 1: montar core a partir dos parquets de seção (sem carregar o monolito) ──
-    if _all_sections_available():
-        core: Dict[str, Any] = {}
-        for section in _SECTION_KEYS:
-            p = _section_parquet_path(section)
-            data = _read_section_parquet(p)
-            if data is not None:
-                core[section] = data
-            else:
-                errors.append(f"{p}: falha ao ler parquet de seção '{section}'")
-        if core:
-            return core, errors
-
-    # ── PRIORIDADE 2: parquet monolítico (legado) ──
-    for p in [Path("data/core_analysis_latest.parquet"), Path("core_analysis_latest.parquet")]:
-        if not p.exists() or _is_lfs_pointer(p):
-            if p.exists():
-                errors.append(f"{p}: ponteiro Git LFS ignorado")
-            continue
-        try:
-            con = duckdb.connect()
-            try:
-                _configure_duckdb_low_memory(con)
-                quoted = str(p).replace("'", "''")
-                try:
-                    cols = [c[0] for c in con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(p)]).fetchall()]
-                    row = con.execute("SELECT * FROM read_parquet(?) LIMIT 1", [str(p)]).fetchone()
-                except Exception:
-                    cols = [c[0] for c in con.execute(f"DESCRIBE SELECT * FROM read_parquet('{quoted}')").fetchall()]
-                    row = con.execute(f"SELECT * FROM read_parquet('{quoted}') LIMIT 1").fetchone()
-            finally:
-                con.close()
-            decoded = _decode_parquet_row(row, cols)
-            if decoded:
-                return decoded, errors
-            errors.append(f"{p}: parquet lido, mas estrutura não reconhecida (colunas={cols[:8]})")
-        except Exception as e:
-            errors.append(f"{p}: falha ao ler parquet ({type(e).__name__}: {e})")
-
-    # ── PRIORIDADE 3: JSON ──
-    for p in [Path("data/core_analysis_latest.json"), Path("core_analysis_latest.json")]:
-        if not p.exists() or _is_lfs_pointer(p):
-            continue
-        try:
-            with p.open("r", encoding="utf-8") as f:
-                return json.load(f), errors
-        except Exception as e:
-            errors.append(f"{p}: falha ao ler JSON ({type(e).__name__}: {e})")
-
-    return {}, errors
-
-
-#@st.cache_data
-#def _load_core() -> Dict[str, Any]:
-#    for p in [Path("data/core_analysis_latest.json"), Path("core_analysis_latest.json")]:
-#        if p.exists():
-#            with p.open("r", encoding="utf-8") as f:
-#                return json.load(f)
-#    return {}
-
-
-def _section_cache_token(section: str) -> str:
-    p = _section_parquet_path(section)
-    if p:
-        stt = p.stat()
-        return f"{p}:{int(stt.st_mtime)}:{stt.st_size}"
-    return f"{section}:missing"
-
-
-@st.cache_data
-def _load_section(_token: str, section: str) -> Tuple[Dict[str, Any], List[str]]:
-    """Carrega uma seção isolada. Fallback para core completo se parquet de seção ausente."""
-    errors: List[str] = []
-    p = _section_parquet_path(section)
-    if p:
-        data = _read_section_parquet(p)
-        if data is not None:
-            return (data if isinstance(data, dict) else {}), errors
-        errors.append(f"{p}: falha ao desserializar seção '{section}'")
-    # Fallback: extrai do core completo
-    core, core_errors = _load_core(_core_cache_token())
-    errors.extend(core_errors)
-    return core.get(section, {}), errors
-
-
-def _get_section(section: str) -> Dict[str, Any]:
-    """Atalho: retorna dados da seção. Ex: _get_section('operacao')"""
-    data, _ = _load_section(_section_cache_token(section), section)
-    return data or {}
+    if not _all_sections_ok():
+        errors.append("Um ou mais parquets de seção não encontrados ou são ponteiros LFS.")
+        return {}, errors
+    core: Dict[str, Any] = {}
+    for section in _SECTION_KEYS:
+        data = _get_section(section)
+        if data:
+            core[section] = data
+        else:
+            errors.append(f"Seção '{section}' retornou vazia.")
+    return core, errors
 
 
 def _series_from_hourly(d: Dict[str, Any], name: str) -> pd.Series:
@@ -290,11 +182,18 @@ def _series_from_operacao(records, value_key: str, name: str) -> pd.Series:
 
 
 def _build_hourly_df(core: Dict[str, Any]) -> pd.DataFrame:
-    econ = core.get("economic", {}) or core.get("advanced_metrics", {}).get("economic", {}) or {}
-    adv = core.get("advanced_metrics", {})
-
+    """
+    Constrói o DataFrame horário carregando cada seção sob demanda e
+    descartando da memória logo após extrair as colunas necessárias.
+    Aceita tanto o dict completo quanto dicts vazios (fallback para _get_section).
+    """
     df = pd.DataFrame()
-    # economic-driven
+
+    # ── economic ────────────────────────────────────────────────────────────
+    econ = (core.get("economic") or
+            (core.get("advanced_metrics") or {}).get("economic") or
+            _get_section("economic").get("economic") or
+            _get_section("economic")) or {}
     for k, col in [
         ("sin_cost_hourly", "sin_cost"),
         ("T_prudencia_hourly", "t_prudencia"),
@@ -313,24 +212,35 @@ def _build_hourly_df(core: Dict[str, Any]) -> pd.DataFrame:
         s = _series_from_hourly(econ.get(k, {}), col)
         if not s.empty:
             df = df.join(s, how="outer") if not df.empty else s.to_frame()
-
-    # system state
     st_h = econ.get("system_state_hourly", {})
     if isinstance(st_h, dict) and st_h:
         s = pd.Series(st_h, name="system_state")
         s.index = pd.to_datetime(s.index, errors="coerce")
         s = s.dropna()
         df = df.join(s, how="outer") if not df.empty else s.to_frame()
+    del econ
 
-    # from operacao
-    oper = core.get("operacao", {})
-    gen = oper.get("generation", {})
-    load = oper.get("load", {})
+    # ── advanced_metrics (apenas painel_horario_renovavel e cmo) ────────────
+    adv = core.get("advanced_metrics") or _get_section("advanced_metrics")
+    panel = pd.DataFrame((adv or {}).get("painel_horario_renovavel", []))
+    if not panel.empty and "instante" in panel.columns:
+        panel["instante"] = pd.to_datetime(panel["instante"], errors="coerce")
+        panel = panel.dropna(subset=["instante"]).set_index("instante")
+        for src, dst in [("gfom_pct", "gfom_pct"), ("ipr", "ipr"), ("isr", "isr"), ("ear", "ear"), ("ena", "ena")]:
+            if src in panel.columns:
+                s = pd.to_numeric(panel[src], errors="coerce").rename(dst)
+                df = df.join(s, how="outer") if not df.empty else s.to_frame()
+    del panel
+    cmo_sm = ((adv or {}).get("aderencia_fisico_economica") or {}).get("cmo_horario_por_submercado") or {}
+    del adv
 
+    # ── operacao ─────────────────────────────────────────────────────────────
+    oper = core.get("operacao") or _get_section("operacao")
+    gen = (oper or {}).get("generation", {})
+    load = (oper or {}).get("load", {})
     load_sin = _series_from_operacao((load.get("sin") or {}).get("serie", []), "carga", "load")
     if not load_sin.empty:
         df = df.join(load_sin, how="outer") if not df.empty else load_sin.to_frame()
-
     for source_keys, col in [
         (["fotovoltaica"], "solar"),
         (["eolielétrica"], "wind"),
@@ -341,19 +251,24 @@ def _build_hourly_df(core: Dict[str, Any]) -> pd.DataFrame:
         serie_records = []
         for key in source_keys:
             if (gen.get(key) or {}).get("serie"):
-                serie_records = (gen.get(key) or {}).get("serie", [])
+                serie_records = (gen[key] or {}).get("serie", [])
                 break
         s = _series_from_operacao(serie_records, "geracao", col)
         if not s.empty:
             df = df.join(s, how="outer") if not df.empty else s.to_frame()
+    del oper, gen, load
 
-    # pld from ccee records
-    ccee = core.get("ccee", {}).get("data", [])
-    if ccee:
-        cdf = pd.DataFrame(ccee)
+    # ── ccee ─────────────────────────────────────────────────────────────────
+    ccee_data = (core.get("ccee") or _get_section("ccee") or {}).get("data", [])
+    if ccee_data:
+        cdf = pd.DataFrame(ccee_data)
+        del ccee_data
         if {"mes_referencia", "dia", "hora", "pld_hora"}.issubset(cdf.columns):
             cdf["mr"] = cdf["mes_referencia"].astype(str).str.zfill(6)
-            cdf["ts"] = pd.to_datetime(cdf["mr"].str[:4] + "-" + cdf["mr"].str[4:6] + "-" + cdf["dia"].astype(str).str.zfill(2) + " " + cdf["hora"].astype(str).str.zfill(2) + ":00:00", errors="coerce")
+            cdf["ts"] = pd.to_datetime(
+                cdf["mr"].str[:4] + "-" + cdf["mr"].str[4:6] + "-" +
+                cdf["dia"].astype(str).str.zfill(2) + " " +
+                cdf["hora"].astype(str).str.zfill(2) + ":00:00", errors="coerce")
             cdf["pld_hora"] = pd.to_numeric(cdf["pld_hora"], errors="coerce")
             cdf = cdf.dropna(subset=["ts", "pld_hora"])
             if not cdf.empty:
@@ -364,20 +279,14 @@ def _build_hourly_df(core: Dict[str, Any]) -> pd.DataFrame:
                 except Exception:
                     pass
                 df = df.join(pld, how="outer") if not df.empty else pld.to_frame()
+        del cdf
+    else:
+        del ccee_data
 
-    # panel from advanced metrics
-    panel = pd.DataFrame(adv.get("painel_horario_renovavel", []))
-    if not panel.empty and "instante" in panel.columns:
-        panel["instante"] = pd.to_datetime(panel["instante"], errors="coerce")
-        panel = panel.dropna(subset=["instante"]).set_index("instante")
-        for src, dst in [("gfom_pct", "gfom_pct"), ("ipr", "ipr"), ("isr", "isr"), ("ear", "ear"), ("ena", "ena")]:
-            if src in panel.columns:
-                s = pd.to_numeric(panel[src], errors="coerce").rename(dst)
-                df = df.join(s, how="outer") if not df.empty else s.to_frame()
-
-    # curtailment series
+    # ── renewables ───────────────────────────────────────────────────────────
+    ren = (core.get("renewables") or _get_section("renewables") or {})
     for key, col in [("solar", "curtail_solar"), ("eolica", "curtail_wind")]:
-        ser = pd.DataFrame(((core.get("renewables", {}).get("curtailment", {}).get(key, {}) or {}).get("serie", [])))
+        ser = pd.DataFrame(((ren.get("curtailment") or {}).get(key) or {}).get("serie", []))
         if not ser.empty and {"instante", "valor"}.issubset(ser.columns):
             ser["instante"] = pd.to_datetime(ser["instante"], errors="coerce")
             ser["valor"] = pd.to_numeric(ser["valor"], errors="coerce")
@@ -388,30 +297,26 @@ def _build_hourly_df(core: Dict[str, Any]) -> pd.DataFrame:
             except Exception:
                 pass
             df = df.join(s, how="outer") if not df.empty else s.to_frame()
+    del ren
 
+    # ── colunas derivadas ────────────────────────────────────────────────────
     if not df.empty:
         df = df.sort_index()
         z = pd.Series(0.0, index=df.index)
-        load_s = pd.to_numeric(df["load"], errors="coerce") if "load" in df.columns else pd.Series(np.nan, index=df.index)
-        solar_s = pd.to_numeric(df["solar"], errors="coerce") if "solar" in df.columns else z
-        wind_s = pd.to_numeric(df["wind"], errors="coerce") if "wind" in df.columns else z
-        hydro_s = pd.to_numeric(df["hydro"], errors="coerce") if "hydro" in df.columns else z
-        thermal_s = pd.to_numeric(df["thermal"], errors="coerce") if "thermal" in df.columns else z
-        nuclear_s = pd.to_numeric(df["nuclear"], errors="coerce") if "nuclear" in df.columns else z
-        cur_solar = pd.to_numeric(df["curtail_solar"], errors="coerce") if "curtail_solar" in df.columns else z
-        cur_wind = pd.to_numeric(df["curtail_wind"], errors="coerce") if "curtail_wind" in df.columns else z
-        df["net_load"] = load_s - solar_s.fillna(0) - wind_s.fillna(0)
-        # auditoria operacional solicitada: carga total e carga líquida por soma de fontes
-        df["carga_total"] = load_s
+        load_s   = pd.to_numeric(df.get("load"),         errors="coerce") if "load"         in df.columns else pd.Series(np.nan, index=df.index)
+        solar_s  = pd.to_numeric(df.get("solar"),        errors="coerce") if "solar"        in df.columns else z
+        wind_s   = pd.to_numeric(df.get("wind"),         errors="coerce") if "wind"         in df.columns else z
+        cur_solar = pd.to_numeric(df.get("curtail_solar"), errors="coerce") if "curtail_solar" in df.columns else z
+        cur_wind  = pd.to_numeric(df.get("curtail_wind"),  errors="coerce") if "curtail_wind"  in df.columns else z
+        df["net_load"]     = load_s - solar_s.fillna(0) - wind_s.fillna(0)
+        df["carga_total"]  = load_s
         df["curtail_total"] = cur_solar.fillna(0) + cur_wind.fillna(0)
-        if "cmo_dominante" not in df.columns:
-            cmo_sm = ((adv.get("aderencia_fisico_economica", {}) or {}).get("cmo_horario_por_submercado", {}) or {})
-            if isinstance(cmo_sm, dict) and cmo_sm:
-                # prefer SUDESTE
-                first_key = "SUDESTE" if "SUDESTE" in cmo_sm else list(cmo_sm.keys())[0]
-                s = _series_from_hourly(cmo_sm.get(first_key, {}), "cmo_dominante")
-                if not s.empty:
-                    df = df.join(s, how="left")
+        if "cmo_dominante" not in df.columns and isinstance(cmo_sm, dict) and cmo_sm:
+            first_key = "SUDESTE" if "SUDESTE" in cmo_sm else next(iter(cmo_sm))
+            s = _series_from_hourly(cmo_sm.get(first_key, {}), "cmo_dominante")
+            if not s.empty:
+                df = df.join(s, how="left")
+    del cmo_sm
 
     return _ensure_hourly(df)
 
@@ -565,47 +470,18 @@ def main():
         unsafe_allow_html=True,
     )
 
-    core, core_load_errors = _load_core(_core_cache_token())
-    if not core:
-        st.warning("⚠️ Nenhum arquivo de análise válido encontrado. Gerando nova análise a partir do DuckDB...")
-        with st.expander("🔎 Diagnóstico de arquivos", expanded=True):
+    # Verificar disponibilidade das seções antes de qualquer carregamento
+    if not _all_sections_ok():
+        st.error("❌ Parquets de seção não encontrados ou são ponteiros LFS.")
+        with st.expander("🔎 Diagnóstico", expanded=True):
             for _msg in _core_file_diagnostics():
                 st.caption(f"• {_msg}")
-            for _err in core_load_errors:
-                st.caption(f"🧪 {_err}")
+        return
 
-        try:
-            from scripts.core_analysis import build_core_analysis
-        except ImportError:
-            st.error("❌ Não foi possível importar `build_core_analysis` de `scripts.core_analysis`.")
-            return
-
-        try:
-            with st.spinner("⏳ Executando análise completa do SIN..."):
-                # No modo DuckDB-only, raw_data não precisa de fontes externas
-                _raw_empty = {"sources": {"ons": {}, "ccee": {}}}
-                new_core = build_core_analysis(_raw_empty)
-
-            if not new_core:
-                st.error("❌ build_core_analysis retornou vazio. Verifique o DuckDB em data/kintuadi.duckdb.")
-                return
-
-            required = ["timestamp", "hydrology", "prices"]
-            missing = [k for k in required if k not in new_core]
-            if missing:
-                st.warning(f"⚠️ Análise gerada, mas faltam campos: {missing}")
-
-            st.success(f"✅ Análise gerada com sucesso! Timestamp: {new_core.get('timestamp', 'N/A')}")
-            st.info("🔄 Recarregue a página para carregar os novos parquets de seção.")
-            core = new_core
-
-        except Exception as e:
-            st.error(f"❌ Erro ao gerar análise: {e}")
-            import traceback
-            traceback.print_exc()
-            return
-
-    df = _build_hourly_df(core)
+    # _build_hourly_df carrega cada seção sob demanda via _get_section()
+    # O dict vazio faz com que cada bloco interno chame _get_section() individualmente
+    df = _build_hourly_df({})
+    core = {}  # core completo só carregado se necessário abaixo
     if df.empty:
         st.warning("Sem séries horárias suficientes no core para renderizar o painel.")
         return
@@ -693,7 +569,7 @@ def main():
         st.warning("Não há dados para o período selecionado.")
         return
 
-    latest_operational = _latest_operational_dates(core)
+    latest_operational = _latest_operational_dates(_get_section('operacao'))
     available_reference_days = [d for d in [latest_operational.get("load"), latest_operational.get("generation")] if d is not None]
     photo_day = max(available_reference_days) if available_reference_days else max_d
     if photo_day < selected_start or photo_day > selected_end:
@@ -943,7 +819,7 @@ def main():
             "load": abs(metrics["Load pressure"]-1),
         }
 
-        norm = ((core.get("economic") or {}).get("normalization_hourly") or {})
+        norm = ((_get_section("economic") or {}).get("normalization_hourly") or {})
         if norm and not dff.empty:
             tkey = dff.index[-1].strftime("%Y-%m-%d %H:%M:%S")
             metrics["EAR_norm"] = (norm.get("EAR_norm") or {}).get(tkey, np.nan)
