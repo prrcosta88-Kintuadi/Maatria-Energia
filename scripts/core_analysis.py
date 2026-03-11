@@ -2863,15 +2863,34 @@ def _try_load_fresh_core_cache(output_dir: str = "data") -> Optional[Dict[str, A
     """Retorna core já persistido quando está sincronizado com o DuckDB (atalho de performance)."""
     try:
         final_path = os.path.join(output_dir, "core_analysis_latest.json")
-        if not os.path.exists(final_path) or not os.path.exists(_DUCKDB_PATH):
+        parquet_path = os.path.join(output_dir, "core_analysis_latest.parquet")
+        if not os.path.exists(_DUCKDB_PATH):
             return None
 
-        with open(final_path, "r", encoding="utf-8") as f:
-            cached = json.load(f)
+        cached: Optional[Dict[str, Any]] = None
+        cache_path = None
+
+        if os.path.exists(parquet_path):
+            con = duckdb.connect()
+            try:
+                row = con.execute(
+                    "SELECT core_json FROM read_parquet(?) LIMIT 1",
+                    [parquet_path],
+                ).fetchone()
+                if row and row[0]:
+                    cached = json.loads(row[0])
+                    cache_path = parquet_path
+            finally:
+                con.close()
+        elif os.path.exists(final_path):
+            with open(final_path, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            cache_path = final_path
+
         if not isinstance(cached, dict):
             return None
 
-        core_mtime = os.path.getmtime(final_path)
+        core_mtime = os.path.getmtime(cache_path)
         db_mtime = os.path.getmtime(_DUCKDB_PATH)
 
         # Se o DB não mudou desde a geração do core, reaproveita.
@@ -3226,6 +3245,8 @@ def build_core_analysis(raw_data: Dict[str, Any], output_dir: str = "data", forc
     # 2) Salvar em arquivo temporário primeiro
     temp_path = os.path.join(output_dir, "core_analysis_temp.json")
     final_path = os.path.join(output_dir, "core_analysis_latest.json")
+    temp_parquet_path = os.path.join(output_dir, "core_analysis_temp.parquet")
+    final_parquet_path = os.path.join(output_dir, "core_analysis_latest.parquet")
 
     try:
         with open(temp_path, "w", encoding="utf-8") as f:
@@ -3250,11 +3271,34 @@ def build_core_analysis(raw_data: Dict[str, Any], output_dir: str = "data", forc
         # 4) Promover temp para definitivo de forma atômica quando possível
         os.replace(temp_path, final_path)
 
+        # 5) Exportar o mesmo payload em Parquet para consumo da aplicação
+        payload_df = pd.DataFrame([
+            {
+                "timestamp": core.get("timestamp"),
+                "core_json": json.dumps(core, ensure_ascii=False, default=str),
+            }
+        ])
+        con = duckdb.connect()
+        try:
+            con.register("core_payload", payload_df)
+            con.execute(
+                "COPY core_payload TO ? (FORMAT PARQUET, COMPRESSION ZSTD)",
+                [temp_parquet_path],
+            )
+            os.replace(temp_parquet_path, final_parquet_path)
+        finally:
+            con.close()
+
     except Exception as e:
         _core_log("PERSIST", "Falha ao salvar core_analysis_latest.json", final_path=final_path, erro=str(e))
         if os.path.exists(temp_path):
             try:
                 os.remove(temp_path)
+            except Exception:
+                pass
+        if os.path.exists(temp_parquet_path):
+            try:
+                os.remove(temp_parquet_path)
             except Exception:
                 pass
         raise
@@ -3264,5 +3308,11 @@ def build_core_analysis(raw_data: Dict[str, Any], output_dir: str = "data", forc
         "core_analysis_latest.json salvo com sucesso",
         path=final_path,
         tamanho_bytes=os.path.getsize(final_path),
+    )
+    _core_log(
+        "PERSIST",
+        "core_analysis_latest.parquet salvo com sucesso",
+        path=final_parquet_path,
+        tamanho_bytes=os.path.getsize(final_parquet_path),
     )
     return core
