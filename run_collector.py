@@ -192,6 +192,14 @@ def _push_with_upstream_fallback(force_with_lease: bool = False) -> None:
             raise
 
 
+
+
+def _has_untracked_overwrite_error(err: Exception) -> bool:
+    stdout = getattr(err, "stdout", "") or ""
+    stderr = getattr(err, "stderr", "") or ""
+    msg = f"{err} {stdout} {stderr}".lower()
+    return "untracked working tree files would be overwritten" in msg
+
 def _is_non_fast_forward_error(err: Exception) -> bool:
     stdout = getattr(err, "stdout", "") or ""
     stderr = getattr(err, "stderr", "") or ""
@@ -201,7 +209,33 @@ def _is_non_fast_forward_error(err: Exception) -> bool:
 
 def _pull_rebase(remote: str, branch: str) -> None:
     logger.info(f"Sincronizando branch local com {remote}/{branch} via pull --rebase --autostash.")
-    subprocess.run(["git", "pull", "--rebase", "--autostash", remote, branch], check=True, capture_output=True, text=True)
+    try:
+        subprocess.run(
+            ["git", "pull", "--rebase", "--autostash", remote, branch],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as e:
+        if not _has_untracked_overwrite_error(e):
+            raise
+
+        logger.warning(
+            "Pull/rebase bloqueado por arquivos untracked que seriam sobrescritos; "
+            "tentando stash temporário com --include-untracked."
+        )
+        subprocess.run(["git", "stash", "push", "--include-untracked", "-m", "auto-stash-untracked-before-rebase"], check=True)
+        try:
+            subprocess.run(
+                ["git", "pull", "--rebase", remote, branch],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        finally:
+            pop = subprocess.run(["git", "stash", "pop"], capture_output=True, text=True)
+            if pop.returncode != 0:
+                logger.warning("Não foi possível aplicar o stash automaticamente após o rebase; verifique com 'git stash list'.")
 
 
 def publish_core_to_github(push: bool = True, force_with_lease: bool = False):
