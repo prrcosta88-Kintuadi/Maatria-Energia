@@ -5,6 +5,7 @@ Kintuadi Energy - Coletor Principal v2.0
 """
 
 import os
+import argparse
 import sys
 import subprocess
 import logging
@@ -138,44 +139,139 @@ def run_core_analysis():
         core = build_core_analysis(raw, output_dir="data")
         return core
     except Exception as e:
-        logger.error(f"Falha ao gerar core_analysis_latest.json: {e}")
+        logger.error(f"Falha ao gerar core_analysis_latest (json/parquet): {e}")
         return None
 
 
-def publish_core_to_github(push: bool = True):
-    src = Path("data") / "core_analysis_latest.json"
-    dst = Path("core_analysis_latest.json")
+def _get_current_branch() -> str:
+    return subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True).strip()
+
+
+def _get_default_remote() -> str:
+    remotes = subprocess.check_output(["git", "remote"], text=True).splitlines()
+    remotes = [r.strip() for r in remotes if r.strip()]
+    if not remotes:
+        raise RuntimeError("Nenhum remote git configurado.")
+    return "origin" if "origin" in remotes else remotes[0]
+
+
+def _has_upstream() -> bool:
+    probe = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        capture_output=True,
+        text=True,
+    )
+    return probe.returncode == 0
+
+
+def _push_once(remote: str, branch: str, force_with_lease: bool = False) -> None:
+    if _has_upstream():
+        cmd = ["git", "push"]
+        if force_with_lease:
+            cmd.append("--force-with-lease")
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    else:
+        logger.info(f"Branch '{branch}' sem upstream; configurando tracking em {remote}/{branch}.")
+        cmd = ["git", "push", "--set-upstream", remote, branch]
+        if force_with_lease:
+            cmd.append("--force-with-lease")
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+
+def _push_with_upstream_fallback(force_with_lease: bool = False) -> None:
+    branch = _get_current_branch()
+    remote = _get_default_remote()
+
+    try:
+        _push_once(remote=remote, branch=branch, force_with_lease=force_with_lease)
+    except subprocess.CalledProcessError as e:
+        if _is_non_fast_forward_error(e):
+            _pull_rebase(remote, branch)
+            _push_once(remote=remote, branch=branch, force_with_lease=force_with_lease)
+        else:
+            raise
+
+
+
+
+def _has_untracked_overwrite_error(err: Exception) -> bool:
+    stdout = getattr(err, "stdout", "") or ""
+    stderr = getattr(err, "stderr", "") or ""
+    msg = f"{err} {stdout} {stderr}".lower()
+    return "untracked working tree files would be overwritten" in msg
+
+def _is_non_fast_forward_error(err: Exception) -> bool:
+    stdout = getattr(err, "stdout", "") or ""
+    stderr = getattr(err, "stderr", "") or ""
+    msg = f"{err} {stdout} {stderr}".lower()
+    return any(s in msg for s in ["fetch first", "non-fast-forward", "failed to push some refs", "updates were rejected"])
+
+
+def _pull_rebase(remote: str, branch: str) -> None:
+    logger.info(f"Sincronizando branch local com {remote}/{branch} via pull --rebase --autostash.")
+    try:
+        subprocess.run(
+            ["git", "pull", "--rebase", "--autostash", remote, branch],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as e:
+        if not _has_untracked_overwrite_error(e):
+            raise
+
+        logger.warning(
+            "Pull/rebase bloqueado por arquivos untracked que seriam sobrescritos; "
+            "tentando stash temporário com --include-untracked."
+        )
+        subprocess.run(["git", "stash", "push", "--include-untracked", "-m", "auto-stash-untracked-before-rebase"], check=True)
+        try:
+            subprocess.run(
+                ["git", "pull", "--rebase", remote, branch],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        finally:
+            pop = subprocess.run(["git", "stash", "pop"], capture_output=True, text=True)
+            if pop.returncode != 0:
+                logger.warning("Não foi possível aplicar o stash automaticamente após o rebase; verifique com 'git stash list'.")
+
+
+def publish_core_to_github(push: bool = True, force_with_lease: bool = False):
+    src = Path("data") / "core_analysis_latest.parquet"
+    dst = Path("core_analysis_latest.parquet")
     if not src.exists():
-        logger.error("core_analysis_latest.json não encontrado em data/.")
+        logger.error("core_analysis_latest.parquet não encontrado em data/.")
         return False
 
     shutil.copy2(src, dst)
 
     try:
-        subprocess.run(["git", "add", "core_analysis_latest.json"], check=True)
+        subprocess.run(["git", "add", "core_analysis_latest.parquet"], check=True)
         diff = subprocess.run(["git", "diff", "--cached", "--quiet"])
         if diff.returncode == 0:
-            logger.info("Sem alterações no core_analysis_latest.json para commit.")
+            logger.info("Sem alterações no core_analysis_latest.parquet para commit.")
             return True
 
-        msg = f"Atualiza core_analysis_latest.json [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
+        msg = f"Atualiza core_analysis_latest.parquet [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
         subprocess.run(["git", "commit", "-m", msg], check=True)
-        logger.info("Commit do core realizado com sucesso.")
+        logger.info("Commit do parquet realizado com sucesso.")
 
         if push:
             try:
-                subprocess.run(["git", "push"], check=True)
+                _push_with_upstream_fallback(force_with_lease=force_with_lease)
                 logger.info("Push para GitHub realizado com sucesso.")
-            except Exception as e:
-                logger.warning(f"Commit feito, mas push falhou: {e}")
+            except Exception as push_e:
+                logger.warning(f"Commit feito, mas push falhou: {push_e}")
         return True
     except Exception as e:
-        logger.error(f"Falha ao commitar core no git: {e}")
+        logger.error(f"Falha ao commitar parquet no git: {e}")
         return False
 
 
-def run_pipeline_and_publish(push: bool = True, persist_mode: str = "full"):
-    logger.info("Iniciando pipeline completo: coleta → integração → análise → publicação do core")
+def run_pipeline_and_publish(push: bool = True, persist_mode: str = "full", force_with_lease: bool = False):
+    logger.info("Iniciando pipeline completo: coleta → integração → análise → publicação do parquet")
     collected = run_collector_v2(persist_mode=persist_mode)
     if not collected:
         logger.error("Coleta/integração falhou.")
@@ -186,7 +282,8 @@ def run_pipeline_and_publish(push: bool = True, persist_mode: str = "full"):
         logger.error("Análise (core) falhou.")
         return False
 
-    return publish_core_to_github(push=push)
+    return publish_core_to_github(push=push, force_with_lease=force_with_lease)
+
 def main():
     """Função principal"""
     
@@ -212,9 +309,9 @@ def main():
         print("3. Apenas abrir dashboard")
         print("4. Coleta incremental (somente ano/mês correntes)")
         print("5. Verificar sistema")
-        print("6. Pipeline completo + commit/push do core (persist completo)")
+        print("6. Pipeline completo + commit/push do parquet (persist completo)")
         print("7. Abrir dashboard_espelho.py")
-        print("8. Pipeline completo + commit/push do core (persist incremental)")
+        print("8. Pipeline completo + commit/push do parquet (persist incremental)")
         print("9. Sair")
         print("="*60)
         
@@ -246,7 +343,7 @@ def main():
             check_system()
         
         elif choice == "6":
-            print("\n🚀 Pipeline completo + publicação do core (persist completo)...")
+            print("\n🚀 Pipeline completo + publicação do parquet (persist completo)...")
             run_pipeline_and_publish(push=True, persist_mode="full")
 
         elif choice == "7":
@@ -257,7 +354,7 @@ def main():
                 print(f"❌ Erro ao executar dashboard_espelho: {e}")
 
         elif choice == "8":
-            print("\n🚀 Pipeline completo + publicação do core (persist incremental)...")
+            print("\n🚀 Pipeline completo + publicação do parquet (persist incremental)...")
             run_pipeline_and_publish(push=True, persist_mode="incremental")
 
         elif choice == "9":
@@ -281,7 +378,7 @@ def check_system():
             print(f"❌ {d}/ (não existe)")
     
     # Verifica arquivos principais
-    files = ["dashboard_integrado.py", "dashboard_espelho.py", "requirements.txt", "run_collector.py", "core_analysis_latest.json"]
+    files = ["dashboard_integrado.py", "dashboard_espelho.py", "requirements.txt", "run_collector.py", "core_analysis_latest.parquet"]
     for f in files:
         if os.path.exists(f):
             print(f"✅ {f}")
@@ -299,8 +396,22 @@ def check_system():
     
     print("-"*40)
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Kintuadi collector and parquet publisher")
+    parser.add_argument("--daily-parquet", action="store_true", help="Executa pipeline e publica apenas core_analysis_latest.parquet")
+    parser.add_argument("--persist-mode", choices=["full", "incremental"], default="incremental", help="Modo de persistência da coleta")
+    parser.add_argument("--no-push", action="store_true", help="Faz commit local sem push")
+    parser.add_argument("--force-with-lease", action="store_true", help="Em caso de push, usa --force-with-lease (somente se necessário)")
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
     try:
+        if args.daily_parquet:
+            setup_environment()
+            ok = run_pipeline_and_publish(push=not args.no_push, persist_mode=args.persist_mode, force_with_lease=args.force_with_lease)
+            sys.exit(0 if ok else 1)
         main()
     except KeyboardInterrupt:
         print("\n\n⏹️ Programa interrompido pelo usuário")
