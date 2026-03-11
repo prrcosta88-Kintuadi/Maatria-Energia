@@ -163,6 +163,9 @@ def _has_upstream() -> bool:
     )
     return probe.returncode == 0
 
+
+
+
 def _is_detached_head() -> bool:
     probe = subprocess.run(["git", "symbolic-ref", "--quiet", "--short", "HEAD"], capture_output=True, text=True)
     return probe.returncode != 0
@@ -193,6 +196,29 @@ def _checkout_branch(branch: str, remote: str) -> None:
     subprocess.run(["git", "checkout", "-b", branch, "--track", f"{remote}/{branch}"], check=True, capture_output=True, text=True)
 
 
+
+
+def _ensure_git_ready_for_commit(remote: str | None = None) -> None:
+    unmerged = _list_unmerged_files()
+    if unmerged:
+        joined = ", ".join(unmerged[:5])
+        raise RuntimeError(
+            "Commit bloqueado: há conflitos git não resolvidos no repositório. "
+            f"Resolva os conflitos e finalize/aborte o rebase antes de rodar a rotina. Exemplo(s): {joined}"
+        )
+
+    if _is_rebase_in_progress():
+        raise RuntimeError(
+            "Commit bloqueado: há um rebase em andamento. "
+            "Finalize com 'git rebase --continue' ou cancele com 'git rebase --abort'."
+        )
+
+    if _is_detached_head():
+        target = _get_remote_head_branch(remote or _get_default_remote())
+        raise RuntimeError(
+            "Commit bloqueado: repositório em detached HEAD. "
+            f"Volte para uma branch (ex.: 'git checkout {target}') antes de executar a rotina automática."
+        )
 def _ensure_clean_git_state_for_sync(remote: str) -> str:
     unmerged = _list_unmerged_files()
     if unmerged and _is_rebase_in_progress():
@@ -216,7 +242,6 @@ def _ensure_clean_git_state_for_sync(remote: str) -> str:
     if branch == "HEAD":
         raise RuntimeError("Não foi possível sair do estado detached HEAD automaticamente.")
     return branch
-
 def _push_once(remote: str, branch: str, force_with_lease: bool = False) -> None:
     if _has_upstream():
         cmd = ["git", "push"]
@@ -259,11 +284,13 @@ def _is_non_fast_forward_error(err: Exception) -> bool:
     msg = f"{err} {stdout} {stderr}".lower()
     return any(s in msg for s in ["fetch first", "non-fast-forward", "failed to push some refs", "updates were rejected"])
 
+
 def _has_unmerged_error(err: Exception) -> bool:
     stdout = getattr(err, "stdout", "") or ""
     stderr = getattr(err, "stderr", "") or ""
     msg = f"{err} {stdout} {stderr}".lower()
     return "you have unmerged files" in msg or "unresolved conflict" in msg
+
 
 def _pull_rebase(remote: str, branch: str) -> None:
     logger.info(f"Sincronizando branch local com {remote}/{branch} via pull --rebase --autostash.")
@@ -285,6 +312,7 @@ def _pull_rebase(remote: str, branch: str) -> None:
                 text=True,
             )
             return
+
         if not _has_untracked_overwrite_error(e):
             raise
 
@@ -307,6 +335,8 @@ def _pull_rebase(remote: str, branch: str) -> None:
 
 
 def publish_core_to_github(push: bool = True, force_with_lease: bool = False):
+    _ensure_git_ready_for_commit(_get_default_remote())
+
     src = Path("data") / "core_analysis_latest.parquet"
     dst = Path("core_analysis_latest.parquet")
     if not src.exists():
