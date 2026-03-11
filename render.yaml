@@ -73,14 +73,14 @@ services:
     
     buildCommand: |
       echo "🔍 Validando artefato Parquet para deploy..."
-      if [ ! -f "core_analysis_latest.parquet" ]; then
-        echo "❌ ERRO: core_analysis_latest.parquet não encontrado!"
+      if [ ! -f "data/core_analysis_latest.parquet" ]; then
+        echo "❌ ERRO: data/core_analysis_latest.parquet não encontrado!"
         echo "Execute a rotina diária para gerar/publicar o arquivo antes do deploy"
         exit 1
       fi
 
       echo "✅ Arquivo encontrado"
-      ls -lh core_analysis_latest.parquet
+      ls -lh data/core_analysis_latest.parquet
     
     
     # ========================================================================

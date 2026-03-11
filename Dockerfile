@@ -28,12 +28,17 @@ COPY docker-compose.yml .
 RUN mkdir -p data logs audit_logs
 
 # Copia o artefato versionado para deploy
-COPY core_analysis_latest.parquet data/core_analysis_latest.parquet
+COPY data/core_analysis_latest.parquet data/core_analysis_latest.parquet
 
 # Validação simples do artefato
 RUN ls -lh data/core_analysis_latest.parquet && \
     python - <<'PY'
 import duckdb
+from pathlib import Path
+p = Path('data/core_analysis_latest.parquet')
+head = p.read_bytes()[:200]
+if b'git-lfs.github.com/spec/v1' in head:
+    raise SystemExit('❌ Arquivo em data/core_analysis_latest.parquet é ponteiro LFS; objeto real não foi baixado no build.')
 con = duckdb.connect(database=':memory:')
 con.execute("SELECT COUNT(*) FROM read_parquet('data/core_analysis_latest.parquet')")
 print('✅ Parquet válido para leitura')

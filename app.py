@@ -12,8 +12,46 @@ import requests
 import duckdb
 
 
+def _core_cache_token() -> str:
+    watched = [
+        Path("data/core_analysis_latest.parquet"),
+        Path("core_analysis_latest.parquet"),
+        Path("data/core_analysis_latest.json"),
+        Path("core_analysis_latest.json"),
+    ]
+    parts = []
+    for p in watched:
+        if p.exists():
+            stt = p.stat()
+            parts.append(f"{p}:{int(stt.st_mtime)}:{stt.st_size}")
+        else:
+            parts.append(f"{p}:missing")
+    return "|".join(parts)
+
+
+def _core_file_diagnostics() -> list[str]:
+    msgs = []
+    for p in [Path("data/core_analysis_latest.parquet"), Path("core_analysis_latest.parquet")]:
+        if not p.exists():
+            msgs.append(f"{p}: ausente")
+            continue
+        size = p.stat().st_size
+        pointer = False
+        try:
+            with p.open("rb") as f:
+                head = f.read(200)
+            pointer = b"git-lfs.github.com/spec/v1" in head
+        except Exception:
+            pass
+        if pointer:
+            msgs.append(f"{p}: presente ({size} bytes), mas é ponteiro Git LFS (objeto real não baixado)")
+        else:
+            msgs.append(f"{p}: presente ({size} bytes)")
+    return msgs
+
+
 @st.cache_data
-def _load_core() -> Dict[str, Any]:
+def _load_core(_token: str) -> Dict[str, Any]:
 
     parquet_paths = [
         Path("data/core_analysis_latest.parquet"),
@@ -366,9 +404,11 @@ def main():
         unsafe_allow_html=True,
     )
 
-    core = _load_core()
+    core = _load_core(_core_cache_token())
     if not core:
-        st.warning("⚠️ core_analysis_latest.parquet/json não encontrado. Gerando nova análise...")
+        st.warning("⚠️ core_analysis_latest.parquet/json não encontrado ou inválido. Gerando nova análise...")
+        for _msg in _core_file_diagnostics():
+            st.caption(f"🔎 {_msg}")
         
         # IMPORTANTE: Você precisa ter os dados brutos em algum lugar!
         # Opção 1: Se os dados brutos estão em um arquivo
