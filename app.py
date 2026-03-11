@@ -2,41 +2,144 @@ import json
 import os
 from datetime import datetime, date, time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List, Tuple
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 import requests
-import gzip
+import duckdb
+
+
+def _core_cache_token() -> str:
+    watched = [
+        Path("data/core_analysis_latest.parquet"),
+        Path("core_analysis_latest.parquet"),
+        Path("data/core_analysis_latest.json"),
+        Path("core_analysis_latest.json"),
+    ]
+    parts = []
+    for p in watched:
+        if p.exists():
+            stt = p.stat()
+            parts.append(f"{p}:{int(stt.st_mtime)}:{stt.st_size}")
+        else:
+            parts.append(f"{p}:missing")
+    return "|".join(parts)
+
+
+def _core_file_diagnostics() -> list[str]:
+    msgs = []
+    for p in [Path("data/core_analysis_latest.parquet"), Path("core_analysis_latest.parquet")]:
+        if not p.exists():
+            msgs.append(f"{p}: ausente")
+            continue
+        size = p.stat().st_size
+        pointer = False
+        try:
+            with p.open("rb") as f:
+                head = f.read(200)
+            pointer = b"git-lfs.github.com/spec/v1" in head
+        except Exception:
+            pass
+        if pointer:
+            msgs.append(f"{p}: presente ({size} bytes), mas é ponteiro Git LFS (objeto real não baixado)")
+        else:
+            msgs.append(f"{p}: presente ({size} bytes)")
+    return msgs
+
+
+def _configure_duckdb_low_memory(con: duckdb.DuckDBPyConnection) -> None:
+    # Ajustes recomendados pelo próprio DuckDB para ambientes com RAM restrita (ex.: Render free)
+    try:
+        con.execute("SET threads=1")
+    except Exception:
+        pass
+    try:
+        con.execute("SET preserve_insertion_order=false")
+    except Exception:
+        pass
+    try:
+        con.execute("SET memory_limit='320MB'")
+    except Exception:
+        pass
+
+
+def _decode_parquet_row(row: Any, columns: list[str]) -> Dict[str, Any]:
+    if not row:
+        return {}
+
+    col_idx = {c.lower(): i for i, c in enumerate(columns)}
+    for candidate in ["core_json", "core", "payload", "json"]:
+        i = col_idx.get(candidate)
+        if i is None:
+            continue
+        val = row[i]
+        if isinstance(val, dict):
+            return val
+        if isinstance(val, str) and val.strip():
+            try:
+                loaded = json.loads(val)
+                if isinstance(loaded, dict):
+                    return loaded
+            except Exception:
+                pass
+
+    rec = {col: row[i] for i, col in enumerate(columns)}
+    if all(k in rec for k in ["timestamp", "hydrology", "prices"]):
+        return rec
+    return {}
 
 
 @st.cache_data
-def _load_core() -> Dict[str, Any]:
+def _load_core(_token: str) -> Tuple[Dict[str, Any], List[str]]:
 
-    paths = [
+    parquet_paths = [
+        Path("data/core_analysis_latest.parquet"),
+        Path("core_analysis_latest.parquet"),
+    ]
+    errors: List[str] = []
+
+    for p in parquet_paths:
+        if not p.exists():
+            continue
+        try:
+            con = duckdb.connect()
+            try:
+                _configure_duckdb_low_memory(con)
+                quoted = str(p).replace("'", "''")
+
+                # Tentativa 1: API parametrizada (preferível)
+                try:
+                    cols = [c[0] for c in con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(p)]).fetchall()]
+                    row = con.execute("SELECT * FROM read_parquet(?) LIMIT 1", [str(p)]).fetchone()
+                except Exception:
+                    # Tentativa 2: SQL literal (compatibilidade com builds antigos do DuckDB)
+                    cols = [c[0] for c in con.execute(f"DESCRIBE SELECT * FROM read_parquet('{quoted}')").fetchall()]
+                    row = con.execute(f"SELECT * FROM read_parquet('{quoted}') LIMIT 1").fetchone()
+            finally:
+                con.close()
+
+            decoded = _decode_parquet_row(row, cols)
+            if decoded:
+                return decoded, errors
+            errors.append(f"{p}: parquet lido, mas estrutura não reconhecida (colunas={cols[:8]})")
+        except Exception as e:
+            errors.append(f"{p}: falha ao ler parquet ({type(e).__name__}: {e})")
+            continue
+
+    json_paths = [
         Path("data/core_analysis_latest.json"),
         Path("core_analysis_latest.json"),
-        Path("data/core_analysis_latest.json.gz"),
-        Path("core_analysis_latest.json.gz"),
     ]
-
-    for p in paths:
-
+    for p in json_paths:
         if p.exists():
+            with p.open("r", encoding="utf-8") as f:
+                return json.load(f), errors
 
-            # Caso seja gzip
-            if p.suffix == ".gz":
-                with gzip.open(p, "rt", encoding="utf-8") as f:
-                    return json.load(f)
+    return {}, errors
 
-            # Caso seja json normal
-            else:
-                with p.open("r", encoding="utf-8") as f:
-                    return json.load(f)
-
-    return {}
 
 #@st.cache_data
 #def _load_core() -> Dict[str, Any]:
@@ -300,6 +403,35 @@ def _ensure_hourly(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _latest_operational_dates(core: Dict[str, Any]) -> Dict[str, Optional[date]]:
+    oper = core.get("operacao", {}) if isinstance(core, dict) else {}
+
+    def _max_date_from_records(records: Any) -> Optional[date]:
+        if not isinstance(records, list) or not records:
+            return None
+        df = pd.DataFrame(records)
+        if "instante" not in df.columns:
+            return None
+        ts = pd.to_datetime(df["instante"], errors="coerce")
+        ts = ts.dropna()
+        if ts.empty:
+            return None
+        return ts.max().date()
+
+    load_records = ((oper.get("load", {}) or {}).get("sin", {}) or {}).get("serie", [])
+    load_day = _max_date_from_records(load_records)
+
+    generation = oper.get("generation", {}) or {}
+    gen_days = []
+    for payload in generation.values():
+        day = _max_date_from_records((payload or {}).get("serie", []))
+        if day is not None:
+            gen_days.append(day)
+    generation_day = max(gen_days) if gen_days else None
+
+    return {"load": load_day, "generation": generation_day}
+
+
 def main():
     st.set_page_config(page_title="MAÁTria Energia", layout="wide", initial_sidebar_state="collapsed")
 
@@ -326,10 +458,23 @@ def main():
         unsafe_allow_html=True,
     )
 
-    core = _load_core()
+    core, core_load_errors = _load_core(_core_cache_token())
     if not core:
-        st.warning("⚠️ core_analysis_latest.json não encontrado. Gerando nova análise...")
-        
+        st.warning("⚠️ core_analysis_latest.parquet/json não encontrado ou inválido. Gerando nova análise...")
+        for _msg in _core_file_diagnostics():
+            st.caption(f"🔎 {_msg}")
+        for _err in core_load_errors:
+            st.caption(f"🧪 {_err}")
+
+        has_oom = any("OutOfMemoryException" in e or "Out of Memory" in e for e in core_load_errors)
+        parquet_exists = Path("data/core_analysis_latest.parquet").exists() or Path("core_analysis_latest.parquet").exists()
+        if parquet_exists and has_oom:
+            st.error(
+                "❌ O parquet foi encontrado, mas o ambiente não teve memória suficiente para carregá-lo. "
+                "Tente reduzir o payload do core/parquet ou aumentar a memória do serviço no Render."
+            )
+            return
+
         # IMPORTANTE: Você precisa ter os dados brutos em algum lugar!
         # Opção 1: Se os dados brutos estão em um arquivo
         raw_data_path = Path("data/kintuadi_latest.json")  # ou o caminho correto
@@ -428,9 +573,9 @@ def main():
             """, unsafe_allow_html=True)
             c1, c2, c3 = st.columns([1.05, 1.05, 0.8])
             with c1:
-                dt_start = st.date_input("DE", value=st.session_state["date_start"], min_value=min_d, max_value=max_d)
+                dt_start = st.date_input("DE", value=st.session_state["date_start"], min_value=min_d, max_value=max_d, format="DD/MM/YYYY")
             with c2:
-                dt_end = st.date_input("ATÉ", value=st.session_state["date_end"], min_value=min_d, max_value=max_d)
+                dt_end = st.date_input("ATÉ", value=st.session_state["date_end"], min_value=min_d, max_value=max_d, format="DD/MM/YYYY")
             with c3:
                 st.markdown("<div style='height:1.65rem;'></div>", unsafe_allow_html=True)
                 analyze_clicked = st.form_submit_button("ANALISAR", use_container_width=True)
@@ -455,6 +600,7 @@ def main():
         else:
             st.session_state["date_start"] = dt_start
             st.session_state["date_end"] = dt_end
+            st.rerun()
 
     selected_start = st.session_state.get("date_start", default_day)
     selected_end = st.session_state.get("date_end", default_day)
@@ -464,7 +610,9 @@ def main():
         st.warning("Não há dados para o período selecionado.")
         return
 
-    photo_day = min(max_d, date.today() - pd.Timedelta(days=1))
+    latest_operational = _latest_operational_dates(core)
+    available_reference_days = [d for d in [latest_operational.get("load"), latest_operational.get("generation")] if d is not None]
+    photo_day = max(available_reference_days) if available_reference_days else max_d
     if photo_day < selected_start or photo_day > selected_end:
         photo_day = selected_end
     dff_photo = dff[dff.index.date == photo_day].copy()
@@ -544,7 +692,11 @@ def main():
         st.dataframe(_plot_df(dff[card_cols]), width="stretch", height=320)
 
     with tabs[0]:
-        st.caption(f"Fotografia operativa do dia **{photo_day}** (D-1 por padrão).")
+        load_ref = latest_operational.get("load")
+        gen_ref = latest_operational.get("generation")
+        load_txt = load_ref.strftime("%d/%m/%Y") if load_ref else "N/D"
+        gen_txt = gen_ref.strftime("%d/%m/%Y") if gen_ref else "N/D"
+        st.caption(f"Dados extraídos até o dia **{load_txt}** (load) e **{gen_txt}** (generation).")
         st.caption("Montagem: séries horárias observadas de geração por fonte + carga e carga líquida (`Carga - (Solar + Eólica)`).")
         st.write(_system_text(current))
         fig = go.Figure()
