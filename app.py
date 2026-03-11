@@ -2,7 +2,7 @@ import json
 import os
 from datetime import datetime, date, time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List, Tuple
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -77,12 +77,13 @@ def _decode_parquet_row(row: Any, columns: list[str]) -> Dict[str, Any]:
 
 
 @st.cache_data
-def _load_core(_token: str) -> Dict[str, Any]:
+def _load_core(_token: str) -> Tuple[Dict[str, Any], List[str]]:
 
     parquet_paths = [
         Path("data/core_analysis_latest.parquet"),
         Path("core_analysis_latest.parquet"),
     ]
+    errors: List[str] = []
 
     for p in parquet_paths:
         if not p.exists():
@@ -90,15 +91,25 @@ def _load_core(_token: str) -> Dict[str, Any]:
         try:
             con = duckdb.connect()
             try:
-                cols = [c[0] for c in con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(p)]).fetchall()]
-                row = con.execute("SELECT * FROM read_parquet(?) LIMIT 1", [str(p)]).fetchone()
+                quoted = str(p).replace("'", "''")
+
+                # Tentativa 1: API parametrizada (preferível)
+                try:
+                    cols = [c[0] for c in con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(p)]).fetchall()]
+                    row = con.execute("SELECT * FROM read_parquet(?) LIMIT 1", [str(p)]).fetchone()
+                except Exception:
+                    # Tentativa 2: SQL literal (compatibilidade com builds antigos do DuckDB)
+                    cols = [c[0] for c in con.execute(f"DESCRIBE SELECT * FROM read_parquet('{quoted}')").fetchall()]
+                    row = con.execute(f"SELECT * FROM read_parquet('{quoted}') LIMIT 1").fetchone()
             finally:
                 con.close()
 
             decoded = _decode_parquet_row(row, cols)
             if decoded:
-                return decoded
-        except Exception:
+                return decoded, errors
+            errors.append(f"{p}: parquet lido, mas estrutura não reconhecida (colunas={cols[:8]})")
+        except Exception as e:
+            errors.append(f"{p}: falha ao ler parquet ({type(e).__name__}: {e})")
             continue
 
     json_paths = [
@@ -108,9 +119,10 @@ def _load_core(_token: str) -> Dict[str, Any]:
     for p in json_paths:
         if p.exists():
             with p.open("r", encoding="utf-8") as f:
-                return json.load(f)
+                return json.load(f), errors
 
-    return {}
+    return {}, errors
+
 
 #@st.cache_data
 #def _load_core() -> Dict[str, Any]:
@@ -429,11 +441,13 @@ def main():
         unsafe_allow_html=True,
     )
 
-    core = _load_core(_core_cache_token())
+    core, core_load_errors = _load_core(_core_cache_token())
     if not core:
         st.warning("⚠️ core_analysis_latest.parquet/json não encontrado ou inválido. Gerando nova análise...")
         for _msg in _core_file_diagnostics():
             st.caption(f"🔎 {_msg}")
+        for _err in core_load_errors:
+            st.caption(f"🧪 {_err}")
         
         # IMPORTANTE: Você precisa ter os dados brutos em algum lugar!
         # Opção 1: Se os dados brutos estão em um arquivo
