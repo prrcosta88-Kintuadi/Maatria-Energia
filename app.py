@@ -50,6 +50,22 @@ def _core_file_diagnostics() -> list[str]:
     return msgs
 
 
+def _configure_duckdb_low_memory(con: duckdb.DuckDBPyConnection) -> None:
+    # Ajustes recomendados pelo próprio DuckDB para ambientes com RAM restrita (ex.: Render free)
+    try:
+        con.execute("SET threads=1")
+    except Exception:
+        pass
+    try:
+        con.execute("SET preserve_insertion_order=false")
+    except Exception:
+        pass
+    try:
+        con.execute("SET memory_limit='320MB'")
+    except Exception:
+        pass
+
+
 def _decode_parquet_row(row: Any, columns: list[str]) -> Dict[str, Any]:
     if not row:
         return {}
@@ -91,6 +107,7 @@ def _load_core(_token: str) -> Tuple[Dict[str, Any], List[str]]:
         try:
             con = duckdb.connect()
             try:
+                _configure_duckdb_low_memory(con)
                 quoted = str(p).replace("'", "''")
 
                 # Tentativa 1: API parametrizada (preferível)
@@ -448,7 +465,16 @@ def main():
             st.caption(f"🔎 {_msg}")
         for _err in core_load_errors:
             st.caption(f"🧪 {_err}")
-        
+
+        has_oom = any("OutOfMemoryException" in e or "Out of Memory" in e for e in core_load_errors)
+        parquet_exists = Path("data/core_analysis_latest.parquet").exists() or Path("core_analysis_latest.parquet").exists()
+        if parquet_exists and has_oom:
+            st.error(
+                "❌ O parquet foi encontrado, mas o ambiente não teve memória suficiente para carregá-lo. "
+                "Tente reduzir o payload do core/parquet ou aumentar a memória do serviço no Render."
+            )
+            return
+
         # IMPORTANTE: Você precisa ter os dados brutos em algum lugar!
         # Opção 1: Se os dados brutos estão em um arquivo
         raw_data_path = Path("data/kintuadi_latest.json")  # ou o caminho correto
