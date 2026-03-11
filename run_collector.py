@@ -164,18 +164,47 @@ def _has_upstream() -> bool:
     return probe.returncode == 0
 
 
-def _push_with_upstream_fallback() -> None:
+def _push_once(remote: str, branch: str, force_with_lease: bool = False) -> None:
     if _has_upstream():
-        subprocess.run(["git", "push"], check=True)
-        return
+        cmd = ["git", "push"]
+        if force_with_lease:
+            cmd.append("--force-with-lease")
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    else:
+        logger.info(f"Branch '{branch}' sem upstream; configurando tracking em {remote}/{branch}.")
+        cmd = ["git", "push", "--set-upstream", remote, branch]
+        if force_with_lease:
+            cmd.append("--force-with-lease")
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
 
+
+def _push_with_upstream_fallback(force_with_lease: bool = False) -> None:
     branch = _get_current_branch()
     remote = _get_default_remote()
-    logger.info(f"Branch '{branch}' sem upstream; configurando tracking em {remote}/{branch}.")
-    subprocess.run(["git", "push", "--set-upstream", remote, branch], check=True)
+
+    try:
+        _push_once(remote=remote, branch=branch, force_with_lease=force_with_lease)
+    except subprocess.CalledProcessError as e:
+        if _is_non_fast_forward_error(e):
+            _pull_rebase(remote, branch)
+            _push_once(remote=remote, branch=branch, force_with_lease=force_with_lease)
+        else:
+            raise
 
 
-def publish_core_to_github(push: bool = True):
+def _is_non_fast_forward_error(err: Exception) -> bool:
+    stdout = getattr(err, "stdout", "") or ""
+    stderr = getattr(err, "stderr", "") or ""
+    msg = f"{err} {stdout} {stderr}".lower()
+    return any(s in msg for s in ["fetch first", "non-fast-forward", "failed to push some refs", "updates were rejected"])
+
+
+def _pull_rebase(remote: str, branch: str) -> None:
+    logger.info(f"Sincronizando branch local com {remote}/{branch} via pull --rebase --autostash.")
+    subprocess.run(["git", "pull", "--rebase", "--autostash", remote, branch], check=True, capture_output=True, text=True)
+
+
+def publish_core_to_github(push: bool = True, force_with_lease: bool = False):
     src = Path("data") / "core_analysis_latest.parquet"
     dst = Path("core_analysis_latest.parquet")
     if not src.exists():
@@ -197,7 +226,7 @@ def publish_core_to_github(push: bool = True):
 
         if push:
             try:
-                _push_with_upstream_fallback()
+                _push_with_upstream_fallback(force_with_lease=force_with_lease)
                 logger.info("Push para GitHub realizado com sucesso.")
             except Exception as push_e:
                 logger.warning(f"Commit feito, mas push falhou: {push_e}")
@@ -207,7 +236,7 @@ def publish_core_to_github(push: bool = True):
         return False
 
 
-def run_pipeline_and_publish(push: bool = True, persist_mode: str = "full"):
+def run_pipeline_and_publish(push: bool = True, persist_mode: str = "full", force_with_lease: bool = False):
     logger.info("Iniciando pipeline completo: coleta → integração → análise → publicação do parquet")
     collected = run_collector_v2(persist_mode=persist_mode)
     if not collected:
@@ -219,7 +248,7 @@ def run_pipeline_and_publish(push: bool = True, persist_mode: str = "full"):
         logger.error("Análise (core) falhou.")
         return False
 
-    return publish_core_to_github(push=push)
+    return publish_core_to_github(push=push, force_with_lease=force_with_lease)
 
 def main():
     """Função principal"""
@@ -338,6 +367,7 @@ def parse_args():
     parser.add_argument("--daily-parquet", action="store_true", help="Executa pipeline e publica apenas core_analysis_latest.parquet")
     parser.add_argument("--persist-mode", choices=["full", "incremental"], default="incremental", help="Modo de persistência da coleta")
     parser.add_argument("--no-push", action="store_true", help="Faz commit local sem push")
+    parser.add_argument("--force-with-lease", action="store_true", help="Em caso de push, usa --force-with-lease (somente se necessário)")
     return parser.parse_args()
 
 
@@ -346,7 +376,7 @@ if __name__ == "__main__":
     try:
         if args.daily_parquet:
             setup_environment()
-            ok = run_pipeline_and_publish(push=not args.no_push, persist_mode=args.persist_mode)
+            ok = run_pipeline_and_publish(push=not args.no_push, persist_mode=args.persist_mode, force_with_lease=args.force_with_lease)
             sys.exit(0 if ok else 1)
         main()
     except KeyboardInterrupt:
