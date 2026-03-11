@@ -2035,32 +2035,12 @@ def _compute_advanced_cross_metrics(
         if not idx.empty:
             idx = idx.sort_values().unique()
             df_e = pd.DataFrame(index=idx)
-
-            # Extrai o ano a partir do índice temporal do dataframe
-            df_e["ano"] = df_e.index.year
-
-            # Teto regulatório do PLD por ano
-            PLD_TETO_ANO = {
-                2021: 583.88,
-                2022: 640.11,
-                2023: 678.29,
-                2024: 716.80,
-                2025: 1470.57,
-                2026: 1611.04
-            }
-
-            # Aplica o teto conforme o ano da observação
-            df_e["pld_teto"] = df_e["ano"].map(PLD_TETO_ANO)
-
-            # Fallback para anos não definidos no dicionário
-            # Usa o maior PLD observado naquele ano
-            fallback = df_e.groupby("ano")["pld"].transform("max")
-
-            # Preenche valores ausentes de teto regulatório
-            df_e["pld_teto"] = df_e["pld_teto"].fillna(fallback)
-            df_e["price_cap_binding"] = df_e["pld"] >= df_e["pld_teto"] * 0.95
-
+            df_e.index = pd.to_datetime(df_e.index)
+            year = df_e.index.year
             df_e["pld"] = pd.to_numeric(pld_h.reindex(idx), errors="coerce")
+            df_e["ano"] = df_e.index.year
+            df_e["pld_teto"] = df_e["pld"].groupby(year).transform("max")
+            df_e["pld_no_teto"] = df_e["pld"] >= df_e["pld_teto"] * 0.95
             df_e["cmo"] = pd.to_numeric(cmo_dom.reindex(idx), errors="coerce")
             df_e["load"] = pd.to_numeric(carga_sin.reindex(idx), errors="coerce")
             df_e["solar"] = pd.to_numeric(solar.reindex(idx), errors="coerce")
@@ -2106,7 +2086,8 @@ def _compute_advanced_cross_metrics(
             df_e["Thermal_inflex_ratio"] = (df_e["thermal_inflex"] / df_e["thermal_total"].replace(0, np.nan)).clip(lower=0, upper=1)
 
             # Step 2-10
-            df_e["SIN_cost_R$/h"] = df_e["geracao_total"] * df_e["pld"]
+            
+            df_e["SIN_cost_R$/h"] = df_e["load"] * df_e["pld"]
             df_e["thermal_real_cost"] = df_e["thermal_total"] * df_e["cvu_semana"]
             df_e["thermal_merit_cost"] = df_e["thermal_merit"] * df_e["cvu_semana"]
             df_e["thermal_prudential_dispatch"] = df_e["thermal_total"] - df_e["thermal_merit"]
@@ -2121,31 +2102,23 @@ def _compute_advanced_cross_metrics(
                 np.where(df_e["Hydro_gap"].abs() <= tol, "Hydro Necessary", "Hydro Deficit"),
             )
 
-            df_e["Hydro_preserved"] = (df_e["disp_sync_uhe"] - df_e["hydro"])
+            df_e["Hydro_preserved"] = (df_e["disp_sync_uhe"] - df_e["hydro"]).clip(lower=0)
             df_e["Water_value_R$/h"] = df_e["Hydro_preserved"] * df_e["cmo"]
             df_e["Curtailment_loss_R$/h"] = df_e["curtailed"] * df_e["pld"]
             df_e["avoidable_curtailment"] = df_e["curtailed"] * (1 - df_e["Thermal_inflex_ratio"].fillna(1))
-            
-            cond_price_cap = df_e["pld"] >= df_e["pld_teto"] * 0.999
-            df_e["CVaR_implicit"] = np.where(
-                cond_price_cap & (df_e["cmo"] > df_e["pld"]),
-                df_e["cmo"] - df_e["pld"],
-                (df_e["pld"] - df_e["cmo"]).clip(lower=0)
-            )
+            df_e["CVaR_implicit"] = (df_e["pld"] - df_e["cmo"]).clip(lower=0)
+            df_e.loc[df_e["pld_no_teto"], "CVaR_implicit"] = np.nan
             df_e["Risk_Aversion_Gap"] = df_e["CVaR_implicit"] - df_e["cvu_semana"]
             df_e["T_prudencia"] = np.where(
                 df_e["cmo"] > df_e["pld"],
                 df_e["Hydro_preserved"] * (df_e["cmo"] - df_e["pld"]),
-                df_e["Hydro_preserved"] * 0
+                0
             )
-            df_e["T_total"] = df_e["SIN_cost_R$/h"]
             df_e["T_eletric"] = df_e["thermal_merit_cost"]
             df_e["T_hidro"] = df_e["Water_value_R$/h"]
-            df_e["T_sistemica"] = np.where(
-                    df_e["cmo"] > df_e["pld"],
-                    df_e["geracao_total"] * (df_e["cmo"] - df_e["pld"]),
-                    df_e["geracao_total"] * (df_e["pld"] - df_e["cmo"])
-            )
+            df_e["T_sistemica"] = df_e["geracao_total"] * (df_e["cmo"] - df_e["pld"])
+            df_e["T_total"] = (df_e["T_eletric"] + df_e["T_hidro"] + df_e["T_prudencia"] + df_e["T_sistemica"])
+            df_e["infra_marginal_rent"] = df_e["SIN_cost_R$/h"] - (df_e["T_eletric"] + df_e["T_hidro"] + df_e["T_prudencia"] + df_e["T_sistemica"])
 
             economic = {
                 "dominant_submarket": dominant_sm,
@@ -2157,6 +2130,7 @@ def _compute_advanced_cross_metrics(
                     "Thermal_inflex_ratio": _series_to_hourly_dict(df_e["Thermal_inflex_ratio"]),
                 },
                 "sin_cost_hourly": _series_to_hourly_dict(df_e["SIN_cost_R$/h"], ndigits=4),
+                "infra_marginal_rent_hourly": _series_to_hourly_dict(df_e["infra_marginal_rent"], ndigits=4),
                 "disp_sync_uhe_hourly": _series_to_hourly_dict(df_e["disp_sync_uhe"], ndigits=4),
                 "geracao_total_hourly": _series_to_hourly_dict(df_e["geracao_total"], ndigits=4),
                 "pld_hourly": _series_to_hourly_dict(df_e["pld"], ndigits=4),
@@ -2889,15 +2863,34 @@ def _try_load_fresh_core_cache(output_dir: str = "data") -> Optional[Dict[str, A
     """Retorna core já persistido quando está sincronizado com o DuckDB (atalho de performance)."""
     try:
         final_path = os.path.join(output_dir, "core_analysis_latest.json")
-        if not os.path.exists(final_path) or not os.path.exists(_DUCKDB_PATH):
+        parquet_path = os.path.join(output_dir, "core_analysis_latest.parquet")
+        if not os.path.exists(_DUCKDB_PATH):
             return None
 
-        with open(final_path, "r", encoding="utf-8") as f:
-            cached = json.load(f)
+        cached: Optional[Dict[str, Any]] = None
+        cache_path = None
+
+        if os.path.exists(parquet_path):
+            con = duckdb.connect()
+            try:
+                row = con.execute(
+                    "SELECT core_json FROM read_parquet(?) LIMIT 1",
+                    [parquet_path],
+                ).fetchone()
+                if row and row[0]:
+                    cached = json.loads(row[0])
+                    cache_path = parquet_path
+            finally:
+                con.close()
+        elif os.path.exists(final_path):
+            with open(final_path, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            cache_path = final_path
+
         if not isinstance(cached, dict):
             return None
 
-        core_mtime = os.path.getmtime(final_path)
+        core_mtime = os.path.getmtime(cache_path)
         db_mtime = os.path.getmtime(_DUCKDB_PATH)
 
         # Se o DB não mudou desde a geração do core, reaproveita.
@@ -3252,6 +3245,8 @@ def build_core_analysis(raw_data: Dict[str, Any], output_dir: str = "data", forc
     # 2) Salvar em arquivo temporário primeiro
     temp_path = os.path.join(output_dir, "core_analysis_temp.json")
     final_path = os.path.join(output_dir, "core_analysis_latest.json")
+    temp_parquet_path = os.path.join(output_dir, "core_analysis_temp.parquet")
+    final_parquet_path = os.path.join(output_dir, "core_analysis_latest.parquet")
 
     try:
         with open(temp_path, "w", encoding="utf-8") as f:
@@ -3276,11 +3271,34 @@ def build_core_analysis(raw_data: Dict[str, Any], output_dir: str = "data", forc
         # 4) Promover temp para definitivo de forma atômica quando possível
         os.replace(temp_path, final_path)
 
+        # 5) Exportar o mesmo payload em Parquet para consumo da aplicação
+        payload_df = pd.DataFrame([
+            {
+                "timestamp": core.get("timestamp"),
+                "core_json": json.dumps(core, ensure_ascii=False, default=str),
+            }
+        ])
+        con = duckdb.connect()
+        try:
+            con.register("core_payload", payload_df)
+            con.execute(
+                "COPY core_payload TO ? (FORMAT PARQUET, COMPRESSION ZSTD)",
+                [temp_parquet_path],
+            )
+            os.replace(temp_parquet_path, final_parquet_path)
+        finally:
+            con.close()
+
     except Exception as e:
         _core_log("PERSIST", "Falha ao salvar core_analysis_latest.json", final_path=final_path, erro=str(e))
         if os.path.exists(temp_path):
             try:
                 os.remove(temp_path)
+            except Exception:
+                pass
+        if os.path.exists(temp_parquet_path):
+            try:
+                os.remove(temp_parquet_path)
             except Exception:
                 pass
         raise
@@ -3290,5 +3308,11 @@ def build_core_analysis(raw_data: Dict[str, Any], output_dir: str = "data", forc
         "core_analysis_latest.json salvo com sucesso",
         path=final_path,
         tamanho_bytes=os.path.getsize(final_path),
+    )
+    _core_log(
+        "PERSIST",
+        "core_analysis_latest.parquet salvo com sucesso",
+        path=final_parquet_path,
+        tamanho_bytes=os.path.getsize(final_parquet_path),
     )
     return core
