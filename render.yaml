@@ -15,10 +15,10 @@ services:
     # ========================================================================
     
     env: docker
-    dockerfilePath: ./Dockerfile.optimized
+    dockerfilePath: ./Dockerfile
     
     # Plano de preço
-    # - free: 0.5GB RAM (⚠️ arriscado com 410MB JSON)
+    # - free: 0.5GB RAM (⚠️ arriscado com datasets grandes)
     # - standard: 512MB RAM (✅ RECOMENDADO)
     # - pro: 2GB RAM (✅ MELHOR)
     plan: standard
@@ -57,7 +57,7 @@ services:
     healthCheckTimeout: 10
     
     # Aguarda esse tempo antes do primeiro health check
-    # IMPORTANTE: Aumentar para 60s (tempo de descompactar JSON)
+    # IMPORTANTE: manter folga para carregar o app e o parquet
     startPeriod: 60
     
     # Número de falhas antes de restart
@@ -72,18 +72,15 @@ services:
     # Útil para validações, cleanup, etc.
     
     buildCommand: |
-      echo "🔍 Validando arquivo JSON gzip..."
-      if [ ! -f "core_analysis_latest.json.gz" ]; then
-        echo "❌ ERRO: core_analysis_latest.json.gz não encontrado!"
-        echo "Por favor, faça upload do arquivo antes de fazer push"
+      echo "🔍 Validando artefato Parquet para deploy..."
+      if [ ! -f "core_analysis_latest.parquet" ]; then
+        echo "❌ ERRO: core_analysis_latest.parquet não encontrado!"
+        echo "Execute a rotina diária para gerar/publicar o arquivo antes do deploy"
         exit 1
       fi
-      
+
       echo "✅ Arquivo encontrado"
-      ls -lh core_analysis_latest.json.gz
-      
-      echo "💡 Dica: Este arquivo será descompactado durante o Docker build"
-      echo "   (Leva ~30-60 segundos, mas só acontece uma vez)"
+      ls -lh core_analysis_latest.parquet
     
     
     # ========================================================================
@@ -198,8 +195,8 @@ services:
 #
 # Antes de fazer git push:
 #
-# ☐ core_analysis_latest.json.gz está no root do projeto
-# ☐ Dockerfile.optimized está no root
+# ☐ core_analysis_latest.parquet está no root do projeto
+# ☐ Dockerfile está no root
 # ☐ requirements.txt está atualizado
 # ☐ Testou localmente: docker build -t kintuadi . && docker run -p 8501:8501 kintuadi
 # ☐ Conectou Render ao repositório GitHub
@@ -217,7 +214,7 @@ services:
 #
 # ☐ Aumentar startPeriod de 60 para 90 segundos
 # ☐ Aumentar plano para Pro (2GB RAM)
-# ☐ Verificar tamanho do JSON (pode ser > 410MB?)
+# ☐ Verificar tamanho do parquet e memória disponível
 # ☐ Considerar refatorar para Opção 4 (DuckDB + Parquet)
 #
 # ============================================================================
@@ -232,18 +229,18 @@ services:
 #
 # Erro: "Dockerfile not found"
 # Causa: dockerfilePath incorreto
-# Solução: Verificar caminho (./Dockerfile.optimized)
+# Solução: Verificar caminho (./Dockerfile)
 #
-# Erro: "core_analysis_latest.json.gz not found"
+# Erro: "core_analysis_latest.parquet not found"
 # Causa: Arquivo não versionado no Git
-# Solução: git add core_analysis_latest.json.gz && git commit && git push
+# Solução: git add core_analysis_latest.parquet && git commit && git push
 #
 # Erro: "No service available"
 # Causa: Build falhou silenciosamente
 # Solução: Ver logs do build no dashboard
 #
 # Erro: "Memory exceeded"
-# Causa: 410MB JSON + Streamlit > 512MB RAM
+# Causa: dataset grande + Streamlit > 512MB RAM
 # Solução: Aumentar para Pro (2GB) ou usar DuckDB (50MB)
 #
 # ============================================================================
