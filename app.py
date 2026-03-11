@@ -12,7 +12,44 @@ import requests
 import duckdb
 
 
+# Seções que formam o core completo
+_SECTION_KEYS = ["advanced_metrics", "economic", "operacao", "ccee", "renewables"]
+_SECTION_PARQUET_DIRS = ["data", "."]
+
+
+def _is_lfs_pointer(p: Path) -> bool:
+    """True se o arquivo é um ponteiro Git LFS (objeto real não baixado)."""
+    try:
+        with p.open("rb") as f:
+            head = f.read(512)
+        return b"git-lfs.github.com/spec/v1" in head or b"oid sha256:" in head
+    except Exception:
+        return False
+
+
+def _section_parquet_path(section: str) -> Optional[Path]:
+    """Retorna o Path do parquet de seção se existir e não for LFS, senão None."""
+    for d in _SECTION_PARQUET_DIRS:
+        p = Path(d) / f"core_section_{section}.parquet"
+        if p.exists() and not _is_lfs_pointer(p):
+            return p
+    return None
+
+
+def _all_sections_available() -> bool:
+    """True se todos os 5 parquets de seção estão prontos para leitura."""
+    return all(_section_parquet_path(s) is not None for s in _SECTION_KEYS)
+
+
 def _core_cache_token() -> str:
+    """Token de cache: prioriza seções quando disponíveis, senão usa arquivos legados."""
+    if _all_sections_available():
+        parts = []
+        for s in _SECTION_KEYS:
+            p = _section_parquet_path(s)
+            stt = p.stat()
+            parts.append(f"{p}:{int(stt.st_mtime)}:{stt.st_size}")
+        return "sections|" + "|".join(parts)
     watched = [
         Path("data/core_analysis_latest.parquet"),
         Path("core_analysis_latest.parquet"),
@@ -31,9 +68,10 @@ def _core_cache_token() -> str:
 
 def _core_file_diagnostics() -> list[str]:
     msgs = []
-    # Parquet e JSON legados
-    for p in [Path("data/core_analysis_latest.parquet"), Path("core_analysis_latest.parquet"),
-              Path("data/core_analysis_latest.json"), Path("core_analysis_latest.json")]:
+    for p in [
+        Path("data/core_analysis_latest.parquet"), Path("core_analysis_latest.parquet"),
+        Path("data/core_analysis_latest.json"),    Path("core_analysis_latest.json"),
+    ]:
         if not p.exists():
             msgs.append(f"{p}: ausente")
             continue
@@ -42,23 +80,16 @@ def _core_file_diagnostics() -> list[str]:
             with p.open("rb") as f:
                 head = f.read(512)
             if b"git-lfs.github.com/spec/v1" in head or b"oid sha256:" in head:
-                msgs.append(f"{p}: ponteiro Git LFS — objeto real não baixado (ignorado)")
+                msgs.append(f"{p}: ponteiro Git LFS — ignorado")
                 continue
         except Exception:
             pass
         msgs.append(f"{p}: presente ({size:,} bytes)")
-
-    # Parquets de seção
-    sections = ["advanced_metrics", "economic", "operacao", "ccee", "renewables"]
-    for sec in sections:
-        found = False
-        for d in ["data", "."]:
-            sp = Path(d) / f"core_section_{sec}.parquet"
-            if sp.exists():
-                msgs.append(f"{sp}: presente ({sp.stat().st_size:,} bytes) ✓")
-                found = True
-                break
-        if not found:
+    for sec in _SECTION_KEYS:
+        sp = _section_parquet_path(sec)
+        if sp:
+            msgs.append(f"{sp}: presente ({sp.stat().st_size:,} bytes) ✓")
+        else:
             msgs.append(f"core_section_{sec}.parquet: ausente")
     return msgs
 
@@ -105,66 +136,78 @@ def _decode_parquet_row(row: Any, columns: list[str]) -> Dict[str, Any]:
     return {}
 
 
-def _is_lfs_pointer(p: Path) -> bool:
-    """Retorna True se o arquivo é um ponteiro Git LFS (objeto real não baixado)."""
+def _read_section_parquet(p: Path) -> Optional[Dict[str, Any]]:
+    """Lê um parquet de seção e retorna o dict desserializado, ou None em caso de falha."""
     try:
-        with p.open("rb") as f:
-            head = f.read(512)
-        return b"git-lfs.github.com/spec/v1" in head or b"oid sha256:" in head
+        con = duckdb.connect()
+        try:
+            _configure_duckdb_low_memory(con)
+            try:
+                row = con.execute("SELECT section_json FROM read_parquet(?) LIMIT 1", [str(p)]).fetchone()
+            except Exception:
+                quoted = str(p).replace("'", "''")
+                row = con.execute(f"SELECT section_json FROM read_parquet('{quoted}') LIMIT 1").fetchone()
+        finally:
+            con.close()
+        if row and row[0]:
+            val = row[0]
+            if isinstance(val, str) and val.strip():
+                loaded = json.loads(val)
+                if isinstance(loaded, (dict, list)):
+                    return loaded
+            elif isinstance(val, (dict, list)):
+                return val
     except Exception:
-        return False
+        pass
+    return None
 
 
 @st.cache_data
 def _load_core(_token: str) -> Tuple[Dict[str, Any], List[str]]:
-
-    parquet_paths = [
-        Path("data/core_analysis_latest.parquet"),
-        Path("core_analysis_latest.parquet"),
-    ]
     errors: List[str] = []
 
-    for p in parquet_paths:
-        if not p.exists():
-            continue
-        # Ignorar ponteiros Git LFS silenciosamente — o arquivo real não foi baixado
-        if _is_lfs_pointer(p):
-            errors.append(f"{p}: ponteiro Git LFS ignorado (objeto real não disponível no deploy)")
+    # ── PRIORIDADE 1: montar core a partir dos parquets de seção (sem carregar o monolito) ──
+    if _all_sections_available():
+        core: Dict[str, Any] = {}
+        for section in _SECTION_KEYS:
+            p = _section_parquet_path(section)
+            data = _read_section_parquet(p)
+            if data is not None:
+                core[section] = data
+            else:
+                errors.append(f"{p}: falha ao ler parquet de seção '{section}'")
+        if core:
+            return core, errors
+
+    # ── PRIORIDADE 2: parquet monolítico (legado) ──
+    for p in [Path("data/core_analysis_latest.parquet"), Path("core_analysis_latest.parquet")]:
+        if not p.exists() or _is_lfs_pointer(p):
+            if p.exists():
+                errors.append(f"{p}: ponteiro Git LFS ignorado")
             continue
         try:
             con = duckdb.connect()
             try:
                 _configure_duckdb_low_memory(con)
                 quoted = str(p).replace("'", "''")
-
-                # Tentativa 1: API parametrizada (preferível)
                 try:
                     cols = [c[0] for c in con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(p)]).fetchall()]
                     row = con.execute("SELECT * FROM read_parquet(?) LIMIT 1", [str(p)]).fetchone()
                 except Exception:
-                    # Tentativa 2: SQL literal (compatibilidade com builds antigos do DuckDB)
                     cols = [c[0] for c in con.execute(f"DESCRIBE SELECT * FROM read_parquet('{quoted}')").fetchall()]
                     row = con.execute(f"SELECT * FROM read_parquet('{quoted}') LIMIT 1").fetchone()
             finally:
                 con.close()
-
             decoded = _decode_parquet_row(row, cols)
             if decoded:
                 return decoded, errors
             errors.append(f"{p}: parquet lido, mas estrutura não reconhecida (colunas={cols[:8]})")
         except Exception as e:
             errors.append(f"{p}: falha ao ler parquet ({type(e).__name__}: {e})")
-            continue
 
-    json_paths = [
-        Path("data/core_analysis_latest.json"),
-        Path("core_analysis_latest.json"),
-    ]
-    for p in json_paths:
-        if not p.exists():
-            continue
-        if _is_lfs_pointer(p):
-            errors.append(f"{p}: ponteiro Git LFS ignorado")
+    # ── PRIORIDADE 3: JSON ──
+    for p in [Path("data/core_analysis_latest.json"), Path("core_analysis_latest.json")]:
+        if not p.exists() or _is_lfs_pointer(p):
             continue
         try:
             with p.open("r", encoding="utf-8") as f:
@@ -184,84 +227,33 @@ def _load_core(_token: str) -> Tuple[Dict[str, Any], List[str]]:
 #    return {}
 
 
-# =====================================================================
-# CARREGAMENTO LAZY POR SEÇÃO — parquets segmentados
-# =====================================================================
-
-_SECTION_PARQUET_DIRS = ["data", "."]
-_VALID_SECTIONS = {"advanced_metrics", "economic", "operacao", "ccee", "renewables"}
-
-
 def _section_cache_token(section: str) -> str:
-    """Token de cache baseado em mtime/tamanho do parquet de seção."""
-    for d in _SECTION_PARQUET_DIRS:
-        p = Path(d) / f"core_section_{section}.parquet"
-        if p.exists():
-            stt = p.stat()
-            return f"{p}:{int(stt.st_mtime)}:{stt.st_size}"
+    p = _section_parquet_path(section)
+    if p:
+        stt = p.stat()
+        return f"{p}:{int(stt.st_mtime)}:{stt.st_size}"
     return f"{section}:missing"
 
 
 @st.cache_data
 def _load_section(_token: str, section: str) -> Tuple[Dict[str, Any], List[str]]:
-    """
-    Carrega apenas uma seção do core a partir do parquet segmentado.
-    Seções: advanced_metrics, economic, operacao, ccee, renewables.
-    Fallback automático para core completo se parquets de seção ainda não existirem.
-    """
-    if section not in _VALID_SECTIONS:
-        return {}, [f"Seção '{section}' inválida. Válidas: {sorted(_VALID_SECTIONS)}"]
-
+    """Carrega uma seção isolada. Fallback para core completo se parquet de seção ausente."""
     errors: List[str] = []
-
-    for d in _SECTION_PARQUET_DIRS:
-        p = Path(d) / f"core_section_{section}.parquet"
-        if not p.exists():
-            continue
-        if _is_lfs_pointer(p):
-            errors.append(f"{p}: ponteiro Git LFS ignorado")
-            continue
-        try:
-            con = duckdb.connect()
-            try:
-                _configure_duckdb_low_memory(con)
-                try:
-                    row = con.execute("SELECT section_json FROM read_parquet(?) LIMIT 1", [str(p)]).fetchone()
-                except Exception:
-                    quoted = str(p).replace("'", "''")
-                    row = con.execute(f"SELECT section_json FROM read_parquet('{quoted}') LIMIT 1").fetchone()
-            finally:
-                con.close()
-
-            if row and row[0]:
-                val = row[0]
-                if isinstance(val, str) and val.strip():
-                    loaded = json.loads(val)
-                    if isinstance(loaded, dict):
-                        return loaded, errors
-                elif isinstance(val, dict):
-                    return val, errors
-
-            errors.append(f"{p}: parquet de seção lido, mas conteúdo não reconhecido")
-        except Exception as e:
-            errors.append(f"{p}: falha ao ler ({type(e).__name__}: {e})")
-
-    # Fallback: extrai do core completo (compatibilidade com deploys sem parquets de seção)
-    token = _core_cache_token()
-    core, core_errors = _load_core(token)
+    p = _section_parquet_path(section)
+    if p:
+        data = _read_section_parquet(p)
+        if data is not None:
+            return (data if isinstance(data, dict) else {}), errors
+        errors.append(f"{p}: falha ao desserializar seção '{section}'")
+    # Fallback: extrai do core completo
+    core, core_errors = _load_core(_core_cache_token())
     errors.extend(core_errors)
-    if core:
-        data = core.get(section, {})
-        if data:
-            return data, errors
-    errors.append(f"Seção '{section}' não encontrada em nenhuma fonte disponível.")
-    return {}, errors
+    return core.get(section, {}), errors
 
 
 def _get_section(section: str) -> Dict[str, Any]:
-    """Atalho: retorna dados da seção sem expor erros. Ex: _get_section('operacao')"""
-    token = _section_cache_token(section)
-    data, _ = _load_section(token, section)
+    """Atalho: retorna dados da seção. Ex: _get_section('operacao')"""
+    data, _ = _load_section(_section_cache_token(section), section)
     return data or {}
 
 
@@ -576,38 +568,23 @@ def main():
     core, core_load_errors = _load_core(_core_cache_token())
     if not core:
         st.warning("⚠️ Nenhum arquivo de análise válido encontrado. Gerando nova análise a partir do DuckDB...")
-        with st.expander("🔎 Diagnóstico de arquivos", expanded=False):
+        with st.expander("🔎 Diagnóstico de arquivos", expanded=True):
             for _msg in _core_file_diagnostics():
                 st.caption(f"• {_msg}")
             for _err in core_load_errors:
                 st.caption(f"🧪 {_err}")
 
-        has_oom = any("OutOfMemoryException" in e or "Out of Memory" in e for e in core_load_errors)
-        # Verifica se existe parquet real (não LFS) que causou OOM
-        real_parquet = any(
-            p.exists() and not _is_lfs_pointer(p)
-            for p in [Path("data/core_analysis_latest.parquet"), Path("core_analysis_latest.parquet")]
-        )
-        if real_parquet and has_oom:
-            st.error(
-                "❌ O parquet foi encontrado, mas o ambiente não teve memória suficiente para carregá-lo. "
-                "Tente reduzir o payload do core/parquet ou aumentar a memória do serviço no Render."
-            )
-            return
-
         try:
             from scripts.core_analysis import build_core_analysis
         except ImportError:
-            st.error("❌ Não foi possível importar `build_core_analysis` de `scripts.core_analysis`. "
-                     "Verifique se o arquivo existe em `C:\\repos\\Kintuadi-Energy\\scripts\\core_analysis.py`.")
+            st.error("❌ Não foi possível importar `build_core_analysis` de `scripts.core_analysis`.")
             return
 
         try:
             with st.spinner("⏳ Executando análise completa do SIN..."):
-                # No modo DuckDB-only, raw_data não precisa de fontes externas —
-                # todas as leituras são feitas diretamente do kintuadi.duckdb.
-                _raw_data_empty = {"sources": {"ons": {}, "ccee": {}}}
-                new_core = build_core_analysis(_raw_data_empty)
+                # No modo DuckDB-only, raw_data não precisa de fontes externas
+                _raw_empty = {"sources": {"ons": {}, "ccee": {}}}
+                new_core = build_core_analysis(_raw_empty)
 
             if not new_core:
                 st.error("❌ build_core_analysis retornou vazio. Verifique o DuckDB em data/kintuadi.duckdb.")
@@ -618,11 +595,8 @@ def main():
             if missing:
                 st.warning(f"⚠️ Análise gerada, mas faltam campos: {missing}")
 
-            os.makedirs("data", exist_ok=True)
-            with open("data/core_analysis_latest.json", "w", encoding="utf-8") as f:
-                json.dump(new_core, f, indent=2, ensure_ascii=False, default=str)
-
             st.success(f"✅ Análise gerada com sucesso! Timestamp: {new_core.get('timestamp', 'N/A')}")
+            st.info("🔄 Recarregue a página para carregar os novos parquets de seção.")
             core = new_core
 
         except Exception as e:
