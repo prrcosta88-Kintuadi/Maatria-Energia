@@ -31,22 +31,35 @@ def _core_cache_token() -> str:
 
 def _core_file_diagnostics() -> list[str]:
     msgs = []
-    for p in [Path("data/core_analysis_latest.parquet"), Path("core_analysis_latest.parquet")]:
+    # Parquet e JSON legados
+    for p in [Path("data/core_analysis_latest.parquet"), Path("core_analysis_latest.parquet"),
+              Path("data/core_analysis_latest.json"), Path("core_analysis_latest.json")]:
         if not p.exists():
             msgs.append(f"{p}: ausente")
             continue
         size = p.stat().st_size
-        pointer = False
         try:
             with p.open("rb") as f:
-                head = f.read(200)
-            pointer = b"git-lfs.github.com/spec/v1" in head
+                head = f.read(512)
+            if b"git-lfs.github.com/spec/v1" in head or b"oid sha256:" in head:
+                msgs.append(f"{p}: ponteiro Git LFS — objeto real não baixado (ignorado)")
+                continue
         except Exception:
             pass
-        if pointer:
-            msgs.append(f"{p}: presente ({size} bytes), mas é ponteiro Git LFS (objeto real não baixado)")
-        else:
-            msgs.append(f"{p}: presente ({size} bytes)")
+        msgs.append(f"{p}: presente ({size:,} bytes)")
+
+    # Parquets de seção
+    sections = ["advanced_metrics", "economic", "operacao", "ccee", "renewables"]
+    for sec in sections:
+        found = False
+        for d in ["data", "."]:
+            sp = Path(d) / f"core_section_{sec}.parquet"
+            if sp.exists():
+                msgs.append(f"{sp}: presente ({sp.stat().st_size:,} bytes) ✓")
+                found = True
+                break
+        if not found:
+            msgs.append(f"core_section_{sec}.parquet: ausente")
     return msgs
 
 
@@ -92,6 +105,16 @@ def _decode_parquet_row(row: Any, columns: list[str]) -> Dict[str, Any]:
     return {}
 
 
+def _is_lfs_pointer(p: Path) -> bool:
+    """Retorna True se o arquivo é um ponteiro Git LFS (objeto real não baixado)."""
+    try:
+        with p.open("rb") as f:
+            head = f.read(512)
+        return b"git-lfs.github.com/spec/v1" in head or b"oid sha256:" in head
+    except Exception:
+        return False
+
+
 @st.cache_data
 def _load_core(_token: str) -> Tuple[Dict[str, Any], List[str]]:
 
@@ -103,6 +126,10 @@ def _load_core(_token: str) -> Tuple[Dict[str, Any], List[str]]:
 
     for p in parquet_paths:
         if not p.exists():
+            continue
+        # Ignorar ponteiros Git LFS silenciosamente — o arquivo real não foi baixado
+        if _is_lfs_pointer(p):
+            errors.append(f"{p}: ponteiro Git LFS ignorado (objeto real não disponível no deploy)")
             continue
         try:
             con = duckdb.connect()
@@ -134,9 +161,16 @@ def _load_core(_token: str) -> Tuple[Dict[str, Any], List[str]]:
         Path("core_analysis_latest.json"),
     ]
     for p in json_paths:
-        if p.exists():
+        if not p.exists():
+            continue
+        if _is_lfs_pointer(p):
+            errors.append(f"{p}: ponteiro Git LFS ignorado")
+            continue
+        try:
             with p.open("r", encoding="utf-8") as f:
                 return json.load(f), errors
+        except Exception as e:
+            errors.append(f"{p}: falha ao ler JSON ({type(e).__name__}: {e})")
 
     return {}, errors
 
@@ -148,6 +182,87 @@ def _load_core(_token: str) -> Tuple[Dict[str, Any], List[str]]:
 #            with p.open("r", encoding="utf-8") as f:
 #                return json.load(f)
 #    return {}
+
+
+# =====================================================================
+# CARREGAMENTO LAZY POR SEÇÃO — parquets segmentados
+# =====================================================================
+
+_SECTION_PARQUET_DIRS = ["data", "."]
+_VALID_SECTIONS = {"advanced_metrics", "economic", "operacao", "ccee", "renewables"}
+
+
+def _section_cache_token(section: str) -> str:
+    """Token de cache baseado em mtime/tamanho do parquet de seção."""
+    for d in _SECTION_PARQUET_DIRS:
+        p = Path(d) / f"core_section_{section}.parquet"
+        if p.exists():
+            stt = p.stat()
+            return f"{p}:{int(stt.st_mtime)}:{stt.st_size}"
+    return f"{section}:missing"
+
+
+@st.cache_data
+def _load_section(_token: str, section: str) -> Tuple[Dict[str, Any], List[str]]:
+    """
+    Carrega apenas uma seção do core a partir do parquet segmentado.
+    Seções: advanced_metrics, economic, operacao, ccee, renewables.
+    Fallback automático para core completo se parquets de seção ainda não existirem.
+    """
+    if section not in _VALID_SECTIONS:
+        return {}, [f"Seção '{section}' inválida. Válidas: {sorted(_VALID_SECTIONS)}"]
+
+    errors: List[str] = []
+
+    for d in _SECTION_PARQUET_DIRS:
+        p = Path(d) / f"core_section_{section}.parquet"
+        if not p.exists():
+            continue
+        if _is_lfs_pointer(p):
+            errors.append(f"{p}: ponteiro Git LFS ignorado")
+            continue
+        try:
+            con = duckdb.connect()
+            try:
+                _configure_duckdb_low_memory(con)
+                try:
+                    row = con.execute("SELECT section_json FROM read_parquet(?) LIMIT 1", [str(p)]).fetchone()
+                except Exception:
+                    quoted = str(p).replace("'", "''")
+                    row = con.execute(f"SELECT section_json FROM read_parquet('{quoted}') LIMIT 1").fetchone()
+            finally:
+                con.close()
+
+            if row and row[0]:
+                val = row[0]
+                if isinstance(val, str) and val.strip():
+                    loaded = json.loads(val)
+                    if isinstance(loaded, dict):
+                        return loaded, errors
+                elif isinstance(val, dict):
+                    return val, errors
+
+            errors.append(f"{p}: parquet de seção lido, mas conteúdo não reconhecido")
+        except Exception as e:
+            errors.append(f"{p}: falha ao ler ({type(e).__name__}: {e})")
+
+    # Fallback: extrai do core completo (compatibilidade com deploys sem parquets de seção)
+    token = _core_cache_token()
+    core, core_errors = _load_core(token)
+    errors.extend(core_errors)
+    if core:
+        data = core.get(section, {})
+        if data:
+            return data, errors
+    errors.append(f"Seção '{section}' não encontrada em nenhuma fonte disponível.")
+    return {}, errors
+
+
+def _get_section(section: str) -> Dict[str, Any]:
+    """Atalho: retorna dados da seção sem expor erros. Ex: _get_section('operacao')"""
+    token = _section_cache_token(section)
+    data, _ = _load_section(token, section)
+    return data or {}
 
 
 def _series_from_hourly(d: Dict[str, Any], name: str) -> pd.Series:
@@ -460,64 +575,58 @@ def main():
 
     core, core_load_errors = _load_core(_core_cache_token())
     if not core:
-        st.warning("⚠️ core_analysis_latest.parquet/json não encontrado ou inválido. Gerando nova análise...")
-        for _msg in _core_file_diagnostics():
-            st.caption(f"🔎 {_msg}")
-        for _err in core_load_errors:
-            st.caption(f"🧪 {_err}")
+        st.warning("⚠️ Nenhum arquivo de análise válido encontrado. Gerando nova análise a partir do DuckDB...")
+        with st.expander("🔎 Diagnóstico de arquivos", expanded=False):
+            for _msg in _core_file_diagnostics():
+                st.caption(f"• {_msg}")
+            for _err in core_load_errors:
+                st.caption(f"🧪 {_err}")
 
         has_oom = any("OutOfMemoryException" in e or "Out of Memory" in e for e in core_load_errors)
-        parquet_exists = Path("data/core_analysis_latest.parquet").exists() or Path("core_analysis_latest.parquet").exists()
-        if parquet_exists and has_oom:
+        # Verifica se existe parquet real (não LFS) que causou OOM
+        real_parquet = any(
+            p.exists() and not _is_lfs_pointer(p)
+            for p in [Path("data/core_analysis_latest.parquet"), Path("core_analysis_latest.parquet")]
+        )
+        if real_parquet and has_oom:
             st.error(
                 "❌ O parquet foi encontrado, mas o ambiente não teve memória suficiente para carregá-lo. "
                 "Tente reduzir o payload do core/parquet ou aumentar a memória do serviço no Render."
             )
             return
 
-        # IMPORTANTE: Você precisa ter os dados brutos em algum lugar!
-        # Opção 1: Se os dados brutos estão em um arquivo
-        raw_data_path = Path("data/kintuadi_latest.json")  # ou o caminho correto
-        if raw_data_path.exists():
-            with open(raw_data_path, "r", encoding="utf-8") as f:
-                raw_data = json.load(f)
-        else:
-            st.error("❌ Arquivo de dados brutos não encontrado. Não é possível gerar nova análise.")
-            return
-        
         try:
-            # Importar a função build_core_analysis
             from scripts.core_analysis import build_core_analysis
-            
-            # PASSAR OS DADOS BRUTOS, não o core vazio!
-            new_core = build_core_analysis(raw_data)
-            
-            if new_core:
-                # Verificar estrutura básica
-                required = ["timestamp", "hydrology", "prices"]
-                missing = [key for key in required if key not in new_core]
-                
-                if missing:
-                    st.warning(f"⚠️ Análise gerada, mas faltam campos obrigatórios: {missing}")
-                
-                # Salvar o arquivo
-                os.makedirs("data", exist_ok=True)
-                with open("data/core_analysis_latest.json", "w", encoding="utf-8") as f:
-                    json.dump(new_core, f, indent=2, ensure_ascii=False, default=str)
-                
-                st.success(f"✅ Nova análise gerada e salva! Timestamp: {new_core.get('timestamp', 'N/A')}")
-                
-                # Atualizar a variável core com o novo conteúdo
-                core = new_core
-            else:
-                st.error("❌ build_core_analysis retornou None")
-                return
-                
         except ImportError:
-            st.error("❌ Não foi possível importar build_core_analysis de scripts.core_analysis")
+            st.error("❌ Não foi possível importar `build_core_analysis` de `scripts.core_analysis`. "
+                     "Verifique se o arquivo existe em `C:\\repos\\Kintuadi-Energy\\scripts\\core_analysis.py`.")
             return
+
+        try:
+            with st.spinner("⏳ Executando análise completa do SIN..."):
+                # No modo DuckDB-only, raw_data não precisa de fontes externas —
+                # todas as leituras são feitas diretamente do kintuadi.duckdb.
+                _raw_data_empty = {"sources": {"ons": {}, "ccee": {}}}
+                new_core = build_core_analysis(_raw_data_empty)
+
+            if not new_core:
+                st.error("❌ build_core_analysis retornou vazio. Verifique o DuckDB em data/kintuadi.duckdb.")
+                return
+
+            required = ["timestamp", "hydrology", "prices"]
+            missing = [k for k in required if k not in new_core]
+            if missing:
+                st.warning(f"⚠️ Análise gerada, mas faltam campos: {missing}")
+
+            os.makedirs("data", exist_ok=True)
+            with open("data/core_analysis_latest.json", "w", encoding="utf-8") as f:
+                json.dump(new_core, f, indent=2, ensure_ascii=False, default=str)
+
+            st.success(f"✅ Análise gerada com sucesso! Timestamp: {new_core.get('timestamp', 'N/A')}")
+            core = new_core
+
         except Exception as e:
-            st.error(f"❌ Erro ao gerar nova análise: {e}")
+            st.error(f"❌ Erro ao gerar análise: {e}")
             import traceback
             traceback.print_exc()
             return
