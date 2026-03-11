@@ -163,10 +163,6 @@ def _has_upstream() -> bool:
     )
     return probe.returncode == 0
 
-
-<<<<<<< codex/update-app.py-to-read-parquet-data-bxiadr
-
-
 def _is_detached_head() -> bool:
     probe = subprocess.run(["git", "symbolic-ref", "--quiet", "--short", "HEAD"], capture_output=True, text=True)
     return probe.returncode != 0
@@ -237,13 +233,8 @@ def _push_once(remote: str, branch: str, force_with_lease: bool = False) -> None
 
 
 def _push_with_upstream_fallback(force_with_lease: bool = False) -> None:
-<<<<<<< codex/update-app.py-to-read-parquet-data-bxiadr
     remote = _get_default_remote()
     branch = _ensure_clean_git_state_for_sync(remote)
-=======
-    branch = _get_current_branch()
-    remote = _get_default_remote()
->>>>>>> main
 
     try:
         _push_once(remote=remote, branch=branch, force_with_lease=force_with_lease)
@@ -269,17 +260,12 @@ def _is_non_fast_forward_error(err: Exception) -> bool:
     msg = f"{err} {stdout} {stderr}".lower()
     return any(s in msg for s in ["fetch first", "non-fast-forward", "failed to push some refs", "updates were rejected"])
 
-
-<<<<<<< codex/update-app.py-to-read-parquet-data-bxiadr
 def _has_unmerged_error(err: Exception) -> bool:
     stdout = getattr(err, "stdout", "") or ""
     stderr = getattr(err, "stderr", "") or ""
     msg = f"{err} {stdout} {stderr}".lower()
     return "you have unmerged files" in msg or "unresolved conflict" in msg
 
-
-=======
->>>>>>> main
 def _pull_rebase(remote: str, branch: str) -> None:
     logger.info(f"Sincronizando branch local com {remote}/{branch} via pull --rebase --autostash.")
     try:
@@ -290,7 +276,6 @@ def _pull_rebase(remote: str, branch: str) -> None:
             text=True,
         )
     except subprocess.CalledProcessError as e:
-<<<<<<< codex/update-app.py-to-read-parquet-data-bxiadr
         if _has_unmerged_error(e) and _is_rebase_in_progress():
             logger.warning("Pull/rebase falhou por conflitos pendentes; abortando rebase anterior e tentando novamente.")
             subprocess.run(["git", "rebase", "--abort"], check=True, capture_output=True, text=True)
@@ -301,9 +286,6 @@ def _pull_rebase(remote: str, branch: str) -> None:
                 text=True,
             )
             return
-
-=======
->>>>>>> main
         if not _has_untracked_overwrite_error(e):
             raise
 
