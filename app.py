@@ -12,41 +12,58 @@ import requests
 import duckdb
 
 
+# Secoes e caminhos
+_SECTION_KEYS = ["advanced_metrics", "economic", "operacao", "ccee", "renewables"]
+_SECTION_DIRS = ["data", "."]
+
+
+def _is_lfs_pointer(p: Path) -> bool:
+    try:
+        with p.open("rb") as f:
+            head = f.read(512)
+        return b"git-lfs.github.com/spec/v1" in head or b"oid sha256:" in head
+    except Exception:
+        return False
+
+
+def _section_path(section: str) -> Optional[Path]:
+    for d in _SECTION_DIRS:
+        p = Path(d) / f"core_section_{section}.parquet"
+        if p.exists() and not _is_lfs_pointer(p):
+            return p
+    return None
+
+
+def _all_sections_ok() -> bool:
+    return all(_section_path(s) is not None for s in _SECTION_KEYS)
+
+
 def _core_cache_token() -> str:
-    watched = [
-        Path("data/core_analysis_latest.parquet"),
-        Path("core_analysis_latest.parquet"),
-        Path("data/core_analysis_latest.json"),
-        Path("core_analysis_latest.json"),
-    ]
     parts = []
-    for p in watched:
-        if p.exists():
+    for s in _SECTION_KEYS:
+        p = _section_path(s)
+        if p:
             stt = p.stat()
             parts.append(f"{p}:{int(stt.st_mtime)}:{stt.st_size}")
         else:
-            parts.append(f"{p}:missing")
+            parts.append(f"{s}:missing")
     return "|".join(parts)
 
 
 def _core_file_diagnostics() -> list[str]:
     msgs = []
-    for p in [Path("data/core_analysis_latest.parquet"), Path("core_analysis_latest.parquet")]:
-        if not p.exists():
-            msgs.append(f"{p}: ausente")
-            continue
-        size = p.stat().st_size
-        pointer = False
-        try:
-            with p.open("rb") as f:
-                head = f.read(200)
-            pointer = b"git-lfs.github.com/spec/v1" in head
-        except Exception:
-            pass
-        if pointer:
-            msgs.append(f"{p}: presente ({size} bytes), mas é ponteiro Git LFS (objeto real não baixado)")
+    for sec in _SECTION_KEYS:
+        p = _section_path(sec)
+        if p:
+            msgs.append(f"{p}: presente ({p.stat().st_size:,} bytes) OK")
         else:
-            msgs.append(f"{p}: presente ({size} bytes)")
+            for d in _SECTION_DIRS:
+                raw = Path(d) / f"core_section_{sec}.parquet"
+                if raw.exists():
+                    msgs.append(f"{raw}: PONTEIRO LFS ({raw.stat().st_size} bytes)")
+                    break
+            else:
+                msgs.append(f"core_section_{sec}.parquet: ausente")
     return msgs
 
 
@@ -181,7 +198,7 @@ def _series_from_operacao(records, value_key: str, name: str) -> pd.Series:
     return s
 
 
-def _build_hourly_df(core: Dict[str, Any]) -> pd.DataFrame:
+def _build_hourly_df(_unused: Any = None) -> pd.DataFrame:
     """
     Constrói o DataFrame horário carregando cada seção sob demanda e
     descartando da memória logo após extrair as colunas necessárias.
@@ -190,10 +207,9 @@ def _build_hourly_df(core: Dict[str, Any]) -> pd.DataFrame:
     df = pd.DataFrame()
 
     # ── economic ────────────────────────────────────────────────────────────
-    econ = (core.get("economic") or
-            (core.get("advanced_metrics") or {}).get("economic") or
-            _get_section("economic").get("economic") or
-            _get_section("economic")) or {}
+    econ = _get_section("economic") or {}
+    if not econ:
+        econ = _get_section("advanced_metrics").get("economic", {})
     for k, col in [
         ("sin_cost_hourly", "sin_cost"),
         ("T_prudencia_hourly", "t_prudencia"),
@@ -221,7 +237,7 @@ def _build_hourly_df(core: Dict[str, Any]) -> pd.DataFrame:
     del econ
 
     # ── advanced_metrics (apenas painel_horario_renovavel e cmo) ────────────
-    adv = core.get("advanced_metrics") or _get_section("advanced_metrics")
+    adv = _get_section("advanced_metrics")
     panel = pd.DataFrame((adv or {}).get("painel_horario_renovavel", []))
     if not panel.empty and "instante" in panel.columns:
         panel["instante"] = pd.to_datetime(panel["instante"], errors="coerce")
@@ -235,7 +251,7 @@ def _build_hourly_df(core: Dict[str, Any]) -> pd.DataFrame:
     del adv
 
     # ── operacao ─────────────────────────────────────────────────────────────
-    oper = core.get("operacao") or _get_section("operacao")
+    oper = _get_section("operacao")
     gen = (oper or {}).get("generation", {})
     load = (oper or {}).get("load", {})
     load_sin = _series_from_operacao((load.get("sin") or {}).get("serie", []), "carga", "load")
@@ -259,7 +275,7 @@ def _build_hourly_df(core: Dict[str, Any]) -> pd.DataFrame:
     del oper, gen, load
 
     # ── ccee ─────────────────────────────────────────────────────────────────
-    ccee_data = (core.get("ccee") or _get_section("ccee") or {}).get("data", [])
+    ccee_data = (_get_section("ccee") or {}).get("data", [])
     if ccee_data:
         cdf = pd.DataFrame(ccee_data)
         del ccee_data
@@ -284,7 +300,7 @@ def _build_hourly_df(core: Dict[str, Any]) -> pd.DataFrame:
         del ccee_data
 
     # ── renewables ───────────────────────────────────────────────────────────
-    ren = (core.get("renewables") or _get_section("renewables") or {})
+    ren = _get_section("renewables") or {}
     for key, col in [("solar", "curtail_solar"), ("eolica", "curtail_wind")]:
         ser = pd.DataFrame(((ren.get("curtailment") or {}).get(key) or {}).get("serie", []))
         if not ser.empty and {"instante", "valor"}.issubset(ser.columns):
