@@ -164,6 +164,64 @@ def _has_upstream() -> bool:
     return probe.returncode == 0
 
 
+<<<<<<< codex/update-app.py-to-read-parquet-data-bxiadr
+
+
+def _is_detached_head() -> bool:
+    probe = subprocess.run(["git", "symbolic-ref", "--quiet", "--short", "HEAD"], capture_output=True, text=True)
+    return probe.returncode != 0
+
+
+def _list_unmerged_files() -> list[str]:
+    probe = subprocess.run(["git", "diff", "--name-only", "--diff-filter=U"], capture_output=True, text=True, check=False)
+    return [line.strip() for line in probe.stdout.splitlines() if line.strip()]
+
+
+def _is_rebase_in_progress() -> bool:
+    git_dir = Path('.git')
+    return (git_dir / 'rebase-merge').exists() or (git_dir / 'rebase-apply').exists()
+
+
+def _get_remote_head_branch(remote: str) -> str:
+    probe = subprocess.run(["git", "symbolic-ref", "--short", f"refs/remotes/{remote}/HEAD"], capture_output=True, text=True)
+    if probe.returncode == 0 and probe.stdout.strip():
+        return probe.stdout.strip().split('/', 1)[-1]
+    return "main"
+
+
+def _checkout_branch(branch: str, remote: str) -> None:
+    local_try = subprocess.run(["git", "checkout", branch], capture_output=True, text=True)
+    if local_try.returncode == 0:
+        return
+
+    subprocess.run(["git", "checkout", "-b", branch, "--track", f"{remote}/{branch}"], check=True, capture_output=True, text=True)
+
+
+def _ensure_clean_git_state_for_sync(remote: str) -> str:
+    unmerged = _list_unmerged_files()
+    if unmerged and _is_rebase_in_progress():
+        logger.warning("Rebase pendente com conflitos detectado; executando 'git rebase --abort' para recuperar estado do repositório.")
+        subprocess.run(["git", "rebase", "--abort"], check=True, capture_output=True, text=True)
+        unmerged = _list_unmerged_files()
+
+    if unmerged:
+        joined = ", ".join(unmerged[:5])
+        raise RuntimeError(
+            "Há arquivos com conflito não resolvido no repositório. "
+            f"Resolva e faça commit antes do push automático. Exemplo(s): {joined}"
+        )
+
+    if _is_detached_head():
+        target = _get_remote_head_branch(remote)
+        logger.warning(f"HEAD destacado detectado; retornando automaticamente para a branch '{target}'.")
+        _checkout_branch(target, remote)
+
+    branch = _get_current_branch()
+    if branch == "HEAD":
+        raise RuntimeError("Não foi possível sair do estado detached HEAD automaticamente.")
+    return branch
+=======
+>>>>>>> main
 def _push_once(remote: str, branch: str, force_with_lease: bool = False) -> None:
     if _has_upstream():
         cmd = ["git", "push"]
@@ -179,8 +237,13 @@ def _push_once(remote: str, branch: str, force_with_lease: bool = False) -> None
 
 
 def _push_with_upstream_fallback(force_with_lease: bool = False) -> None:
+<<<<<<< codex/update-app.py-to-read-parquet-data-bxiadr
+    remote = _get_default_remote()
+    branch = _ensure_clean_git_state_for_sync(remote)
+=======
     branch = _get_current_branch()
     remote = _get_default_remote()
+>>>>>>> main
 
     try:
         _push_once(remote=remote, branch=branch, force_with_lease=force_with_lease)
@@ -207,6 +270,16 @@ def _is_non_fast_forward_error(err: Exception) -> bool:
     return any(s in msg for s in ["fetch first", "non-fast-forward", "failed to push some refs", "updates were rejected"])
 
 
+<<<<<<< codex/update-app.py-to-read-parquet-data-bxiadr
+def _has_unmerged_error(err: Exception) -> bool:
+    stdout = getattr(err, "stdout", "") or ""
+    stderr = getattr(err, "stderr", "") or ""
+    msg = f"{err} {stdout} {stderr}".lower()
+    return "you have unmerged files" in msg or "unresolved conflict" in msg
+
+
+=======
+>>>>>>> main
 def _pull_rebase(remote: str, branch: str) -> None:
     logger.info(f"Sincronizando branch local com {remote}/{branch} via pull --rebase --autostash.")
     try:
@@ -217,6 +290,20 @@ def _pull_rebase(remote: str, branch: str) -> None:
             text=True,
         )
     except subprocess.CalledProcessError as e:
+<<<<<<< codex/update-app.py-to-read-parquet-data-bxiadr
+        if _has_unmerged_error(e) and _is_rebase_in_progress():
+            logger.warning("Pull/rebase falhou por conflitos pendentes; abortando rebase anterior e tentando novamente.")
+            subprocess.run(["git", "rebase", "--abort"], check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "pull", "--rebase", "--autostash", remote, branch],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return
+
+=======
+>>>>>>> main
         if not _has_untracked_overwrite_error(e):
             raise
 
