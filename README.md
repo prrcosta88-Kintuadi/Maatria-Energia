@@ -118,6 +118,31 @@ python run_collector.py
 streamlit run dashboard_integrado.py
 ```
 
+### Rotina diária local (atualizar e publicar só Parquet)
+Para o seu cenário de deploy no Render (limite de armazenamento da conta gratuita), o fluxo recomendado é versionar apenas `core_analysis_latest.parquet` no GitHub.
+
+Comando não interativo para rodar no seu computador:
+```bash
+python run_collector.py --daily-parquet --persist-mode incremental
+```
+
+Esse comando executa:
+1. coleta/integração,
+2. geração do core,
+3. cópia de `data/core_analysis_latest.parquet` para a raiz do repositório,
+4. `git add core_analysis_latest.parquet`, commit e `git push`.
+
+Se quiser testar sem push:
+```bash
+python run_collector.py --daily-parquet --persist-mode incremental --no-push
+```
+
+Exemplo de agendamento no Linux (cron, 1x ao dia às 06:10):
+```bash
+10 6 * * * cd /caminho/do/repositorio && /usr/bin/python3 run_collector.py --daily-parquet --persist-mode incremental >> logs/daily_parquet.log 2>&1
+```
+
+
 ### Testes das APIs
 ```bash
 python test_ons_api.py
