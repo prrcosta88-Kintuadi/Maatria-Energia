@@ -27,23 +27,44 @@ COPY docker-compose.yml .
 # 3) Dados necessários em runtime
 RUN mkdir -p data logs audit_logs
 
-# Copia o artefato versionado para deploy
-COPY data/core_analysis_latest.parquet data/core_analysis_latest.parquet
+# Copia os parquets de seção (arquivos Git normais, não LFS)
+COPY data/core_section_advanced_metrics.parquet data/core_section_advanced_metrics.parquet
+COPY data/core_section_economic.parquet         data/core_section_economic.parquet
+COPY data/core_section_operacao.parquet         data/core_section_operacao.parquet
+COPY data/core_section_ccee.parquet             data/core_section_ccee.parquet
+COPY data/core_section_renewables.parquet       data/core_section_renewables.parquet
 
-# Validação simples do artefato
-RUN ls -lh data/core_analysis_latest.parquet && \
-    python - <<'PY'
+# Validação dos parquets de seção
+RUN python3 - <<'PY'
 import duckdb
 from pathlib import Path
-p = Path('data/core_analysis_latest.parquet')
-head = p.read_bytes()[:200]
-if b'git-lfs.github.com/spec/v1' in head:
-    raise SystemExit('❌ Arquivo em data/core_analysis_latest.parquet é ponteiro LFS; objeto real não foi baixado no build.')
-con = duckdb.connect(database=':memory:')
-con.execute("SELECT COUNT(*) FROM read_parquet('data/core_analysis_latest.parquet')")
-print('✅ Parquet válido para leitura')
-PY
 
+sections = ["advanced_metrics", "economic", "operacao", "ccee", "renewables"]
+ok = True
+for s in sections:
+    p = Path(f"data/core_section_{s}.parquet")
+    if not p.exists():
+        print(f"ERRO: {p} nao encontrado")
+        ok = False
+        continue
+    head = p.read_bytes()[:512]
+    if b"git-lfs.github.com/spec/v1" in head or b"oid sha256:" in head:
+        print(f"ERRO: {p} e ponteiro LFS ({p.stat().st_size} bytes)")
+        ok = False
+        continue
+    try:
+        con = duckdb.connect(database=":memory:")
+        count = con.execute(f"SELECT COUNT(*) FROM read_parquet('{p}')").fetchone()[0]
+        con.close()
+        print(f"OK: {p} ({p.stat().st_size:,} bytes, {count} linha(s))")
+    except Exception as e:
+        print(f"ERRO: {p} falhou: {e}")
+        ok = False
+
+if not ok:
+    raise SystemExit("Um ou mais parquets de secao sao invalidos.")
+print("Todos os parquets de secao validados com sucesso.")
+PY
 # 4) Configuração runtime
 EXPOSE 8501
 ENV STREAMLIT_SERVER_PORT=8501

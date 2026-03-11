@@ -72,15 +72,23 @@ services:
     # Útil para validações, cleanup, etc.
     
     buildCommand: |
-      echo "🔍 Validando artefato Parquet para deploy..."
-      if [ ! -f "data/core_analysis_latest.parquet" ]; then
-        echo "❌ ERRO: data/core_analysis_latest.parquet não encontrado!"
-        echo "Execute a rotina diária para gerar/publicar o arquivo antes do deploy"
+      echo "Validando parquets de secao para deploy..."
+      MISSING=0
+      for s in advanced_metrics economic operacao ccee renewables; do
+        f="data/core_section_${s}.parquet"
+        if [ ! -f "$f" ]; then
+          echo "ERRO: $f nao encontrado"
+          MISSING=1
+        else
+          size=$(wc -c < "$f")
+          echo "OK: $f ($size bytes)"
+        fi
+      done
+      if [ "$MISSING" = "1" ]; then
+        echo "Um ou mais parquets de secao estao ausentes. Abortando deploy."
         exit 1
       fi
-
-      echo "✅ Arquivo encontrado"
-      ls -lh data/core_analysis_latest.parquet
+      echo "Todos os parquets de secao encontrados."
     
     
     # ========================================================================
