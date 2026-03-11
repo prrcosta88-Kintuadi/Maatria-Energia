@@ -50,6 +50,32 @@ def _core_file_diagnostics() -> list[str]:
     return msgs
 
 
+def _decode_parquet_row(row: Any, columns: list[str]) -> Dict[str, Any]:
+    if not row:
+        return {}
+
+    col_idx = {c.lower(): i for i, c in enumerate(columns)}
+    for candidate in ["core_json", "core", "payload", "json"]:
+        i = col_idx.get(candidate)
+        if i is None:
+            continue
+        val = row[i]
+        if isinstance(val, dict):
+            return val
+        if isinstance(val, str) and val.strip():
+            try:
+                loaded = json.loads(val)
+                if isinstance(loaded, dict):
+                    return loaded
+            except Exception:
+                pass
+
+    rec = {col: row[i] for i, col in enumerate(columns)}
+    if all(k in rec for k in ["timestamp", "hydrology", "prices"]):
+        return rec
+    return {}
+
+
 @st.cache_data
 def _load_core(_token: str) -> Dict[str, Any]:
 
@@ -64,15 +90,14 @@ def _load_core(_token: str) -> Dict[str, Any]:
         try:
             con = duckdb.connect()
             try:
-                row = con.execute(
-                    "SELECT core_json FROM read_parquet(?) LIMIT 1",
-                    [str(p)],
-                ).fetchone()
+                cols = [c[0] for c in con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(p)]).fetchall()]
+                row = con.execute("SELECT * FROM read_parquet(?) LIMIT 1", [str(p)]).fetchone()
             finally:
                 con.close()
 
-            if row and row[0]:
-                return row[0] if isinstance(row[0], dict) else json.loads(row[0])
+            decoded = _decode_parquet_row(row, cols)
+            if decoded:
+                return decoded
         except Exception:
             continue
 
