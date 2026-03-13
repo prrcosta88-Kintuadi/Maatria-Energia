@@ -53,7 +53,7 @@ def _core_file_diagnostics() -> list[str]:
     if not _NEON_OK():
         return ["DATABASE_URL não configurada ou psycopg2 não instalado."]
     msgs = []
-    for table in ["geracao_usina_horaria","curva_carga","pld_historical","ear_diario_subsistema","despacho_gfom"]:
+    for table in ["geracao_tipo_hora","curva_carga","pld_historical","ear_diario_subsistema","despacho_gfom"]:
         row = db_neon.fetchone(f"SELECT COUNT(*) FROM {table}")
         msgs.append(f"{table}: {row[0]:,} linhas" if row else f"{table}: erro")
     return msgs
@@ -213,26 +213,20 @@ def _build_hourly_df_cached(_token: str) -> pd.DataFrame:
 
     # ── Geração por fonte ────────────────────────────────────────────────────
     gen_df = db_neon.fetchdf(
-        "SELECT din_instante AS instante, "
-        "  LOWER(nom_tipousina) AS tipousina, "
-        "  SUM(val_geracao) AS valor "
-        "FROM geracao_usina_horaria "
-        "WHERE din_instante IS NOT NULL AND val_geracao IS NOT NULL "
-        "GROUP BY din_instante, nom_tipousina ORDER BY din_instante"
+        "SELECT din_instante AS instante, tipo_geracao, "
+        "  SUM(val_geracao_mw) AS valor "
+        "FROM geracao_tipo_hora "
+        "WHERE din_instante IS NOT NULL AND val_geracao_mw IS NOT NULL "
+        "GROUP BY din_instante, tipo_geracao ORDER BY din_instante"
     )
     if not gen_df.empty:
         gen_df["instante"] = pd.to_datetime(gen_df["instante"], errors="coerce")
         gen_df = gen_df.dropna(subset=["instante"])
-        FONTE_MAP = {
-            "fotovoltaica": "solar", "eolielétrica": "wind", "eolietrica": "wind",
-            "térmica": "thermal", "termica": "thermal",
-            "hidroelétrica": "hydro", "hidreletrica": "hydro",
-            "nuclear": "nuclear",
-        }
-        for src, col in FONTE_MAP.items():
-            sub = gen_df[gen_df["tipousina"].str.contains(src[:5], case=False, na=False)]
+        # tipo_geracao já vem normalizado: solar/wind/hydro/thermal/nuclear/other
+        for tipo in ("solar", "wind", "hydro", "thermal", "nuclear"):
+            sub = gen_df[gen_df["tipo_geracao"] == tipo]
             if not sub.empty:
-                s = sub.groupby("instante")["valor"].sum().rename(col)
+                s = sub.groupby("instante")["valor"].sum().rename(tipo)
                 _join(_ts(pd.to_numeric(s, errors="coerce")))
     del gen_df
 
@@ -279,6 +273,113 @@ def _build_hourly_df_cached(_token: str) -> pd.DataFrame:
         ear_df["ear_pct"] = ear_df["ear"] / ear_df["earmaxp"].replace(0, np.nan) * 100
         _join(_ts(pd.to_numeric(ear_df.set_index("instante")["ear_pct"], errors="coerce").rename("ear")))
     del ear_df
+
+    # ── ENA diário ───────────────────────────────────────────────────────────
+    ena_df = db_neon.fetchdf(
+        "SELECT ena_data AS instante, "
+        "  SUM(ena_bruta_regiao_mwmed) AS ena_bruta, "
+        "  SUM(ena_armazenavel_regiao_mwmed) AS ena_arm "
+        "FROM ena_diario_subsistema WHERE ena_data IS NOT NULL "
+        "GROUP BY ena_data ORDER BY ena_data"
+    )
+    if not ena_df.empty:
+        ena_df["instante"] = pd.to_datetime(ena_df["instante"], errors="coerce")
+        ena_df = ena_df.dropna(subset=["instante"]).set_index("instante")
+        _join(_ts(pd.to_numeric(ena_df["ena_bruta"].rename("ena_bruta"), errors="coerce")))
+        _join(_ts(pd.to_numeric(ena_df["ena_arm"].rename("ena_arm"), errors="coerce")))
+    del ena_df
+
+    # ── Disponibilidade por tipo ─────────────────────────────────────────────
+    disp_df = db_neon.fetchdf(
+        "SELECT din_instante AS instante, tipo_geracao, "
+        "  SUM(val_disp_sincronizada) AS disp_sinc "
+        "FROM disponibilidade_tipo_hora "
+        "WHERE din_instante IS NOT NULL "
+        "GROUP BY din_instante, tipo_geracao ORDER BY din_instante"
+    )
+    if not disp_df.empty:
+        disp_df["instante"] = pd.to_datetime(disp_df["instante"], errors="coerce")
+        disp_df = disp_df.dropna(subset=["instante"])
+        for tipo in ("hydro", "thermal", "nuclear", "solar", "wind"):
+            sub = disp_df[disp_df["tipo_geracao"] == tipo]
+            if not sub.empty:
+                s = sub.groupby("instante")["disp_sinc"].sum().rename(f"disp_{tipo}")
+                _join(_ts(pd.to_numeric(s, errors="coerce")))
+        disp_total = disp_df.groupby("instante")["disp_sinc"].sum().rename("disp_total")
+        _join(_ts(pd.to_numeric(disp_total, errors="coerce")))
+    del disp_df
+
+    # ── Restrição renovável (curtailment) ────────────────────────────────────
+    restr_df = db_neon.fetchdf(
+        "SELECT din_instante AS instante, fonte, "
+        "  SUM(val_geracao) AS gerado, SUM(val_geracaolimitada) AS limitado, "
+        "  SUM(val_disponibilidade) AS disponivel "
+        "FROM restricao_renovavel "
+        "WHERE din_instante IS NOT NULL "
+        "GROUP BY din_instante, fonte ORDER BY din_instante"
+    )
+    if not restr_df.empty:
+        restr_df["instante"] = pd.to_datetime(restr_df["instante"], errors="coerce")
+        restr_df = restr_df.dropna(subset=["instante"])
+        for fonte, sfx in (("solar", "solar"), ("wind", "wind")):
+            sub = restr_df[restr_df["fonte"] == fonte].set_index("instante")
+            if not sub.empty:
+                curtail = (sub["limitado"] - sub["gerado"]).clip(lower=0).rename(f"curtail_{sfx}")
+                fator = (sub["gerado"] / sub["disponivel"].replace(0, np.nan) * 100).rename(f"fator_cap_{sfx}")
+                _join(_ts(pd.to_numeric(curtail, errors="coerce")))
+                _join(_ts(pd.to_numeric(fator, errors="coerce")))
+    del restr_df
+
+    # ── Despacho GFOM ────────────────────────────────────────────────────────
+    gfom_df = db_neon.fetchdf(
+        "SELECT din_instante AS instante, "
+        "  val_verifgeracao AS gfom_ger, "
+        "  val_verifconstrainedoff AS constrained_off, "
+        "  val_verifinflexibilidade AS thermal_inflex, "
+        "  val_verifordemmerito AS thermal_merit, "
+        "  val_verifgfom AS gfom "
+        "FROM despacho_gfom WHERE din_instante IS NOT NULL ORDER BY din_instante"
+    )
+    if not gfom_df.empty:
+        gfom_df["instante"] = pd.to_datetime(gfom_df["instante"], errors="coerce")
+        gfom_df = gfom_df.dropna(subset=["instante"]).set_index("instante")
+        for col in ("gfom_ger", "constrained_off", "thermal_inflex", "thermal_merit", "gfom"):
+            if col in gfom_df.columns:
+                _join(_ts(pd.to_numeric(gfom_df[col].rename(col), errors="coerce")))
+    del gfom_df
+
+    # ── CVU médio semanal térmico ────────────────────────────────────────────
+    cvu_df = db_neon.fetchdf(
+        "SELECT dat_fimsemana AS instante, AVG(val_cvu) AS cvu_semana "
+        "FROM cvu_usina_termica WHERE val_cvu > 0 "
+        "GROUP BY dat_fimsemana ORDER BY dat_fimsemana"
+    )
+    if not cvu_df.empty:
+        cvu_df["instante"] = pd.to_datetime(cvu_df["instante"], errors="coerce")
+        cvu_df = cvu_df.dropna(subset=["instante"])
+        s = cvu_df.set_index("instante")["cvu_semana"].rename("cvu_semana")
+        _join(_ts(pd.to_numeric(s, errors="coerce")))
+    del cvu_df
+
+    # ── Intercâmbio inter-subsistema ─────────────────────────────────────────
+    itc_df = db_neon.fetchdf(
+        "SELECT din_instante AS instante, "
+        "  id_subsistema_origem AS orig, id_subsistema_destino AS dest, "
+        "  SUM(val_intercambiomwmed) AS mw "
+        "FROM intercambio WHERE din_instante IS NOT NULL "
+        "GROUP BY din_instante, id_subsistema_origem, id_subsistema_destino "
+        "ORDER BY din_instante"
+    )
+    if not itc_df.empty:
+        itc_df["instante"] = pd.to_datetime(itc_df["instante"], errors="coerce")
+        itc_df = itc_df.dropna(subset=["instante"])
+        itc_df["par"] = itc_df["orig"].str.upper() + "_" + itc_df["dest"].str.upper()
+        for par, grp in itc_df.groupby("par"):
+            s = grp.set_index("instante")["mw"].rename(f"itc_{par.lower()}")
+            _join(_ts(pd.to_numeric(s, errors="coerce")))
+        itc_total = itc_df.groupby("instante")["mw"].sum().rename("itc_total")
+        _join(_ts(pd.to_numeric(itc_total, errors="coerce")))
+    del itc_df
 
     # ── Colunas derivadas ─────────────────────────────────────────────────────
     if not df.empty:
@@ -644,7 +745,7 @@ def main():
             r = db_neon.fetchdf(
                 "SELECT 'carga' AS tipo, MAX(din_instante)::date::text AS mx FROM curva_carga "
                 "UNION ALL "
-                "SELECT 'geracao', MAX(din_instante)::date::text FROM geracao_usina_horaria"
+                "SELECT 'geracao', MAX(din_instante)::date::text FROM geracao_tipo_hora"
             )
             for _, row in r.iterrows():
                 if row["mx"]:
@@ -732,11 +833,9 @@ def main():
         st.dataframe(_plot_df(dff[card_cols]), width="stretch", height=320)
 
     with tabs[0]:
-        load_ref = latest_operational.get("load")
-        gen_ref = latest_operational.get("generation")
-        load_txt = load_ref.strftime("%d/%m/%Y") if load_ref else "N/D"
-        gen_txt = gen_ref.strftime("%d/%m/%Y") if gen_ref else "N/D"
-        st.caption(f"Dados extraídos até o dia **{load_txt}** (load) e **{gen_txt}** (generation).")
+        _ref_dates = [d for d in (latest_operational.get("load"), latest_operational.get("generation")) if d]
+        _last_date = max(_ref_dates).strftime("%d/%m/%Y") if _ref_dates else "N/D"
+        st.caption(f"Dados extraídos até o dia **{_last_date}**.")
         st.caption("Montagem: séries horárias observadas de geração por fonte + carga e carga líquida (`Carga - (Solar + Eólica)`).")
         st.write(_system_text(current))
         fig = go.Figure()
