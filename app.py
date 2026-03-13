@@ -546,8 +546,7 @@ def main():
         _db_url = _os.getenv("DATABASE_URL", "")
         _err = st.session_state.get("_neon_error", "sem detalhes")
         st.error("❌ Banco de dados Neon não configurado ou inacessível.")
-        st.code(f"DATABASE_URL: {'definida (' + _db_url[:60] + '...)' if _db_url else 'NÃO DEFINIDA'}")
-        st.error(f"Erro de conexão: {_err}")
+        st.code(f"DATABASE_URL: {'definida' if _db_url else 'NÃO DEFINIDA'} | Erro: {_err}")
         return
 
     df = _build_hourly_df()
