@@ -25,7 +25,9 @@ def _NEON_OK() -> bool:
     try:
         row = db_neon.fetchone("SELECT 1")
         return row is not None
-    except Exception:
+    except Exception as _e:
+        import streamlit as _st
+        _st.session_state["_neon_error"] = str(_e)
         return False
 
 
@@ -537,8 +539,10 @@ def main():
     if not _NEON_OK():
         import os as _os
         _db_url = _os.getenv("DATABASE_URL", "")
+        _err = st.session_state.get("_neon_error", "sem detalhes")
         st.error("❌ Banco de dados Neon não configurado ou inacessível.")
-        st.code(f"DATABASE_URL: {'definida (' + _db_url[:50] + '...)' if _db_url else 'NÃO DEFINIDA'}")
+        st.code(f"DATABASE_URL: {'definida (' + _db_url[:60] + '...)' if _db_url else 'NÃO DEFINIDA'}")
+        st.error(f"Erro de conexão: {_err}")
         return
 
     df = _build_hourly_df()
