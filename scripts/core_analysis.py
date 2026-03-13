@@ -906,13 +906,29 @@ def _series_to_hourly_dict(series: pd.Series, ndigits: int = 6) -> Dict[str, flo
 
 
 def _load_carga_sin_horaria_duckdb() -> pd.Series:
-    if duckdb is None:
+    """Retorna série horária SIN total (soma de todos os submercados)."""
+    result = _load_carga_por_submercado_duckdb()
+    if not result:
         return pd.Series(dtype=float)
+    combined = pd.concat(list(result.values()), axis=1).sum(axis=1)
+    return _ensure_tz_naive_index(combined.astype(float))
+
+
+def _load_carga_por_submercado_duckdb() -> Dict[str, pd.Series]:
+    """
+    Retorna carga horária por submercado:
+    {"se": Series, "ne": Series, "s": Series, "n": Series}
+    Chaves em minúsculo para alinhamento com pld_se, pld_ne, pld_s, pld_n.
+    """
+    _SUB_MAP = {"SE": "se", "NE": "ne", "S": "s", "N": "n",
+                "SUDESTE": "se", "NORDESTE": "ne", "SUL": "s", "NORTE": "n"}
+    out: Dict[str, pd.Series] = {}
+
     con = _duckdb_connect()
     if con is None or not _duckdb_table_exists(con, "curva_carga"):
         if con is not None:
             con.close()
-        return pd.Series(dtype=float)
+        return out
     try:
         q = f"""
             SELECT
@@ -924,12 +940,15 @@ def _load_carga_sin_horaria_duckdb() -> pd.Series:
         """
         df = con.execute(q).fetchdf().dropna(subset=["din_instante", "id_subsistema", "carga"])
         if df.empty:
-            return pd.Series(dtype=float)
-        df = df[df["id_subsistema"].isin(["N", "NE", "SE", "S"]) ]
-        s = df.groupby("din_instante")["carga"].sum().sort_index()
-        return _ensure_tz_naive_index(s.astype(float))
+            return out
+        df["sub_key"] = df["id_subsistema"].map(_SUB_MAP)
+        df = df.dropna(subset=["sub_key"])
+        for sub_key, grp in df.groupby("sub_key"):
+            s = grp.groupby("din_instante")["carga"].sum().sort_index()
+            out[sub_key] = _ensure_tz_naive_index(s.astype(float))
+        return out
     except Exception:
-        return pd.Series(dtype=float)
+        return out
     finally:
         con.close()
 
@@ -1195,6 +1214,7 @@ def _compute_advanced_cross_metrics(
 
     carga_sin = _ensure_tz_naive_index(_to_series(load.get("sin", {}).get("serie", []), "carga"))
     carga_sin_db = _load_carga_sin_horaria_duckdb()
+    carga_por_sub = _load_carga_por_submercado_duckdb()  # {"se", "ne", "s", "n"}
 
     if isinstance(carga_sin_db, pd.Series) and not carga_sin_db.empty:
         carga_sin = carga_sin_db
@@ -2043,6 +2063,14 @@ def _compute_advanced_cross_metrics(
             df_e["pld_no_teto"] = df_e["pld"] >= df_e["pld_teto"] * 0.95
             df_e["cmo"] = pd.to_numeric(cmo_dom.reindex(idx), errors="coerce")
             df_e["load"] = pd.to_numeric(carga_sin.reindex(idx), errors="coerce")
+
+            # Carga por submercado — usada no SIN_cost ponderado
+            _SUB_KEYS = ["se", "ne", "s", "n"]
+            for _sk in _SUB_KEYS:
+                _s = carga_por_sub.get(_sk, pd.Series(dtype=float))
+                df_e[f"load_{_sk}"] = pd.to_numeric(
+                    _ensure_tz_naive_index(_s).reindex(idx), errors="coerce"
+                )
             df_e["solar"] = pd.to_numeric(solar.reindex(idx), errors="coerce")
             df_e["wind"] = pd.to_numeric(eolica.reindex(idx), errors="coerce")
             df_e["thermal_total"] = pd.to_numeric(termica.reindex(idx), errors="coerce")
@@ -2087,7 +2115,23 @@ def _compute_advanced_cross_metrics(
 
             # Step 2-10
             
-            df_e["SIN_cost_R$/h"] = df_e["load"] * df_e["pld"]
+            # SIN_cost ponderado por submercado:
+            # custo = load_se*pld_se + load_ne*pld_ne + load_s*pld_s + load_n*pld_n
+            # Fallback para load*pld (média SIN) quando séries por sub não disponíveis
+            _sin_cost = pd.Series(0.0, index=df_e.index)
+            _sub_pairs = [("se", "pld_se"), ("ne", "pld_ne"), ("s", "pld_s"), ("n", "pld_n")]
+            _any_sub = False
+            for _lk, _pk in _sub_pairs:
+                _load_col = f"load_{_lk}"
+                if _load_col in df_e.columns and _pk in df_e.columns:
+                    _l = pd.to_numeric(df_e[_load_col], errors="coerce").fillna(0)
+                    _p = pd.to_numeric(df_e[_pk], errors="coerce").fillna(0)
+                    _sin_cost += _l * _p
+                    _any_sub = True
+            if not _any_sub:
+                # Fallback: SIN total * PLD médio
+                _sin_cost = df_e["load"].fillna(0) * df_e["pld"].fillna(0)
+            df_e["SIN_cost_R$/h"] = _sin_cost
             df_e["thermal_real_cost"] = df_e["thermal_total"] * df_e["cvu_semana"]
             df_e["thermal_merit_cost"] = df_e["thermal_merit"] * df_e["cvu_semana"]
             df_e["thermal_prudential_dispatch"] = df_e["thermal_total"] - df_e["thermal_merit"]

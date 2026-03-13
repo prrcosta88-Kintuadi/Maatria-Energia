@@ -12,41 +12,35 @@ import requests
 import duckdb
 
 
+# ── Neon PostgreSQL ───────────────────────────────────────────────────────────
+try:
+    import db_neon
+    _NEON_OK = db_neon.is_configured()
+except Exception:
+    db_neon = None  # type: ignore
+    _NEON_OK = False
+
+
 def _core_cache_token() -> str:
-    watched = [
-        Path("data/core_analysis_latest.parquet"),
-        Path("core_analysis_latest.parquet"),
-        Path("data/core_analysis_latest.json"),
-        Path("core_analysis_latest.json"),
-    ]
-    parts = []
-    for p in watched:
-        if p.exists():
-            stt = p.stat()
-            parts.append(f"{p}:{int(stt.st_mtime)}:{stt.st_size}")
-        else:
-            parts.append(f"{p}:missing")
-    return "|".join(parts)
+    """Token de cache baseado no max(data) do PLD — muda quando novos dados chegam."""
+    if not _NEON_OK:
+        return "neon:offline"
+    try:
+        row = db_neon.fetchone(
+            "SELECT MAX(mes_referencia * 100 + dia)::text FROM pld_historical"
+        )
+        return f"neon:{row[0] if row else 'empty'}"
+    except Exception:
+        return "neon:error"
 
 
 def _core_file_diagnostics() -> list[str]:
+    if not _NEON_OK:
+        return ["DATABASE_URL não configurada ou psycopg2 não instalado."]
     msgs = []
-    for p in [Path("data/core_analysis_latest.parquet"), Path("core_analysis_latest.parquet")]:
-        if not p.exists():
-            msgs.append(f"{p}: ausente")
-            continue
-        size = p.stat().st_size
-        pointer = False
-        try:
-            with p.open("rb") as f:
-                head = f.read(200)
-            pointer = b"git-lfs.github.com/spec/v1" in head
-        except Exception:
-            pass
-        if pointer:
-            msgs.append(f"{p}: presente ({size} bytes), mas é ponteiro Git LFS (objeto real não baixado)")
-        else:
-            msgs.append(f"{p}: presente ({size} bytes)")
+    for table in ["geracao_usina_horaria","curva_carga","pld_historical","ear_diario_subsistema","despacho_gfom"]:
+        row = db_neon.fetchone(f"SELECT COUNT(*) FROM {table}")
+        msgs.append(f"{table}: {row[0]:,} linhas" if row else f"{table}: erro")
     return msgs
 
 
@@ -129,24 +123,192 @@ def _get_section(section: str) -> Dict[str, Any]:
     return _load_section_cached(token, section)
 
 
-@st.cache_data
-def _load_core(_token: str) -> Tuple[Dict[str, Any], List[str]]:
+@st.cache_data(show_spinner=False)
+def _build_hourly_df_cached(_token: str) -> pd.DataFrame:
     """
-    Carrega o core completo — usado apenas para _build_hourly_df na inicialização.
-    Cada seção é carregada e descartada sequencialmente para minimizar pico de RAM.
+    Constrói o DataFrame horário lendo o Neon PostgreSQL via queries leves.
+    Cada query retorna apenas as colunas necessárias — RAM < 40MB no Render.
     """
-    errors: List[str] = []
-    if not _all_sections_ok():
-        errors.append("Um ou mais parquets de seção não encontrados ou são ponteiros LFS.")
-        return {}, errors
-    core: Dict[str, Any] = {}
-    for section in _SECTION_KEYS:
-        data = _get_section(section)
-        if data:
-            core[section] = data
-        else:
-            errors.append(f"Seção '{section}' retornou vazia.")
-    return core, errors
+    if not _NEON_OK:
+        return pd.DataFrame()
+
+    df = pd.DataFrame()
+
+    def _join(s: pd.Series) -> None:
+        nonlocal df
+        if s.empty:
+            return
+        df = df.join(s, how="outer") if not df.empty else s.to_frame()
+
+    def _ts(s: pd.Series) -> pd.Series:
+        s.index = pd.to_datetime(s.index, errors="coerce")
+        if getattr(s.index, "tz", None):
+            s.index = s.index.tz_localize(None)
+        return s.dropna()
+
+    # ── economic: CMO por submercado ─────────────────────────────────────────
+    cmo_df = db_neon.fetchdf(
+        "SELECT din_instante AS instante, id_subsistema, val_cmo AS valor "
+        "FROM cmo WHERE din_instante IS NOT NULL AND val_cmo IS NOT NULL "
+        "ORDER BY din_instante"
+    )
+    if not cmo_df.empty:
+        cmo_df["instante"] = pd.to_datetime(cmo_df["instante"], errors="coerce")
+        cmo_df = cmo_df.dropna(subset=["instante"])
+        cmo_best = "SUDESTE" if "SUDESTE" in cmo_df["id_subsistema"].values else cmo_df["id_subsistema"].iloc[0]
+        sub = cmo_df[cmo_df["id_subsistema"] == cmo_best]
+        if not sub.empty:
+            _join(_ts(pd.to_numeric(sub.set_index("instante")["valor"], errors="coerce").rename("cmo_dominante")))
+    del cmo_df
+
+    # ── PLD (CCEE) ────────────────────────────────────────────────────────────
+    pld_df = db_neon.fetchdf(
+        "SELECT "
+        "  MAKE_DATE("
+        "    CAST(SUBSTR(CAST(mes_referencia AS TEXT), 1, 4) AS INTEGER), "
+        "    CAST(SUBSTR(CAST(mes_referencia AS TEXT), 5, 2) AS INTEGER), "
+        "    dia"
+        "  ) + (hora * INTERVAL '1 hour') AS ts, "
+        "  submercado, "
+        "  AVG(pld_hora) AS pld_hora "
+        "FROM pld_historical "
+        "WHERE mes_referencia IS NOT NULL AND pld_hora IS NOT NULL "
+        "GROUP BY mes_referencia, dia, hora, submercado "
+        "ORDER BY ts, submercado"
+    )
+    if not pld_df.empty:
+        pld_df["ts"] = pd.to_datetime(pld_df["ts"], errors="coerce")
+        pld_df = pld_df.dropna(subset=["ts", "submercado"])
+        pld_df["pld_hora"] = pd.to_numeric(pld_df["pld_hora"], errors="coerce")
+
+        # Série por submercado
+        SUB_COL = {"SUDESTE": "pld_se", "NORDESTE": "pld_ne",
+                   "SUL": "pld_s", "NORTE": "pld_n",
+                   "SE": "pld_se", "NE": "pld_ne",
+                   "S": "pld_s", "N": "pld_n"}
+        for sub in pld_df["submercado"].unique():
+            col_name = SUB_COL.get(sub.upper().strip(), f"pld_{sub.lower()[:3]}")
+            sub_s = pld_df[pld_df["submercado"] == sub].set_index("ts")["pld_hora"].rename(col_name)
+            _join(_ts(pd.to_numeric(sub_s, errors="coerce")))
+
+        # Média SIN como série principal "pld"
+        sin_s = pld_df.groupby("ts")["pld_hora"].mean().rename("pld")
+        _join(_ts(sin_s))
+    del pld_df
+
+    # ── Geração por fonte ────────────────────────────────────────────────────
+    gen_df = db_neon.fetchdf(
+        "SELECT din_instante AS instante, "
+        "  LOWER(nom_tipousina) AS tipousina, "
+        "  SUM(val_geracao) AS valor "
+        "FROM geracao_usina_horaria "
+        "WHERE din_instante IS NOT NULL AND val_geracao IS NOT NULL "
+        "GROUP BY din_instante, nom_tipousina ORDER BY din_instante"
+    )
+    if not gen_df.empty:
+        gen_df["instante"] = pd.to_datetime(gen_df["instante"], errors="coerce")
+        gen_df = gen_df.dropna(subset=["instante"])
+        FONTE_MAP = {
+            "fotovoltaica": "solar", "eolielétrica": "wind", "eolietrica": "wind",
+            "térmica": "thermal", "termica": "thermal",
+            "hidroelétrica": "hydro", "hidreletrica": "hydro",
+            "nuclear": "nuclear",
+        }
+        for src, col in FONTE_MAP.items():
+            sub = gen_df[gen_df["tipousina"].str.contains(src[:5], case=False, na=False)]
+            if not sub.empty:
+                s = sub.groupby("instante")["valor"].sum().rename(col)
+                _join(_ts(pd.to_numeric(s, errors="coerce")))
+    del gen_df
+
+    # ── Carga SIN ────────────────────────────────────────────────────────────
+    carga_df = db_neon.fetchdf(
+        "SELECT din_instante AS instante, "
+        "  UPPER(TRIM(id_subsistema)) AS id_subsistema, "
+        "  SUM(val_cargaenergiahomwmed) AS valor "
+        "FROM curva_carga "
+        "WHERE din_instante IS NOT NULL AND val_cargaenergiahomwmed IS NOT NULL "
+        "GROUP BY din_instante, id_subsistema ORDER BY din_instante"
+    )
+    if not carga_df.empty:
+        carga_df["instante"] = pd.to_datetime(carga_df["instante"], errors="coerce")
+        carga_df = carga_df.dropna(subset=["instante", "id_subsistema"])
+        carga_df["valor"] = pd.to_numeric(carga_df["valor"], errors="coerce")
+
+        _SUB_MAP = {"SE": "se", "NE": "ne", "S": "s", "N": "n",
+                    "SUDESTE": "se", "NORDESTE": "ne", "SUL": "s", "NORTE": "n"}
+        carga_df["sub_key"] = carga_df["id_subsistema"].map(_SUB_MAP)
+        carga_df = carga_df.dropna(subset=["sub_key"])
+
+        # Série por submercado: load_se, load_ne, load_s, load_n
+        for sub_key, grp in carga_df.groupby("sub_key"):
+            col = f"load_{sub_key}"
+            s = grp.groupby("instante")["valor"].sum().rename(col)
+            _join(_ts(pd.to_numeric(s, errors="coerce")))
+
+        # Série SIN total
+        sin_s = carga_df.groupby("instante")["valor"].sum().rename("load")
+        _join(_ts(pd.to_numeric(sin_s, errors="coerce")))
+    del carga_df
+
+    # ── EAR / ENA ────────────────────────────────────────────────────────────
+    ear_df = db_neon.fetchdf(
+        "SELECT ear_data AS instante, "
+        "  SUM(ear_verif_subsistema_mwmes) AS ear, SUM(ear_max_subsistema) AS earmaxp "
+        "FROM ear_diario_subsistema WHERE ear_data IS NOT NULL "
+        "GROUP BY ear_data ORDER BY ear_data"
+    )
+    if not ear_df.empty:
+        ear_df["instante"] = pd.to_datetime(ear_df["instante"], errors="coerce")
+        ear_df = ear_df.dropna(subset=["instante"])
+        ear_df["ear_pct"] = ear_df["ear"] / ear_df["earmaxp"].replace(0, np.nan) * 100
+        _join(_ts(pd.to_numeric(ear_df.set_index("instante")["ear_pct"], errors="coerce").rename("ear")))
+    del ear_df
+
+    # ── Colunas derivadas ─────────────────────────────────────────────────────
+    if not df.empty:
+        df = df.sort_index()
+        z = pd.Series(0.0, index=df.index)
+
+        def _col(name):
+            return pd.to_numeric(df[name], errors="coerce") if name in df.columns else z
+
+        load_s  = _col("load")
+        solar_s = _col("solar")
+        wind_s  = _col("wind")
+
+        df["net_load"]    = load_s - solar_s.fillna(0) - wind_s.fillna(0)
+        df["carga_total"] = load_s
+
+        # SIN_cost ponderado por submercado:
+        # custo_total = load_se*pld_se + load_ne*pld_ne + load_s*pld_s + load_n*pld_n
+        _sub_pairs = [("se", "se"), ("ne", "ne"), ("s", "s"), ("n", "n")]
+        _sin_cost = pd.Series(0.0, index=df.index)
+        _any_sub = False
+        for _sk, _pk in _sub_pairs:
+            _lc, _pc = f"load_{_sk}", f"pld_{_pk}"
+            if _lc in df.columns and _pc in df.columns:
+                _sin_cost += _col(_lc).fillna(0) * _col(_pc).fillna(0)
+                _any_sub = True
+        if not _any_sub and "load" in df.columns and "pld" in df.columns:
+            # Fallback: SIN total * PLD médio
+            _sin_cost = _col("load").fillna(0) * _col("pld").fillna(0)
+        df["SIN_cost_R$/h"] = _sin_cost.where(_sin_cost > 0, np.nan)
+
+        # Custo médio ponderado R$/MWh (custo_total / carga_total)
+        df["pld_ponderado"] = (df["SIN_cost_R$/h"] / load_s.replace(0, np.nan)).where(load_s > 0, np.nan)
+
+    return _ensure_hourly(df)
+
+
+def _build_hourly_df(_unused: Any = None) -> pd.DataFrame:
+    return _build_hourly_df_cached(_core_cache_token())
+
+
+def _get_section(section: str) -> Dict[str, Any]:
+    """Compatibilidade — retorna dict vazio; dados vêm do Neon agora."""
+    return {}
+
 
 
 def _series_from_hourly(d: Dict[str, Any], name: str) -> pd.Series:
@@ -180,145 +342,6 @@ def _series_from_operacao(records, value_key: str, name: str) -> pd.Series:
         pass
     return s
 
-
-def _build_hourly_df(core: Dict[str, Any]) -> pd.DataFrame:
-    """
-    Constrói o DataFrame horário carregando cada seção sob demanda e
-    descartando da memória logo após extrair as colunas necessárias.
-    Aceita tanto o dict completo quanto dicts vazios (fallback para _get_section).
-    """
-    df = pd.DataFrame()
-
-    # ── economic ────────────────────────────────────────────────────────────
-    econ = (core.get("economic") or
-            (core.get("advanced_metrics") or {}).get("economic") or
-            _get_section("economic").get("economic") or
-            _get_section("economic")) or {}
-    for k, col in [
-        ("sin_cost_hourly", "sin_cost"),
-        ("T_prudencia_hourly", "t_prudencia"),
-        ("T_hidro_hourly", "t_hidro"),
-        ("T_eletric_hourly", "t_eletric"),
-        ("T_sistemica_hourly", "t_sistemica"),
-        ("CVaR_implicit_hourly", "cvar_implicit"),
-        ("Risk_Aversion_Gap_hourly", "risk_gap"),
-        ("curtailment_loss_hourly", "curtailment_loss"),
-        ("hydro_gap_hourly", "hydro_gap"),
-        ("required_hydro_hourly", "required_hydro"),
-        ("mandatory_generation_hourly", "mandatory_generation"),
-        ("thermal_prudential_dispatch_hourly", "thermal_prudential_dispatch"),
-        ("infra_marginal_rent_hourly", "infra_marginal_rent"),
-    ]:
-        s = _series_from_hourly(econ.get(k, {}), col)
-        if not s.empty:
-            df = df.join(s, how="outer") if not df.empty else s.to_frame()
-    st_h = econ.get("system_state_hourly", {})
-    if isinstance(st_h, dict) and st_h:
-        s = pd.Series(st_h, name="system_state")
-        s.index = pd.to_datetime(s.index, errors="coerce")
-        s = s.dropna()
-        df = df.join(s, how="outer") if not df.empty else s.to_frame()
-    del econ
-
-    # ── advanced_metrics (apenas painel_horario_renovavel e cmo) ────────────
-    adv = core.get("advanced_metrics") or _get_section("advanced_metrics")
-    panel = pd.DataFrame((adv or {}).get("painel_horario_renovavel", []))
-    if not panel.empty and "instante" in panel.columns:
-        panel["instante"] = pd.to_datetime(panel["instante"], errors="coerce")
-        panel = panel.dropna(subset=["instante"]).set_index("instante")
-        for src, dst in [("gfom_pct", "gfom_pct"), ("ipr", "ipr"), ("isr", "isr"), ("ear", "ear"), ("ena", "ena")]:
-            if src in panel.columns:
-                s = pd.to_numeric(panel[src], errors="coerce").rename(dst)
-                df = df.join(s, how="outer") if not df.empty else s.to_frame()
-    del panel
-    cmo_sm = ((adv or {}).get("aderencia_fisico_economica") or {}).get("cmo_horario_por_submercado") or {}
-    del adv
-
-    # ── operacao ─────────────────────────────────────────────────────────────
-    oper = core.get("operacao") or _get_section("operacao")
-    gen = (oper or {}).get("generation", {})
-    load = (oper or {}).get("load", {})
-    load_sin = _series_from_operacao((load.get("sin") or {}).get("serie", []), "carga", "load")
-    if not load_sin.empty:
-        df = df.join(load_sin, how="outer") if not df.empty else load_sin.to_frame()
-    for source_keys, col in [
-        (["fotovoltaica"], "solar"),
-        (["eolielétrica"], "wind"),
-        (["térmica"], "thermal"),
-        (["hidroelétrica"], "hydro"),
-        (["nuclear"], "nuclear"),
-    ]:
-        serie_records = []
-        for key in source_keys:
-            if (gen.get(key) or {}).get("serie"):
-                serie_records = (gen[key] or {}).get("serie", [])
-                break
-        s = _series_from_operacao(serie_records, "geracao", col)
-        if not s.empty:
-            df = df.join(s, how="outer") if not df.empty else s.to_frame()
-    del oper, gen, load
-
-    # ── ccee ─────────────────────────────────────────────────────────────────
-    ccee_data = (core.get("ccee") or _get_section("ccee") or {}).get("data", [])
-    if ccee_data:
-        cdf = pd.DataFrame(ccee_data)
-        del ccee_data
-        if {"mes_referencia", "dia", "hora", "pld_hora"}.issubset(cdf.columns):
-            cdf["mr"] = cdf["mes_referencia"].astype(str).str.zfill(6)
-            cdf["ts"] = pd.to_datetime(
-                cdf["mr"].str[:4] + "-" + cdf["mr"].str[4:6] + "-" +
-                cdf["dia"].astype(str).str.zfill(2) + " " +
-                cdf["hora"].astype(str).str.zfill(2) + ":00:00", errors="coerce")
-            cdf["pld_hora"] = pd.to_numeric(cdf["pld_hora"], errors="coerce")
-            cdf = cdf.dropna(subset=["ts", "pld_hora"])
-            if not cdf.empty:
-                pld = cdf.groupby("ts")["pld_hora"].mean().rename("pld")
-                try:
-                    if getattr(pld.index, "tz", None) is not None:
-                        pld.index = pld.index.tz_localize(None)
-                except Exception:
-                    pass
-                df = df.join(pld, how="outer") if not df.empty else pld.to_frame()
-        del cdf
-    else:
-        del ccee_data
-
-    # ── renewables ───────────────────────────────────────────────────────────
-    ren = (core.get("renewables") or _get_section("renewables") or {})
-    for key, col in [("solar", "curtail_solar"), ("eolica", "curtail_wind")]:
-        ser = pd.DataFrame(((ren.get("curtailment") or {}).get(key) or {}).get("serie", []))
-        if not ser.empty and {"instante", "valor"}.issubset(ser.columns):
-            ser["instante"] = pd.to_datetime(ser["instante"], errors="coerce")
-            ser["valor"] = pd.to_numeric(ser["valor"], errors="coerce")
-            s = ser.dropna().set_index("instante")["valor"].groupby(level=0).sum().rename(col)
-            try:
-                if getattr(s.index, "tz", None) is not None:
-                    s.index = s.index.tz_localize(None)
-            except Exception:
-                pass
-            df = df.join(s, how="outer") if not df.empty else s.to_frame()
-    del ren
-
-    # ── colunas derivadas ────────────────────────────────────────────────────
-    if not df.empty:
-        df = df.sort_index()
-        z = pd.Series(0.0, index=df.index)
-        load_s   = pd.to_numeric(df.get("load"),         errors="coerce") if "load"         in df.columns else pd.Series(np.nan, index=df.index)
-        solar_s  = pd.to_numeric(df.get("solar"),        errors="coerce") if "solar"        in df.columns else z
-        wind_s   = pd.to_numeric(df.get("wind"),         errors="coerce") if "wind"         in df.columns else z
-        cur_solar = pd.to_numeric(df.get("curtail_solar"), errors="coerce") if "curtail_solar" in df.columns else z
-        cur_wind  = pd.to_numeric(df.get("curtail_wind"),  errors="coerce") if "curtail_wind"  in df.columns else z
-        df["net_load"]     = load_s - solar_s.fillna(0) - wind_s.fillna(0)
-        df["carga_total"]  = load_s
-        df["curtail_total"] = cur_solar.fillna(0) + cur_wind.fillna(0)
-        if "cmo_dominante" not in df.columns and isinstance(cmo_sm, dict) and cmo_sm:
-            first_key = "SUDESTE" if "SUDESTE" in cmo_sm else next(iter(cmo_sm))
-            s = _series_from_hourly(cmo_sm.get(first_key, {}), "cmo_dominante")
-            if not s.empty:
-                df = df.join(s, how="left")
-    del cmo_sm
-
-    return _ensure_hourly(df)
 
 
 def _fmt_ptbr(value: Any, decimals: int = 2) -> str:
@@ -398,6 +421,87 @@ def _plot_df(dff: pd.DataFrame) -> pd.DataFrame:
 
 def _ensure_hourly(df: pd.DataFrame) -> pd.DataFrame:
     """Consolida qualquer série semihorária em base horária (média de :00 e :30)."""
+    if df.empty:
+        return df
+    out = df.copy()
+    out.index = pd.to_datetime(out.index, errors="coerce")
+    out = out[~out.index.isna()]
+    if out.empty:
+        return out
+    out["hora_ref"] = out.index.floor("h")
+    num_cols = out.select_dtypes(include=[np.number]).columns.tolist()
+    other_cols = [c for c in out.columns if c not in num_cols + ["hora_ref"]]
+    agg_map = {c: "mean" for c in num_cols}
+    agg_map.update({c: "last" for c in other_cols})
+    out = out.groupby("hora_ref", as_index=True).agg(agg_map).sort_index()
+    out.index.name = "instante"
+    return out
+
+
+def _latest_operational_dates(core: Dict[str, Any]) -> Dict[str, Optional[date]]:
+    oper = core.get("operacao", {}) if isinstance(core, dict) else {}
+
+    def _max_date_from_records(records: Any) -> Optional[date]:
+        if not isinstance(records, list) or not records:
+            return None
+        df = pd.DataFrame(records)
+        if "instante" not in df.columns:
+            return None
+        ts = pd.to_datetime(df["instante"], errors="coerce")
+        ts = ts.dropna()
+        if ts.empty:
+            return None
+        return ts.max().date()
+
+    load_records = ((oper.get("load", {}) or {}).get("sin", {}) or {}).get("serie", [])
+    load_day = _max_date_from_records(load_records)
+
+    generation = oper.get("generation", {}) or {}
+    gen_days = []
+    for payload in generation.values():
+        day = _max_date_from_records((payload or {}).get("serie", []))
+        if day is not None:
+            gen_days.append(day)
+    generation_day = max(gen_days) if gen_days else None
+
+    return {"load": load_day, "generation": generation_day}
+
+
+def main():
+    st.set_page_config(page_title="MAÁTria Energia", layout="wide", initial_sidebar_state="collapsed")
+
+    st.markdown(
+        """
+        <style>
+          .stApp { background-color:#0b0f14; color:#f3f4f6; }
+          [data-testid="stSidebar"] { display:none !important; }
+          .block-container { padding-top: 40px; }
+          .fixed-header { position: fixed; top: 0; left:0; right:0; z-index:999; background:#0b0f14; }
+          .full-bleed-line { height:0.1px; background:#c8a44d; width:100vw; margin-left:calc(50% - 50vw); }
+          .tabs-layer { background: linear-gradient(180deg, #0b1222 0%, #070d1a 100%); padding:0.01rem 0.01rem 0.01rem 0.01rem; }
+          label { color:#ffffff !important; font-weight:700 !important; }
+          .stTabs [data-baseweb="tab-list"] { gap: 0.15rem; flex-wrap: nowrap !important; overflow-x: auto !important; scrollbar-width: thin; }
+          .stTabs [data-baseweb="tab"] { color:#e5e7eb; border-radius:6px; padding:0.25rem 0.45rem; font-size:0.78rem; white-space:nowrap; }
+          .stTabs [aria-selected="true"] { background:#152238 !important; color:#f8fafc !important; border:1px solid #c8a44d !important; }
+          div[data-testid="stFormSubmitButton"] > button {
+            background:#d4af37 !important; color:#111827 !important; font-weight:800 !important; border:1px solid #b38f2b !important;
+          }
+          div[data-testid="stFormSubmitButton"] > button:hover { background:#e3bf4c !important; color:#000 !important; }
+          .cards-row { margin-bottom: 5px; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if not _NEON_OK:
+        st.error("❌ Banco de dados Neon não configurado.")
+        st.info("Defina DATABASE_URL nas variáveis de ambiente do Render com a connection string do Neon.")
+        with st.expander("ℹ️ Como configurar", expanded=True):
+            st.code("DATABASE_URL=postgresql://user:pass@ep-xxx.neon.tech/neondb?sslmode=require")
+        return
+
+    df = _build_hourly_df()
+
     if df.empty:
         return df
     out = df.copy()
@@ -594,7 +698,19 @@ def main():
         st.warning("Não há dados para o período selecionado.")
         return
 
-    latest_operational = _latest_operational_dates(_get_section('operacao'))
+    latest_operational = {"load": None, "generation": None}
+    if _NEON_OK:
+        try:
+            r = db_neon.fetchdf(
+                "SELECT 'carga' AS tipo, MAX(din_instante)::date::text AS mx FROM curva_carga "
+                "UNION ALL "
+                "SELECT 'geracao', MAX(din_instante)::date::text FROM geracao_usina_horaria"
+            )
+            for _, row in r.iterrows():
+                if row["mx"]:
+                    latest_operational["load" if row["tipo"]=="carga" else "generation"] = pd.Timestamp(row["mx"]).date()
+        except Exception:
+            pass
     available_reference_days = [d for d in [latest_operational.get("load"), latest_operational.get("generation")] if d is not None]
     photo_day = max(available_reference_days) if available_reference_days else max_d
     if photo_day < selected_start or photo_day > selected_end:
@@ -844,7 +960,7 @@ def main():
             "load": abs(metrics["Load pressure"]-1),
         }
 
-        norm = ((_get_section("economic") or {}).get("normalization_hourly") or {})
+        norm = {}
         if norm and not dff.empty:
             tkey = dff.index[-1].strftime("%Y-%m-%d %H:%M:%S")
             metrics["EAR_norm"] = (norm.get("EAR_norm") or {}).get(tkey, np.nan)

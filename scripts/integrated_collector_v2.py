@@ -13,6 +13,19 @@ try:
 except Exception:
     duckdb = None
 
+try:
+    import sys as _sys
+    import os as _os
+    # Garante que o root do projeto está no path para importar db_neon
+    _root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _root not in _sys.path:
+        _sys.path.insert(0, _root)
+    import db_neon
+    _NEON_OK = db_neon.is_configured()
+except Exception:
+    db_neon = None  # type: ignore
+    _NEON_OK = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -103,6 +116,132 @@ class KintuadiIntegratedCollectorV2:
             return True
 
         return int(month) == int(current_month)
+
+    # ── Neon PostgreSQL ───────────────────────────────────────────────────────
+
+    def _persist_ons_neon(self, dataset_name: str, file_path: str) -> None:
+        """Persiste dataset ONS no Neon PostgreSQL."""
+        if not _NEON_OK:
+            return
+        if not os.path.exists(file_path):
+            return
+
+        # Apenas tabelas que o app usa
+        SUPPORTED = {
+            "geracao_usina_horaria", "curva_carga", "despacho_gfom",
+            "cmo", "capacidade_instalada", "disponibilidade_usina",
+            "ear_diario_subsistema", "ena_diario_subsistema",
+            "cvu_usina_termica", "intercambio",
+        }
+        table_name = self._sanitize_table_name(dataset_name)
+        if table_name not in SUPPORTED:
+            return
+
+        year, month = self._extract_year_month(dataset_name)
+        try:
+            is_xlsx = str(file_path).lower().endswith(".xlsx")
+            df_src = (pd.read_excel(file_path, engine="openpyxl") if is_xlsx
+                      else pd.read_csv(file_path, sep=None, engine="python",
+                                       on_bad_lines="skip", encoding="utf-8-sig"))
+            if df_src.empty:
+                return
+
+            df_src.columns = [str(c).strip().lower() for c in df_src.columns]
+            df_src["ano"] = year
+            df_src["mes"] = month
+
+            if not db_neon.table_exists(table_name):
+                logger.warning(f"Neon: tabela {table_name} nao existe. Rode: python db_neon.py --create-tables")
+                return
+
+            # Deletar periodo antes de reinserir (idempotente)
+            if month is not None:
+                db_neon.execute(f'DELETE FROM "{table_name}" WHERE ano = %s AND mes = %s', [year, month])
+            elif year is not None:
+                db_neon.execute(f'DELETE FROM "{table_name}" WHERE ano = %s', [year])
+
+            # Filtrar colunas que existem no destino
+            dest_df = db_neon.fetchdf(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema='public' AND table_name=%s", [table_name]
+            )
+            if dest_df.empty:
+                return
+            dest_cols = set(dest_df["column_name"].str.lower())
+            cols = [c for c in df_src.columns if c in dest_cols]
+            if not cols:
+                return
+
+            df_insert = df_src[cols].where(pd.notnull(df_src[cols]), None)
+
+            import psycopg2.extras
+            col_names = ", ".join([f'"{c}"' for c in cols])
+            placeholders = ", ".join(["%s"] * len(cols))
+            sql = (f'INSERT INTO "{table_name}" ({col_names}) VALUES ({placeholders}) '
+                   f'ON CONFLICT DO NOTHING')
+            data = [tuple(r) for r in df_insert.itertuples(index=False, name=None)]
+            with db_neon.get_conn() as conn:
+                psycopg2.extras.execute_batch(conn.cursor(), sql, data, page_size=500)
+            logger.info(f"Neon: {table_name} <- {len(df_insert)} linhas (ano={year}, mes={month})")
+        except Exception as e:
+            logger.error(f"Neon persist error {dataset_name}: {e}")
+
+    def _persist_pld_neon(self, df: pd.DataFrame, year: int) -> None:
+        """Persiste PLD historico no Neon."""
+        if not _NEON_OK:
+            return
+        try:
+            dfx = df.copy()
+            dfx.columns = [str(c).lower() for c in dfx.columns]
+
+            if "data" not in dfx.columns:
+                if {"mes_referencia", "dia", "hora"}.issubset(dfx.columns):
+                    mr = pd.to_numeric(dfx["mes_referencia"], errors="coerce").astype("Int64").astype(str).str.zfill(6)
+                    dfx["data"] = pd.to_datetime(
+                        mr.str[:4] + "-" + mr.str[4:6] + "-" +
+                        pd.to_numeric(dfx["dia"], errors="coerce").fillna(1).astype(int).astype(str).str.zfill(2) +
+                        " " + pd.to_numeric(dfx["hora"], errors="coerce").fillna(0).astype(int).astype(str).str.zfill(2) + ":00:00",
+                        errors="coerce"
+                    )
+            else:
+                dfx["data"] = pd.to_datetime(dfx["data"], errors="coerce")
+
+            if "pld" not in dfx.columns and "pld_hora" in dfx.columns:
+                dfx["pld"] = pd.to_numeric(dfx["pld_hora"], errors="coerce")
+            if "submercado" in dfx.columns:
+                dfx["submercado"] = dfx["submercado"].astype(str).str.upper().str.strip()
+
+            dfx = dfx.dropna(subset=["data", "submercado", "pld"])
+            if dfx.empty:
+                return
+
+            dfx["ano"]  = dfx["data"].dt.year
+            dfx["mes"]  = dfx["data"].dt.month
+            dfx["hora"] = dfx["data"].dt.hour
+            if "dia" not in dfx.columns:
+                dfx["dia"] = dfx["data"].dt.day
+            if "mes_referencia" not in dfx.columns:
+                dfx["mes_referencia"] = dfx["data"].dt.strftime("%Y%m").astype(int)
+            if "periodo_comercializacao" not in dfx.columns:
+                dfx["periodo_comercializacao"] = None
+
+            db_neon.execute("DELETE FROM pld_historical WHERE ano = %s", [year])
+
+            keep = ["data","submercado","pld","ano","mes","hora","dia","mes_referencia","periodo_comercializacao"]
+            dfx = dfx[[c for c in keep if c in dfx.columns]].where(pd.notnull(dfx), None)
+
+            import psycopg2.extras
+            cols = list(dfx.columns)
+            col_names = ", ".join([f'"{c}"' for c in cols])
+            placeholders = ", ".join(["%s"] * len(cols))
+            sql = (f'INSERT INTO pld_historical ({col_names}) VALUES ({placeholders}) '
+                   f'ON CONFLICT (data, submercado) DO UPDATE SET pld = EXCLUDED.pld')
+            data = [tuple(r) for r in dfx.itertuples(index=False, name=None)]
+            with db_neon.get_conn() as conn:
+                psycopg2.extras.execute_batch(conn.cursor(), sql, data, page_size=500)
+            logger.info(f"Neon: pld_historical <- {len(dfx)} linhas (ano={year})")
+        except Exception as e:
+            logger.error(f"Neon PLD persist error: {e}")
 
     def _persist_ons_dataset(self, dataset_name: str, file_path: str):
         if duckdb is None:
@@ -446,6 +585,7 @@ class KintuadiIntegratedCollectorV2:
                     if dataset_name and file_path and os.path.exists(file_path):
                         if self._should_persist_dataset(dataset_name, persist_mode):
                             self._persist_ons_dataset(dataset_name, file_path)
+                            self._persist_ons_neon(dataset_name, file_path)
                         else:
                             logger.info(f"Pulando persist ONS (modo incremental): {dataset_name}")
 
@@ -487,8 +627,10 @@ class KintuadiIntegratedCollectorV2:
                             df_year = pd.DataFrame(recs)
                         if df_year.empty:
                             continue
-                        logger.info(f"Persistindo PLD {year} no DuckDB...")
-                        self._persist_pld_duckdb(df_year, int(year) if year else datetime.now().year)
+                        logger.info(f"Persistindo PLD {year} no DuckDB + Neon...")
+                        yr = int(year) if year else datetime.now().year
+                        self._persist_pld_duckdb(df_year, yr)
+                        self._persist_pld_neon(df_year, yr)
                     except Exception as e:
                         logger.warning(f"Falha ao persistir PLD {year}: {e}")
 
