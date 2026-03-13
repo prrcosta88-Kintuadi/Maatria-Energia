@@ -706,7 +706,7 @@ def main():
           .stApp { background-color:#0b0f14; color:#f3f4f6; }
           [data-testid="stSidebar"] { display:none !important; }
           .block-container { padding-top: 40px; }
-          .fixed-header { position: fixed; top: 0; left:100; right:0; z-index:999; background:#0b0f14; }
+          .fixed-header { position: fixed; top: 0; left:0; right:0; z-index:999; background:#0b0f14; }
           .full-bleed-line { height:0.1px; background:#c8a44d; width:100vw; margin-left:calc(50% - 50vw); }
           .tabs-layer { background: linear-gradient(180deg, #0b1222 0%, #070d1a 100%); padding:0.01rem 0.01rem 0.01rem 0.01rem; }
           label { color:#ffffff !important; font-weight:700 !important; }
@@ -1026,26 +1026,22 @@ def main():
             if _cmo_err:
                 st.caption(f"⚠️ CMO não carregado: {_cmo_err}")
             with st.expander("Ver dados PLD/CMO (hora a hora)"):
-                # PLD do dff
+                # Montar tabela com índice Timestamp comum
                 _pld_cols = [col for col in ["pld_se","pld_ne","pld_s","pld_n","pld"] if col in dff.columns]
-                _tbl_parts = []
-                if _pld_cols:
-                    _pld_tbl = _plot_df(dff[_pld_cols]).rename(
-                        columns={"pld_se":"PLD SE","pld_ne":"PLD NE","pld_s":"PLD S","pld_n":"PLD N","pld":"PLD SIN"}
-                    )
-                    _tbl_parts.append(_pld_tbl)
-                # CMO pivotado
+                _tbl = dff[_pld_cols].copy() if _pld_cols else pd.DataFrame(index=dff.index)
+                _tbl.index = pd.to_datetime(_tbl.index, errors="coerce")
+                _tbl = _tbl.rename(columns={"pld_se":"PLD SE","pld_ne":"PLD NE",
+                                             "pld_s":"PLD S","pld_n":"PLD N","pld":"PLD SIN"})
                 if not _cmo_pivot.empty:
-                    _cmo_tbl = _cmo_pivot.rename(
-                        columns={"se":"CMO SE","ne":"CMO NE","s":"CMO S","n":"CMO N"}
-                    )
-                    _tbl_parts.append(_cmo_tbl)
-                if _tbl_parts:
-                    import functools
-                    _merged = functools.reduce(
-                        lambda a, b: a.join(b, how="outer"), _tbl_parts
-                    )
-                    st.dataframe(_merged.sort_index(ascending=False), width="stretch", height=260)
+                    _cmo_tbl = _cmo_pivot.copy()
+                    _cmo_tbl.index = pd.to_datetime(_cmo_tbl.index, errors="coerce")
+                    _cmo_tbl = _cmo_tbl.rename(columns={"se":"CMO SE","ne":"CMO NE",
+                                                          "s":"CMO S","n":"CMO N"})
+                    _tbl = _tbl.join(_cmo_tbl, how="outer")
+                _tbl = _tbl[~_tbl.index.isna()].sort_index(ascending=False)
+                _tbl.index.name = "instante"
+                if not _tbl.empty:
+                    st.dataframe(_tbl, width="stretch", height=260)
 
     with tabs[1]:
         pdf = _plot_df(dff)
