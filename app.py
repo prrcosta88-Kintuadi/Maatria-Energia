@@ -278,6 +278,9 @@ def _build_hourly_df_cached(_token: str) -> pd.DataFrame:
     del ear_df
 
     # ── ENA diário ───────────────────────────────────────────────────────────
+    # Busca histórico completo de ENA + percentil 90 dos últimos 365 dias
+    # O P90 serve como denominador estável para ENA_norm, independente do
+    # período selecionado na tela pelo usuário.
     ena_df = db_neon.fetchdf(
         "SELECT ena_data AS instante, "
         "  SUM(ena_bruta_regiao_mwmed) AS ena_bruta, "
@@ -285,6 +288,19 @@ def _build_hourly_df_cached(_token: str) -> pd.DataFrame:
         "FROM ena_diario_subsistema WHERE ena_data IS NOT NULL "
         "GROUP BY ena_data ORDER BY ena_data"
     )
+    # Denominador para ENA_norm: percentil 90 dos últimos 365 dias
+    # Janela de 365 dias captura um ciclo hidrológico completo (cheia + seca),
+    # tornando a normalização estável e comparável ao longo do tempo.
+    _ena_norm_denom = np.nan
+    if not ena_df.empty:
+        _ena_ref = pd.to_numeric(ena_df["ena_arm"], errors="coerce").dropna()
+        _cutoff  = pd.Timestamp.now().normalize() - pd.Timedelta(days=365)
+        _ena_ref_365 = _ena_ref[pd.to_datetime(ena_df["instante"], errors="coerce") >= _cutoff]
+        if not _ena_ref_365.empty:
+            _ena_norm_denom = float(_ena_ref_365.quantile(0.90))
+        elif not _ena_ref.empty:
+            _ena_norm_denom = float(_ena_ref.quantile(0.90))   # fallback: série toda
+
     if not ena_df.empty:
         ena_df["instante"] = pd.to_datetime(ena_df["instante"], errors="coerce").dt.normalize()
         ena_df = ena_df.dropna(subset=["instante"]).set_index("instante")
@@ -508,14 +524,19 @@ def _build_hourly_df_cached(_token: str) -> pd.DataFrame:
         else:
             df["EAR_norm"] = np.nan
 
-        # ENA_norm: ENA armazenável / capacidade máxima EAR (proxy)
-        # Usamos ena_arm normalizado pelo valor máximo histórico da série
+        # ENA_norm: ENA armazenável / P90 dos últimos 365 dias (denominador estável)
+        # Janela de 365 dias captura cheia + seca sem depender do período selecionado.
+        # P90 (e não máximo) evita que valores extremos de cheia inflacionem o
+        # denominador e comprimam artificialmente os scores em anos secos.
         if "ena_arm" in df.columns:
-            _ena_max = df["ena_arm"].max()
-            if pd.notna(_ena_max) and _ena_max > 0:
-                df["ENA_norm"] = (df["ena_arm"] / _ena_max).clip(lower=0, upper=1)
+            # _ena_norm_denom calculado acima na query de ENA (P90 / 365 dias)
+            _denom = _ena_norm_denom if (pd.notna(_ena_norm_denom) and _ena_norm_denom > 0) else np.nan
+            if pd.notna(_denom):
+                df["ENA_norm"] = (df["ena_arm"] / _denom).clip(lower=0, upper=1)
             else:
-                df["ENA_norm"] = np.nan
+                # fallback: max da série presente no df (comportamento anterior)
+                _fallback = df["ena_arm"].max()
+                df["ENA_norm"] = (df["ena_arm"] / _fallback).clip(lower=0, upper=1)                     if pd.notna(_fallback) and _fallback > 0 else np.nan
         else:
             df["ENA_norm"] = np.nan
 
@@ -1824,8 +1845,8 @@ restrições de transmissão ou inflexibilidade térmica excessiva.
 
 ### Limitações
 
-- ENA_norm usa o máximo histórico **da série carregada no período** como denominador.
-  Períodos curtos podem distorcer a normalização.
+- **ENA_norm** usa o P90 dos últimos 365 dias como denominador, calculado sobre o
+  histórico completo do banco de dados — não sobre o período selecionado na tela.
 - O score de CVaR usa R$100/MWh como unidade de referência implícita.
   Em cenários de PLD próximo ao teto regulatório, o CVaR pode ser estruturalmente
   alto sem refletir incoerência real.
