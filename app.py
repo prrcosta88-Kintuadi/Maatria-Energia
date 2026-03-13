@@ -1741,37 +1741,96 @@ Mudanças de comportamento ao longo das estações hidrológicas ou da expansão
 Por utilizar toda a base histórica disponível, o heatmap permite visualizar **padrões operativos recorrentes do SIN**.
 """)
 
-        with st.expander("🏷️ 11) Classificação Operativa do SIN", expanded=False):
+        with st.expander("🏷️ 11) Coerência Operativa do SIN", expanded=False):
             st.markdown("""
-A plataforma classifica o estado do sistema em regimes operativos.
+## Coerência Operativa do SIN
 
-**Escassez Hidrológica**
-
-Baixo armazenamento e maior dependência térmica.
-
----
-
-**Preservação Hídrica**
-
-Estratégia deliberada de poupar reservatórios.
+A aba **Coerência Operativa** avalia se o comportamento econômico observado no mercado
+(PLD, CVaR, Risk Gap) é **internamente consistente com as condições físicas do sistema**
+(armazenamento, afluência e pressão de carga). Um sistema coerente é aquele em que
+os preços refletem fielmente o estado físico — sem distorções regulatórias, anomalias
+de despacho ou ruídos de formação de preços.
 
 ---
 
-**Saturação Renovável**
+### Normalizações — o que são e por que existem
 
-Excesso instantâneo de geração renovável.
+Cada variável do SIN opera em uma escala diferente (MW, MWmês, R$/MWh, %).
+Para combiná-las em um único indicador é necessário **normalizar** cada série para
+o intervalo **[0, 1]**, onde 0 representa o extremo mais favorável e 1 o mais crítico.
+
+| Variável | Fórmula de normalização | Interpretação do valor |
+|---|---|---|
+| **EAR_norm** | EAR% ÷ 100 | 0 = reservatório vazio · 1 = cheio |
+| **ENA_norm** | ENA_arm ÷ max(ENA_arm histórico) | 0 = afluência mínima · 1 = máxima |
+| **Load_norm** | Carga / Capacidade sincronizada | 0 = sistema folgado · 1 = no limite |
+| **CVaR** | (PLD − CMO).clip(0) em R$/MWh | divergência entre preço e custo marginal |
+| **Risk Gap** | CVaR − CVU semanal | prêmio de risco além do custo variável |
+
+> **Nota sobre EAR_norm e ENA_norm:** por serem dados diários (publicados uma vez por dia
+> pelo ONS), o mesmo valor é atribuído a todas as 24 horas do dia correspondente.
+> Isso é metodologicamente correto — o armazenamento e a afluência são grandezas
+> de fluxo diário, não horário.
 
 ---
 
-**Stress Operativo**
+### Scores normalizados — como funcionam
 
-Sinais simultâneos de risco físico e pressão econômica.
+Cada variável é convertida em um **score de desvio** (quanto aquela dimensão contribui
+para a incoerência do sistema). O score ideal é **0** (sem desvio); scores próximos de
+**1** indicam pressão máxima naquela dimensão.
+
+| Score | Fórmula | Lógica |
+|---|---|---|
+| **ear** | 1 − EAR_norm | Reservatórios baixos → maior risco |
+| **ena** | 1 − ENA_norm | Afluência baixa → menor folga hídrica |
+| **load** | abs(Load_norm − 1) | Carga muito próxima da capacidade → risco operativo |
+| **cvar** | CVaR ÷ 100 | Divergência PLD/CMO como fração de R$100/MWh |
+| **risk** | tanh(Risk Gap ÷ 300) | Prêmio de risco saturado em ±1 (300 R$/MWh como referência) |
+
+A função `tanh` no score de risco evita que valores extremos de Risk Gap dominem
+o indicador — ela comprime a escala de forma suave, preservando o sinal direcional
+mas limitando o peso de outliers.
 
 ---
 
-**Equilíbrio Estrutural**
+### Métrica de Coerência do SIN — score final
 
-Operação estável sem pressões relevantes.
+O score final é calculado como:
+
+```
+Coerência (%) = 100 × (1 − média dos scores)
+```
+
+**Interpretação:**
+
+| Faixa | Sinal | Significado |
+|---|---|---|
+| 🟢 ≥ 70 | Coerente | Preços consistentes com o estado físico |
+| 🟡 40–70 | Atenção | Alguma divergência entre sinal físico e econômico |
+| 🔴 < 40 | Incoerente | Pressão severa ou descolamento significativo |
+
+**Exemplo prático:** um sistema com EAR baixo (EAR_norm = 0,30), afluência reduzida
+(ENA_norm = 0,40) e PLD muito acima do CMO (CVaR alto) terá scores individuais
+elevados em todas as dimensões, resultando em Coerência < 40 — sinal de stress
+sistêmico consistente, onde o preço alto reflete genuinamente as condições físicas.
+
+Por outro lado, se o PLD estiver alto mas EAR e ENA estiverem em níveis confortáveis,
+a Coerência também será baixa — mas por incoerência: o preço não encontra respaldo
+nas condições físicas do reservatório, o que pode indicar distorção regulatória,
+restrições de transmissão ou inflexibilidade térmica excessiva.
+
+---
+
+### Limitações
+
+- ENA_norm usa o máximo histórico **da série carregada no período** como denominador.
+  Períodos curtos podem distorcer a normalização.
+- O score de CVaR usa R$100/MWh como unidade de referência implícita.
+  Em cenários de PLD próximo ao teto regulatório, o CVaR pode ser estruturalmente
+  alto sem refletir incoerência real.
+- Dados ausentes (NaN) recebem score neutro de **0,5**, para não penalizar nem
+  beneficiar a métrica na ausência de informação.
 """)
 
         with st.expander("🧭 12) Como Interpretar o Dashboard", expanded=False):
