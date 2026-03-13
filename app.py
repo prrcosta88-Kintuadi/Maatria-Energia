@@ -706,7 +706,7 @@ def main():
           .stApp { background-color:#0b0f14; color:#f3f4f6; }
           [data-testid="stSidebar"] { display:none !important; }
           .block-container { padding-top: 40px; }
-          .fixed-header { position: fixed; top: 0; left:10; right:0; z-index:999; background:#0b0f14; }
+          .fixed-header { position: fixed; top: 0; left:100; right:0; z-index:999; background:#0b0f14; }
           .full-bleed-line { height:0.1px; background:#c8a44d; width:100vw; margin-left:calc(50% - 50vw); }
           .tabs-layer { background: linear-gradient(180deg, #0b1222 0%, #070d1a 100%); padding:0.01rem 0.01rem 0.01rem 0.01rem; }
           label { color:#ffffff !important; font-weight:700 !important; }
@@ -941,7 +941,9 @@ def main():
         _fig_pld = go.Figure()
         _SUB_COLORS = {"se": "#f59e0b", "ne": "#34d399", "s": "#60a5fa", "n": "#f472b6"}
         _SUB_LABELS = {"se": "SE", "ne": "NE", "s": "S", "n": "N"}
-        _pld_added, _cmo_added = False, False
+        _pld_added = False
+
+        # PLD por submercado (já está no dff)
         for _sk, _color in _SUB_COLORS.items():
             _pld_col = f"pld_{_sk}"
             if _pld_col in dff.columns:
@@ -950,36 +952,64 @@ def main():
                     _fig_pld.add_trace(go.Scatter(
                         x=_s.index, y=_s.values,
                         name=f"PLD {_SUB_LABELS[_sk]}",
-                        line=dict(color=_color, width=1.5, dash="solid"),
-                        mode="lines", legendgroup=f"pld_{_sk}",
+                        line=dict(color=_color, width=1.8, dash="solid"),
+                        mode="lines",
                     ))
                     _pld_added = True
-        # CMO por subsistema — buscar do Neon se não estiver no dff
-        _cmo_sub_map = {"SUDESTE": ("se", "#f59e0b"), "NORDESTE": ("ne", "#34d399"),
-                        "SUL": ("s", "#60a5fa"), "NORTE": ("n", "#f472b6")}
+
+        # CMO por subsistema — query com filtro de período + normalização de id_subsistema
+        # O campo id_subsistema pode conter: SE/SUDESTE/SECO, NE/NORDESTE, S/SUL, N/NORTE
+        _cmo_pivot = pd.DataFrame()
+        _cmo_added = False
+        _cmo_err = None
         try:
+            _ts_min = dff.index.min()
+            _ts_max = dff.index.max()
             _cmo_raw = db_neon.fetchdf(
-                "SELECT din_instante AS instante, id_subsistema, val_cmo "
-                "FROM cmo WHERE din_instante IS NOT NULL AND val_cmo IS NOT NULL "
+                "SELECT din_instante AS instante, "
+                "  UPPER(TRIM(id_subsistema)) AS sub, "
+                "  val_cmo "
+                "FROM cmo "
+                "WHERE din_instante IS NOT NULL "
+                "  AND val_cmo IS NOT NULL "
+                f" AND din_instante >= '{_ts_min}' "
+                f" AND din_instante <= '{_ts_max}' "
                 "ORDER BY din_instante"
             )
             if not _cmo_raw.empty:
                 _cmo_raw["instante"] = pd.to_datetime(_cmo_raw["instante"], errors="coerce")
-                _cmo_raw = _cmo_raw.dropna(subset=["instante"])
-                _cmo_raw = _cmo_raw[(_cmo_raw["instante"] >= pd.Timestamp(dff.index.min())) &
-                                    (_cmo_raw["instante"] <= pd.Timestamp(dff.index.max()))]
-                for _sub_id, (_sk, _color) in _cmo_sub_map.items():
-                    _sub_df = _cmo_raw[_cmo_raw["id_subsistema"].str.upper().str.strip() == _sub_id]
-                    if not _sub_df.empty:
-                        _fig_pld.add_trace(go.Scatter(
-                            x=_sub_df["instante"], y=_sub_df["val_cmo"],
-                            name=f"CMO {_SUB_LABELS[_sk]}",
-                            line=dict(color=_color, width=1.2, dash="dash"),
-                            mode="lines", legendgroup=f"cmo_{_sk}",
-                        ))
-                        _cmo_added = True
-        except Exception:
-            pass
+                _cmo_raw["val_cmo"]  = pd.to_numeric(_cmo_raw["val_cmo"], errors="coerce")
+                _cmo_raw = _cmo_raw.dropna(subset=["instante", "val_cmo"])
+
+                # Normalizar id_subsistema para chave curta (se/ne/s/n)
+                _ID_NORM = {
+                    "SE": "se", "SUDESTE": "se", "SECO": "se",
+                    "NE": "ne", "NORDESTE": "ne",
+                    "S":  "s",  "SUL": "s",
+                    "N":  "n",  "NORTE": "n",
+                }
+                _cmo_raw["sk"] = _cmo_raw["sub"].map(_ID_NORM)
+                _cmo_raw = _cmo_raw.dropna(subset=["sk"])
+
+                # Pivotar: instante × subsistema → val_cmo
+                _cmo_pivot = _cmo_raw.pivot_table(
+                    index="instante", columns="sk", values="val_cmo", aggfunc="mean"
+                )
+
+                for _sk, _color in _SUB_COLORS.items():
+                    if _sk in _cmo_pivot.columns:
+                        _s = _cmo_pivot[_sk].dropna()
+                        if not _s.empty:
+                            _fig_pld.add_trace(go.Scatter(
+                                x=_s.index, y=_s.values,
+                                name=f"CMO {_SUB_LABELS[_sk]}",
+                                line=dict(color=_color, width=1.2, dash="dash"),
+                                mode="lines",
+                            ))
+                            _cmo_added = True
+        except Exception as _e:
+            _cmo_err = str(_e)
+
         if _pld_added or _cmo_added:
             _fig_pld.update_layout(
                 template="plotly_dark",
@@ -993,10 +1023,29 @@ def main():
                 xaxis=dict(gridcolor="#1e293b"),
             )
             st.plotly_chart(_fig_pld, width="stretch")
+            if _cmo_err:
+                st.caption(f"⚠️ CMO não carregado: {_cmo_err}")
             with st.expander("Ver dados PLD/CMO (hora a hora)"):
-                _pld_cmo_cols = [c for c in ["pld","pld_se","pld_ne","pld_s","pld_n","cmo_dominante"] if c in dff.columns]
-                if _pld_cmo_cols:
-                    st.dataframe(_plot_df(dff[_pld_cmo_cols]), width="stretch", height=260)
+                # PLD do dff
+                _pld_cols = [col for col in ["pld_se","pld_ne","pld_s","pld_n","pld"] if col in dff.columns]
+                _tbl_parts = []
+                if _pld_cols:
+                    _pld_tbl = _plot_df(dff[_pld_cols]).rename(
+                        columns={"pld_se":"PLD SE","pld_ne":"PLD NE","pld_s":"PLD S","pld_n":"PLD N","pld":"PLD SIN"}
+                    )
+                    _tbl_parts.append(_pld_tbl)
+                # CMO pivotado
+                if not _cmo_pivot.empty:
+                    _cmo_tbl = _cmo_pivot.rename(
+                        columns={"se":"CMO SE","ne":"CMO NE","s":"CMO S","n":"CMO N"}
+                    )
+                    _tbl_parts.append(_cmo_tbl)
+                if _tbl_parts:
+                    import functools
+                    _merged = functools.reduce(
+                        lambda a, b: a.join(b, how="outer"), _tbl_parts
+                    )
+                    st.dataframe(_merged.sort_index(ascending=False), width="stretch", height=260)
 
     with tabs[1]:
         pdf = _plot_df(dff)
