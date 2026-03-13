@@ -15,15 +15,23 @@ import duckdb
 # ── Neon PostgreSQL ───────────────────────────────────────────────────────────
 try:
     import db_neon
-    _NEON_OK = db_neon.is_configured()
 except Exception:
     db_neon = None  # type: ignore
-    _NEON_OK = False
+
+def _NEON_OK() -> bool:
+    """Verifica conexão Neon em tempo de execução (não no import)."""
+    if db_neon is None:
+        return False
+    try:
+        row = db_neon.fetchone("SELECT 1")
+        return row is not None
+    except Exception:
+        return False
 
 
 def _core_cache_token() -> str:
     """Token de cache baseado no max(data) do PLD — muda quando novos dados chegam."""
-    if not _NEON_OK:
+    if not _NEON_OK():
         return "neon:offline"
     try:
         row = db_neon.fetchone(
@@ -35,7 +43,7 @@ def _core_cache_token() -> str:
 
 
 def _core_file_diagnostics() -> list[str]:
-    if not _NEON_OK:
+    if not _NEON_OK():
         return ["DATABASE_URL não configurada ou psycopg2 não instalado."]
     msgs = []
     for table in ["geracao_usina_horaria","curva_carga","pld_historical","ear_diario_subsistema","despacho_gfom"]:
@@ -129,7 +137,7 @@ def _build_hourly_df_cached(_token: str) -> pd.DataFrame:
     Constrói o DataFrame horário lendo o Neon PostgreSQL via queries leves.
     Cada query retorna apenas as colunas necessárias — RAM < 40MB no Render.
     """
-    if not _NEON_OK:
+    if not _NEON_OK():
         return pd.DataFrame()
 
     df = pd.DataFrame()
@@ -526,27 +534,11 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # ── Diagnóstico de conexão Neon ─────────────────────────────────────────
-    import os as _os
-    _db_url = _os.getenv("DATABASE_URL", "")
-    _neon_error = None
-    if not _db_url:
-        _neon_status = "DATABASE_URL não definida"
-    else:
-        try:
-            import psycopg2 as _pg2
-            _conn = _pg2.connect(_db_url)
-            _conn.close()
-            _neon_status = "OK"
-        except Exception as _e:
-            _neon_status = f"ERRO: {_e}"
-            _neon_error = str(_e)
-
-    if _neon_status != "OK":
-        st.error(f"❌ Neon não conectado: {_neon_status}")
-        st.code(f"DATABASE_URL definida: {'Sim (' + _db_url[:40] + '...)' if _db_url else 'NÃO'}")
-        if _neon_error:
-            st.exception(_neon_error)
+    if not _NEON_OK():
+        import os as _os
+        _db_url = _os.getenv("DATABASE_URL", "")
+        st.error("❌ Banco de dados Neon não configurado ou inacessível.")
+        st.code(f"DATABASE_URL: {'definida (' + _db_url[:50] + '...)' if _db_url else 'NÃO DEFINIDA'}")
         return
 
     df = _build_hourly_df()
@@ -639,7 +631,7 @@ def main():
         return
 
     latest_operational = {"load": None, "generation": None}
-    if _NEON_OK:
+    if _NEON_OK():
         try:
             r = db_neon.fetchdf(
                 "SELECT 'carga' AS tipo, MAX(din_instante)::date::text AS mx FROM curva_carga "
