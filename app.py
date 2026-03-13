@@ -731,7 +731,11 @@ def main():
         st.code(f"DATABASE_URL: {'definida' if _db_url else 'NÃO DEFINIDA'} | Erro: {_err}")
         return
 
-    df = _build_hourly_df()
+    with st.spinner(
+        "⏳ Carregando dados do banco… O tempo médio de carregamento é de **2 a 3 minutos** "
+        "na primeira abertura. Por favor, aguarde."
+    ):
+        df = _build_hourly_df()
 
     if df.empty:
         st.warning("Sem séries horárias suficientes no core para renderizar o painel.")
