@@ -526,11 +526,27 @@ def main():
         unsafe_allow_html=True,
     )
 
-    if not _NEON_OK:
-        st.error("❌ Banco de dados Neon não configurado.")
-        st.info("Defina DATABASE_URL nas variáveis de ambiente do Render.")
-        with st.expander("ℹ️ Como configurar", expanded=True):
-            st.code("DATABASE_URL=postgresql://user:pass@ep-xxx.neon.tech/neondb?sslmode=require")
+    # ── Diagnóstico de conexão Neon ─────────────────────────────────────────
+    import os as _os
+    _db_url = _os.getenv("DATABASE_URL", "")
+    _neon_error = None
+    if not _db_url:
+        _neon_status = "DATABASE_URL não definida"
+    else:
+        try:
+            import psycopg2 as _pg2
+            _conn = _pg2.connect(_db_url)
+            _conn.close()
+            _neon_status = "OK"
+        except Exception as _e:
+            _neon_status = f"ERRO: {_e}"
+            _neon_error = str(_e)
+
+    if _neon_status != "OK":
+        st.error(f"❌ Neon não conectado: {_neon_status}")
+        st.code(f"DATABASE_URL definida: {'Sim (' + _db_url[:40] + '...)' if _db_url else 'NÃO'}")
+        if _neon_error:
+            st.exception(_neon_error)
         return
 
     df = _build_hourly_df()
