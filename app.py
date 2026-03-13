@@ -272,7 +272,7 @@ def _build_hourly_df_cached(_token: str) -> pd.DataFrame:
         ear_df = ear_df.dropna(subset=["instante"])
         ear_df["ear_pct"] = ear_df["ear"] / ear_df["earmaxp"].replace(0, np.nan) * 100
         # Série diária → expandir para cada hora do dia via resample + ffill
-        ear_s = pd.to_numeric(ear_df.set_index("instante")["ear_pct"], errors="coerce").rename("ear")
+        ear_s = pd.to_numeric(ear_df.set_index("instante")["ear_pct"], errors="coerce").rename("ear_pct")
         ear_s = ear_s.resample("h").ffill()   # cria 24 entradas por dia com mesmo valor
         _join(_ts(ear_s))
     del ear_df
