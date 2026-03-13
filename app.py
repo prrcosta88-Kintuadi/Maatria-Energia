@@ -574,43 +574,6 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # ── Diagnóstico raw de filesystem (detecta LFS e ausência) ─────────────
-    from pathlib import Path as _P
-    _diag_files = [
-        "data/core_tab_economic.parquet",
-        "data/core_tab_advanced.parquet",
-        "data/core_tab_operacao.parquet",
-        "data/core_tab_ccee.parquet",
-        "data/core_tab_renewables.parquet",
-        "data/core_section_advanced_metrics.parquet",
-        "data/core_section_economic.parquet",
-        "data/core_section_operacao.parquet",
-        "data/core_section_ccee.parquet",
-        "data/core_section_renewables.parquet",
-        "data/core_analysis_latest.parquet",
-    ]
-    _diag_msgs = []
-    for _fp in _diag_files:
-        _pp = _P(_fp)
-        if not _pp.exists():
-            _diag_msgs.append(f"✗ AUSENTE: {_fp}")
-            continue
-        _sz = _pp.stat().st_size
-        try:
-            with _pp.open("rb") as _f:
-                _head = _f.read(100)
-            _is_lfs = b"git-lfs" in _head or b"oid sha256" in _head
-            _head_repr = _head[:60].decode("utf-8", errors="replace").replace("\n"," ")
-        except Exception as _e:
-            _head_repr = str(_e)
-            _is_lfs = False
-        _flag = " ⚠️ LFS POINTER" if _is_lfs else " ✓ real"
-        _diag_msgs.append(f"{_fp}: {_sz:,} bytes{_flag} | {_head_repr}")
-
-    with st.expander("🔬 Diagnóstico de Filesystem", expanded=True):
-        for _m in _diag_msgs:
-            st.caption(_m)
-    st.stop()
     if df.empty:
         st.warning("Sem séries horárias suficientes no core para renderizar o painel.")
         return
