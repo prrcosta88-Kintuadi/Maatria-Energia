@@ -705,7 +705,7 @@ def main():
         <style>
           .stApp { background-color:#0b0f14; color:#f3f4f6; }
           [data-testid="stSidebar"] { display:none !important; }
-          .block-container { padding-top: 40px; padding-bottom: 0; margin-bottom: 0; }
+          .block-container { padding-top: 50px; padding-bottom: 0; margin-bottom: 0; }
           .fixed-header { position: fixed; top: 0; left:0; right:0; z-index:999; background:#0b0f14; }
           .full-bleed-line { height:0.1px; background:#c8a44d; width:100vw; margin-left:calc(50% - 50vw); }
           .tabs-layer { background: linear-gradient(180deg, #0b1222 0%, #070d1a 100%); padding:0.01rem 0.01rem 0.01rem 0.01rem; }
@@ -714,23 +714,23 @@ def main():
           .stTabs [data-baseweb="tab"] { color:#e5e7eb; border-radius:6px; padding:0.25rem 0.45rem; font-size:0.78rem; white-space:nowrap; }
           .stTabs [aria-selected="true"] { background:#152238 !important; color:#f8fafc !important; border:1px solid #c8a44d !important; }
           div[data-testid="stFormSubmitButton"] > button {
-            background:#d4af37 !important; color:#111827 !important; font-weight:800 !important; border:1px solid #b38f2b !important;
+            background:#d4af37 !important; color:#111827 !important; font-weight:800 !important; border:0px solid #b38f2b !important;
           }
           div[data-testid="stFormSubmitButton"] > button:hover { background:#e3bf4c !important; color:#000 !important; }
           .cards-row { margin-bottom: 5px; }
                   /* NOVO: Reduzir espaçamento entre elementos */
           .element-container {
-              margin-bottom: 0 !important;
+              margin-bottom: 1 !important;
           }
           .stMarkdown {
-              margin-bottom: 0 !important;
+              margin-bottom: 1 !important;
           }
           hr {
-              margin-top: 2px !important;
-              margin-bottom: 2px !important;
+              margin-top: 15px !important;
+              margin-bottom: 6px !important;
           }
           div[data-testid="stVerticalBlock"] {
-              gap: 0rem !important;
+              gap: 0.75rem !important;
           }
         </style>
         """,
@@ -768,7 +768,7 @@ def main():
     st.markdown("<div class='fixed-header'>", unsafe_allow_html=True)
     st.markdown("<div class='full-bleed-line'></div>", unsafe_allow_html=True)
 
-    colc1, colc2, colc3 = st.columns([1, 1, 1])
+    colc1, colc2, colc3 = st.columns([1.18, 1, 0.82])
     with colc2:
         logo = _prepare_logo(Path("streamlit/img/emblema_maatria.png"))
         if logo and logo.exists():
@@ -787,7 +787,7 @@ def main():
             <style>
             div[data-testid="stForm"] .stDateInput label {
                 font-size: 0.7rem !important;
-                margin-bottom: 2px !important;
+                margin-bottom: 0px !important;
             }
             div[data-testid="stForm"] .stDateInput input {
                 font-size: 0.75rem !important;
@@ -796,6 +796,15 @@ def main():
             div[data-testid="stForm"] .stFormSubmitButton button {
                 font-size: 0.7rem !important;
                 padding: 0.2rem 0.5rem !important;
+            }
+                        /* NOVO: Reduzir margem inferior do formulário */
+            div[data-testid="stForm"] {
+                margin-bottom: 0 !important;
+                padding-bottom: 0.25 !important;
+            }
+            /* NOVO: Reduzir margem do container do formulário */
+            .element-container:has(div[data-testid="stForm"]) {
+                margin-bottom: 0 !important;
             }
             </style>
             """, unsafe_allow_html=True)
