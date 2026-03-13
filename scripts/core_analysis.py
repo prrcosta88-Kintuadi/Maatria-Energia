@@ -25,6 +25,29 @@ try:
 except Exception:
     duckdb = None
 
+# ── Neon PostgreSQL (usado quando DuckDB local não está disponível) ────────────
+def _neon_fetchdf(sql: str) -> pd.DataFrame:
+    """Executa SQL no Neon e retorna DataFrame. Retorna vazio em caso de erro."""
+    try:
+        import os, psycopg2
+        url = os.getenv("DATABASE_URL", "")
+        if not url:
+            return pd.DataFrame()
+        conn = psycopg2.connect(url)
+        df = pd.read_sql(sql, conn)
+        conn.close()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+def _neon_available() -> bool:
+    """True se DATABASE_URL está definida e psycopg2 disponível."""
+    try:
+        import os, psycopg2
+        return bool(os.getenv("DATABASE_URL", ""))
+    except Exception:
+        return False
+
 # =====================================================================
 # CONSTANTES REGULATÓRIAS - ANEEL/CCEE 2025
 # =====================================================================
@@ -622,13 +645,42 @@ def _normalize_text_key(value: Any) -> str:
 
 
 def _load_gfom_hourly(ons: Dict[str, Any]) -> pd.DataFrame:
+    """Geração e GFOM horários SIN total.
+
+    Fonte primária: Neon (despacho_gfom).
+    Fallback: DuckDB local.
+    """
+    _COLS = ["ger", "gfom"]
+    # ── Neon ─────────────────────────────────────────────────────────
+    if _neon_available():
+        try:
+            sql = """
+                SELECT
+                    din_instante,
+                    SUM(val_verifgeracao) AS ger,
+                    SUM(val_verifgfom)    AS gfom
+                FROM despacho_gfom
+                GROUP BY 1
+                HAVING din_instante IS NOT NULL
+                ORDER BY 1
+            """
+            df = _neon_fetchdf(sql)
+            if not df.empty:
+                df["din_instante"] = pd.to_datetime(df["din_instante"], errors="coerce")
+                df = df.dropna(subset=["din_instante"]).set_index("din_instante")
+                df = df.apply(pd.to_numeric, errors="coerce")
+                if not df.empty:
+                    return df[_COLS]
+        except Exception:
+            pass
+    # ── DuckDB ───────────────────────────────────────────────────────
     if duckdb is None:
-        return pd.DataFrame(columns=["ger", "gfom"])
+        return pd.DataFrame(columns=_COLS)
     con = _duckdb_connect()
     if con is None or not _duckdb_table_exists(con, "despacho_gfom"):
         if con is not None:
             con.close()
-        return pd.DataFrame(columns=["ger", "gfom"])
+        return pd.DataFrame(columns=_COLS)
     try:
         q = f"""
             SELECT
@@ -642,15 +694,45 @@ def _load_gfom_hourly(ons: Dict[str, Any]) -> pd.DataFrame:
         """
         df = con.execute(q).fetchdf()
         if df.empty:
-            return pd.DataFrame(columns=["ger", "gfom"])
-        return df.set_index("din_instante")[["ger", "gfom"]]
+            return pd.DataFrame(columns=_COLS)
+        return df.set_index("din_instante")[_COLS]
     except Exception:
-        return pd.DataFrame(columns=["ger", "gfom"])
+        return pd.DataFrame(columns=_COLS)
     finally:
         con.close()
 
 
 def _load_gfom_hourly_by_submarket(ons: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
+    """GFOM horário por submercado.
+
+    Nota: despacho_gfom no Neon é SIN total (sem coluna de submercado).
+    Fonte primária: Neon (agrega tudo como submercado único "SIN").
+    Fallback: DuckDB local (pode ter coluna de submercado).
+    """
+    # ── Neon ─────────────────────────────────────────────────────────
+    if _neon_available():
+        try:
+            sql = """
+                SELECT
+                    din_instante,
+                    SUM(val_verifgeracao) AS ger,
+                    SUM(val_verifgfom)    AS gfom
+                FROM despacho_gfom
+                GROUP BY 1
+                HAVING din_instante IS NOT NULL
+                ORDER BY 1
+            """
+            df = _neon_fetchdf(sql)
+            if not df.empty:
+                df["din_instante"] = pd.to_datetime(df["din_instante"], errors="coerce")
+                df = df.dropna(subset=["din_instante"])
+                df = df.apply(lambda s: pd.to_numeric(s, errors="coerce") if s.name != "din_instante" else s)
+                grp = df.set_index("din_instante")[["ger", "gfom"]].sort_index()
+                if not grp.empty:
+                    return {"SUDESTE": grp}   # fallback: trata SIN como SE dominante
+        except Exception:
+            pass
+    # ── DuckDB ───────────────────────────────────────────────────────
     if duckdb is None:
         return {}
     con = _duckdb_connect()
@@ -685,7 +767,49 @@ def _load_gfom_hourly_by_submarket(ons: Dict[str, Any]) -> Dict[str, pd.DataFram
 
 
 def _load_cmo_hourly_by_submarket() -> Dict[str, pd.Series]:
-    """Consolida CMO semi-horário em horário (média dos minutos 00 e 30) por submercado."""
+    """Consolida CMO semi-horário em horário (média :00 e :30) por submercado.
+
+    Fonte primária: Neon PostgreSQL (tabela `cmo`, coluna `id_subsistema`).
+    Fallback: DuckDB local (tabela `cmo`).
+
+    O CMO da ONS é publicado em base semi-horária (:00 e :30).
+    A consolidação horária é feita pela média aritmética dos dois registros
+    de cada hora, equivalente a (valor_:00 + valor_:30) / 2.
+    """
+    # ── tentativa 1: Neon ────────────────────────────────────────────────────
+    if _neon_available():
+        try:
+            sql = """
+                SELECT
+                    din_instante,
+                    UPPER(TRIM(COALESCE(nom_subsistema, id_subsistema))) AS sub_raw,
+                    val_cmo
+                FROM cmo
+                WHERE din_instante IS NOT NULL
+                  AND val_cmo     IS NOT NULL
+                ORDER BY din_instante
+            """
+            df = _neon_fetchdf(sql)
+            if not df.empty:
+                df["submercado"] = df["sub_raw"].map(_normalize_submercado_name)
+                df = df.dropna(subset=["submercado", "din_instante", "val_cmo"])
+                df["val_cmo"] = pd.to_numeric(df["val_cmo"], errors="coerce")
+                df = df.dropna(subset=["val_cmo"])
+                # Consolidar semi-horário → horário: floor("h") + mean()
+                # Isso calcula (valor_:00 + valor_:30) / 2 por submercado
+                df["hora"] = pd.to_datetime(df["din_instante"], errors="coerce").dt.floor("h")
+                df = df.dropna(subset=["hora"])
+                out: Dict[str, pd.Series] = {}
+                for sm, grp in df.groupby("submercado"):
+                    s = grp.groupby("hora")["val_cmo"].mean().sort_index()
+                    if not s.empty:
+                        out[str(sm)] = _ensure_tz_naive_index(s.astype(float))
+                if out:
+                    return out
+        except Exception:
+            pass
+
+    # ── tentativa 2: DuckDB local ────────────────────────────────────────────
     if duckdb is None:
         return {}
     con = _duckdb_connect()
@@ -710,6 +834,7 @@ def _load_cmo_hourly_by_submarket() -> Dict[str, pd.Series]:
         df = df.dropna(subset=["submercado", "din_instante", "val_cmo"])
         if df.empty:
             return {}
+        # Consolidar semi-horário → horário
         df["hora"] = pd.to_datetime(df["din_instante"], errors="coerce").dt.floor("h")
         df = df.dropna(subset=["hora"])
         out: Dict[str, pd.Series] = {}
@@ -773,26 +898,109 @@ def _load_capacidade_instalada_ativa_por_fonte(ons: Dict[str, Any]) -> Dict[str,
 
 
 def _load_disponibilidade_horaria() -> Dict[str, pd.Series]:
-    """Capacidade sincronizada horária por tipo de usina (UHE, UTE, UTN) e total."""
-    
-    out = {
-        "uhe": pd.Series(dtype=float),
-        "ute": pd.Series(dtype=float),
-        "utn": pd.Series(dtype=float),
-        "total": pd.Series(dtype=float),
+    """Capacidade sincronizada horária por tipo de usina e por submercado.
+
+    Retorna dict com chaves:
+      - tipo SIN total:       "uhe", "ute", "utn", "total"
+      - tipo por submercado:  "uhe_se", "uhe_s", "uhe_ne", "uhe_n"  (e idem ute/utn)
+      - submercado total:     "total_se", "total_s", "total_ne", "total_n"
+
+    Fonte primária: Neon PostgreSQL (tabela `disponibilidade_tipo_hora`
+    com colunas din_instante, id_subsistema, tipo_geracao, val_disp_sincronizada).
+    Fallback: DuckDB local (tabela `disponibilidade_usina`, sem submercado).
+    """
+    _TIPO_MAP = {
+        # Neon usa nomes normalizados em inglês (mesmo padrão de geracao_tipo_hora)
+        "hydro":    "uhe",
+        "thermal":  "ute",
+        "nuclear":  "utn",
+        # variantes possíveis
+        "uhe": "uhe", "ute": "ute", "utn": "utn",
+        "hidro": "uhe", "hidráulica": "uhe", "eólica": None, "wind": None,
+        "solar": None, "other": None,
+    }
+    _SUB_MAP = {"SE": "se", "NE": "ne", "S": "s", "N": "n",
+                "SUDESTE": "se", "NORDESTE": "ne", "SUL": "s", "NORTE": "n",
+                "SECO": "se"}
+    _TIPOS = ["uhe", "ute", "utn"]
+    _SUBS  = ["se", "s", "ne", "n"]
+
+    out: Dict[str, pd.Series] = {k: pd.Series(dtype=float) for k in
+        ["uhe", "ute", "utn", "total"] +
+        [f"{t}_{s}" for t in _TIPOS for s in _SUBS] +
+        [f"total_{s}" for s in _SUBS]
     }
 
+    # ── tentativa 1: Neon (disponibilidade_tipo_hora) ─────────────────────────
+    if _neon_available():
+        try:
+            sql = """
+                SELECT
+                    din_instante,
+                    UPPER(TRIM(id_subsistema))    AS sub_raw,
+                    LOWER(TRIM(tipo_geracao))     AS tipo_geracao,
+                    val_disp_sincronizada         AS disp_sync
+                FROM disponibilidade_tipo_hora
+                WHERE din_instante        IS NOT NULL
+                  AND val_disp_sincronizada IS NOT NULL
+                ORDER BY din_instante
+            """
+            df = _neon_fetchdf(sql)
+            if not df.empty:
+                df["din_instante"] = pd.to_datetime(df["din_instante"], errors="coerce")
+                df["disp_sync"]    = pd.to_numeric(df["disp_sync"], errors="coerce")
+                df = df.dropna(subset=["din_instante", "disp_sync"])
+                df["tipo"] = df["tipo_geracao"].map(_TIPO_MAP)
+                df["sub"]  = df["sub_raw"].map(_SUB_MAP)
+                df = df.dropna(subset=["tipo"])   # descarta solar/wind/other
+
+                # ── SIN total por tipo ────────────────────────────────────────
+                for tipo in _TIPOS:
+                    mask = df["tipo"] == tipo
+                    if mask.any():
+                        s = df[mask].groupby("din_instante")["disp_sync"].sum()
+                        out[tipo] = _ensure_tz_naive_index(
+                            _normalize_power_to_mw(s).astype(float).sort_index()
+                        )
+                s_total = df.groupby("din_instante")["disp_sync"].sum()
+                out["total"] = _ensure_tz_naive_index(
+                    _normalize_power_to_mw(s_total).astype(float).sort_index()
+                )
+
+                # ── por tipo × submercado ────────────────────────────────────
+                df_sub = df.dropna(subset=["sub"])
+                for tipo in _TIPOS:
+                    for sub in _SUBS:
+                        mask = (df_sub["tipo"] == tipo) & (df_sub["sub"] == sub)
+                        if mask.any():
+                            s = df_sub[mask].groupby("din_instante")["disp_sync"].sum()
+                            out[f"{tipo}_{sub}"] = _ensure_tz_naive_index(
+                                _normalize_power_to_mw(s).astype(float).sort_index()
+                            )
+
+                # ── total por submercado ─────────────────────────────────────
+                for sub in _SUBS:
+                    mask = df_sub["sub"] == sub
+                    if mask.any():
+                        s = df_sub[mask].groupby("din_instante")["disp_sync"].sum()
+                        out[f"total_{sub}"] = _ensure_tz_naive_index(
+                            _normalize_power_to_mw(s).astype(float).sort_index()
+                        )
+
+                if not out["total"].empty:
+                    return out
+        except Exception:
+            pass
+
+    # ── tentativa 2: DuckDB local (disponibilidade_usina, sem submercado) ─────
     if duckdb is None:
         return out
-
     con = _duckdb_connect()
     if con is None or not _duckdb_table_exists(con, "disponibilidade_usina"):
         if con is not None:
             con.close()
         return out
-
     try:
-
         q = f"""
             SELECT
                 {_duckdb_date_expr('din_instante')} AS din_instante,
@@ -802,64 +1010,82 @@ def _load_disponibilidade_horaria() -> Dict[str, pd.Series]:
             WHERE {_duckdb_date_expr('din_instante')} IS NOT NULL
               AND UPPER(TRIM(CAST(id_tipousina AS VARCHAR))) IN ('UHE','UTE','UTN')
         """
-
         df = con.execute(q).fetchdf()
-
         if df.empty:
             return out
-
         df["din_instante"] = pd.to_datetime(df["din_instante"])
-
-        # separa tipos
-        uhe = df[df["tipousina"] == "UHE"]
-        ute = df[df["tipousina"] == "UTE"]
-        utn = df[df["tipousina"] == "UTN"]
-
-        if not uhe.empty:
-            s = uhe.groupby("din_instante")["disp_sync"].sum()
-            out["uhe"] = _ensure_tz_naive_index(_normalize_power_to_mw(s).astype(float).sort_index())
-
-        if not ute.empty:
-            s = ute.groupby("din_instante")["disp_sync"].sum()
-            out["ute"] = _ensure_tz_naive_index(_normalize_power_to_mw(s).astype(float).sort_index())
-
-        if not utn.empty:
-            s = utn.groupby("din_instante")["disp_sync"].sum()
-            out["utn"] = _ensure_tz_naive_index(_normalize_power_to_mw(s).astype(float).sort_index())
-
-        # TOTAL = soma de tudo
+        for tipo, col in [("UHE", "uhe"), ("UTE", "ute"), ("UTN", "utn")]:
+            mask = df["tipousina"] == tipo
+            if mask.any():
+                s = df[mask].groupby("din_instante")["disp_sync"].sum()
+                out[col] = _ensure_tz_naive_index(
+                    _normalize_power_to_mw(s).astype(float).sort_index()
+                )
         s_total = df.groupby("din_instante")["disp_sync"].sum()
-        out["total"] = _ensure_tz_naive_index(_normalize_power_to_mw(s_total).astype(float).sort_index())
-
+        out["total"] = _ensure_tz_naive_index(
+            _normalize_power_to_mw(s_total).astype(float).sort_index()
+        )
         return out
-
     except Exception:
         return out
-
     finally:
         con.close()
 
 
 def _load_gfom_components_hourly() -> pd.DataFrame:
-    """Componentes horários de despacho térmico (GFOM e decomposição)."""
+    """Componentes horários de despacho térmico (GFOM e decomposição).
+
+    Fonte primária: Neon (despacho_gfom).
+    Fallback: DuckDB local.
+    """
     cols_out = [
-        "ger",
-        "ordem_merito",
-        "inflex_pura",
-        "inflex_total",
-        "inflex_embut_merito",
-        "ordem_demerito_acima_inflex",
-        "razao_eletrica",
-        "constrained_off",
-        "gfom",
+        "ger", "ordem_merito", "inflex_pura", "inflex_total",
+        "inflex_embut_merito", "ordem_demerito_acima_inflex",
+        "razao_eletrica", "constrained_off", "gfom",
     ]
+    _EMPTY = pd.DataFrame(columns=cols_out)
+    # ── Neon ─────────────────────────────────────────────────────────
+    if _neon_available():
+        try:
+            sql = """
+                SELECT
+                    din_instante,
+                    SUM(val_verifgeracao)               AS ger,
+                    SUM(val_verifordemmerito)            AS ordem_merito,
+                    SUM(val_verifinflexibilidade)        AS inflex_total,
+                    SUM(val_verifconstrainedoff)         AS constrained_off,
+                    SUM(val_verifgfom)                  AS gfom
+                FROM despacho_gfom
+                GROUP BY 1
+                HAVING din_instante IS NOT NULL
+                ORDER BY 1
+            """
+            df = _neon_fetchdf(sql)
+            if not df.empty:
+                df["din_instante"] = pd.to_datetime(df["din_instante"], errors="coerce")
+                df = df.dropna(subset=["din_instante"]).set_index("din_instante")
+                df = df.apply(pd.to_numeric, errors="coerce").sort_index()
+                # Neon não tem todas as colunas — preencher ausentes com 0
+                for col in cols_out:
+                    if col not in df.columns:
+                        df[col] = 0.0
+                # inflex_pura = inflex_total - inflex_embut_merito (se não houver coluna)
+                if "inflex_pura" not in df.columns or df["inflex_pura"].isna().all():
+                    df["inflex_pura"] = df.get("inflex_total", 0)
+                for col in ["inflex_embut_merito", "ordem_demerito_acima_inflex", "razao_eletrica"]:
+                    df[col] = df.get(col, pd.Series(0.0, index=df.index)).fillna(0)
+                if not df.empty:
+                    return df[cols_out]
+        except Exception:
+            pass
+    # ── DuckDB ───────────────────────────────────────────────────────
     if duckdb is None:
-        return pd.DataFrame(columns=cols_out)
+        return _EMPTY
     con = _duckdb_connect()
     if con is None or not _duckdb_table_exists(con, "despacho_gfom"):
         if con is not None:
             con.close()
-        return pd.DataFrame(columns=cols_out)
+        return _EMPTY
     try:
         info = con.execute("PRAGMA table_info('despacho_gfom')").fetchall()
         cols = {str(c[1]).lower(): str(c[1]) for c in info}
@@ -887,17 +1113,15 @@ def _load_gfom_components_hourly() -> pd.DataFrame:
         """
         df = con.execute(q).fetchdf()
         if df.empty:
-            return pd.DataFrame(columns=cols_out)
+            return _EMPTY
         out = df.set_index("din_instante")
         out.index = pd.to_datetime(out.index, errors="coerce")
         out = out[~out.index.isna()].sort_index()
         return out[cols_out]
     except Exception:
-        return pd.DataFrame(columns=cols_out)
+        return _EMPTY
     finally:
         con.close()
-
-
 def _series_to_hourly_dict(series: pd.Series, ndigits: int = 6) -> Dict[str, float]:
     if not isinstance(series, pd.Series) or series.empty:
         return {}
@@ -915,15 +1139,41 @@ def _load_carga_sin_horaria_duckdb() -> pd.Series:
 
 
 def _load_carga_por_submercado_duckdb() -> Dict[str, pd.Series]:
-    """
-    Retorna carga horária por submercado:
-    {"se": Series, "ne": Series, "s": Series, "n": Series}
-    Chaves em minúsculo para alinhamento com pld_se, pld_ne, pld_s, pld_n.
+    """Carga horária por submercado: {"se", "ne", "s", "n"}.
+
+    Fonte primária: Neon (curva_carga, coluna id_subsistema).
+    Fallback: DuckDB local.
     """
     _SUB_MAP = {"SE": "se", "NE": "ne", "S": "s", "N": "n",
                 "SUDESTE": "se", "NORDESTE": "ne", "SUL": "s", "NORTE": "n"}
     out: Dict[str, pd.Series] = {}
-
+    # ── Neon ─────────────────────────────────────────────────────────
+    if _neon_available():
+        try:
+            sql = """
+                SELECT
+                    din_instante,
+                    UPPER(TRIM(id_subsistema)) AS id_subsistema,
+                    val_cargaenergiahomwmed    AS carga
+                FROM curva_carga
+                WHERE din_instante IS NOT NULL
+                  AND val_cargaenergiahomwmed IS NOT NULL
+            """
+            df = _neon_fetchdf(sql)
+            if not df.empty:
+                df["din_instante"] = pd.to_datetime(df["din_instante"], errors="coerce")
+                df["carga"]        = pd.to_numeric(df["carga"], errors="coerce")
+                df = df.dropna(subset=["din_instante", "id_subsistema", "carga"])
+                df["sub_key"] = df["id_subsistema"].map(_SUB_MAP)
+                df = df.dropna(subset=["sub_key"])
+                for sub_key, grp in df.groupby("sub_key"):
+                    s = grp.groupby("din_instante")["carga"].sum().sort_index()
+                    out[sub_key] = _ensure_tz_naive_index(s.astype(float))
+                if out:
+                    return out
+        except Exception:
+            pass
+    # ── DuckDB ───────────────────────────────────────────────────────
     con = _duckdb_connect()
     if con is None or not _duckdb_table_exists(con, "curva_carga"):
         if con is not None:
@@ -951,16 +1201,83 @@ def _load_carga_por_submercado_duckdb() -> Dict[str, pd.Series]:
         return out
     finally:
         con.close()
-
-
 def _load_geracao_tipos_horaria_duckdb() -> Dict[str, pd.Series]:
-    out = {
-        "solar": pd.Series(dtype=float),
-        "eolica": pd.Series(dtype=float),
-        "termica": pd.Series(dtype=float),
-        "hidro": pd.Series(dtype=float),
-        "nuclear": pd.Series(dtype=float),
+    """Geração horária por tipo de usina e por submercado.
+
+    Retorna dict com chaves:
+      - tipo SIN total:       "solar", "eolica", "termica", "hidro", "nuclear"
+      - tipo por submercado:  "solar_se", "solar_s", …, "hidro_ne", …  (todas as combinações)
+
+    Fonte primária: Neon PostgreSQL (tabela `geracao_tipo_hora`
+    com colunas din_instante, id_subsistema, tipo_geracao, val_geracao_mw).
+    Fallback: DuckDB local (tabela `geracao_usina_horaria`, sem submercado).
+    """
+    # Mapeamento tipo_geracao (Neon, inglês) → chave interna em português
+    _TIPO_MAP = {
+        "solar":   "solar",
+        "wind":    "eolica",
+        "thermal": "termica",
+        "hydro":   "hidro",
+        "nuclear": "nuclear",
+        "other":   None,
     }
+    _SUB_MAP = {"SE": "se", "NE": "ne", "S": "s", "N": "n",
+                "SUDESTE": "se", "NORDESTE": "ne", "SUL": "s", "NORTE": "n",
+                "SECO": "se"}
+    _TIPOS = ["solar", "eolica", "termica", "hidro", "nuclear"]
+    _SUBS  = ["se", "s", "ne", "n"]
+
+    out: Dict[str, pd.Series] = {k: pd.Series(dtype=float) for k in
+        _TIPOS + [f"{t}_{s}" for t in _TIPOS for s in _SUBS]
+    }
+
+    # ── tentativa 1: Neon (geracao_tipo_hora) ─────────────────────────────────
+    if _neon_available():
+        try:
+            sql = """
+                SELECT
+                    din_instante,
+                    UPPER(TRIM(id_subsistema)) AS sub_raw,
+                    LOWER(TRIM(tipo_geracao))  AS tipo_geracao,
+                    val_geracao_mw             AS val_geracao
+                FROM geracao_tipo_hora
+                WHERE din_instante  IS NOT NULL
+                  AND val_geracao_mw IS NOT NULL
+                ORDER BY din_instante
+            """
+            df = _neon_fetchdf(sql)
+            if not df.empty:
+                df["din_instante"] = pd.to_datetime(df["din_instante"], errors="coerce")
+                df["val_geracao"]  = pd.to_numeric(df["val_geracao"], errors="coerce")
+                df = df.dropna(subset=["din_instante", "val_geracao"])
+                df["tipo"] = df["tipo_geracao"].map(_TIPO_MAP)
+                df["sub"]  = df["sub_raw"].map(_SUB_MAP)
+                df = df.dropna(subset=["tipo"])   # descarta "other"
+
+                # ── SIN total por tipo ────────────────────────────────────────
+                for tipo in _TIPOS:
+                    mask = df["tipo"] == tipo
+                    if mask.any():
+                        s = df[mask].groupby("din_instante")["val_geracao"].sum()
+                        out[tipo] = _ensure_tz_naive_index(s.astype(float).sort_index())
+
+                # ── por tipo × submercado ────────────────────────────────────
+                df_sub = df.dropna(subset=["sub"])
+                for tipo in _TIPOS:
+                    for sub in _SUBS:
+                        mask = (df_sub["tipo"] == tipo) & (df_sub["sub"] == sub)
+                        if mask.any():
+                            s = df_sub[mask].groupby("din_instante")["val_geracao"].sum()
+                            out[f"{tipo}_{sub}"] = _ensure_tz_naive_index(
+                                s.astype(float).sort_index()
+                            )
+
+                if not out["hidro"].empty:
+                    return out
+        except Exception:
+            pass
+
+    # ── tentativa 2: DuckDB local (geracao_usina_horaria, sem submercado) ─────
     if duckdb is None:
         return out
     con = _duckdb_connect()
@@ -977,25 +1294,23 @@ def _load_geracao_tipos_horaria_duckdb() -> Dict[str, pd.Series]:
             FROM geracao_usina_horaria
             WHERE {_duckdb_date_expr('din_instante')} IS NOT NULL
         """
-        df = con.execute(q).fetchdf().dropna(subset=["din_instante", "tipousina", "val_geracao"])
+        df = con.execute(q).fetchdf().dropna(
+            subset=["din_instante", "tipousina", "val_geracao"]
+        )
         if df.empty:
             return out
         df["k"] = df["tipousina"].apply(_normalize_text_key)
-        solar = df[df["k"].str.contains("fotov|solar", regex=True)]
-        eolica = df[df["k"].str.contains("eol", regex=True)]
-        termica = df[df["k"].str.contains("term", regex=True)]
-        hidro = df[df["k"].str.contains("hidro|hidraul", regex=True)]
-        nuclear = df[df["k"].str.contains("nuclear", regex=True)]
-        if not solar.empty:
-            out["solar"] = _ensure_tz_naive_index(solar.groupby("din_instante")["val_geracao"].sum().sort_index().astype(float))
-        if not eolica.empty:
-            out["eolica"] = _ensure_tz_naive_index(eolica.groupby("din_instante")["val_geracao"].sum().sort_index().astype(float))
-        if not termica.empty:
-            out["termica"] = _ensure_tz_naive_index(termica.groupby("din_instante")["val_geracao"].sum().sort_index().astype(float))
-        if not hidro.empty:
-            out["hidro"] = _ensure_tz_naive_index(hidro.groupby("din_instante")["val_geracao"].sum().sort_index().astype(float))
-        if not nuclear.empty:
-            out["nuclear"] = _ensure_tz_naive_index(nuclear.groupby("din_instante")["val_geracao"].sum().sort_index().astype(float))
+        _local_map = {
+            "solar":   df["k"].str.contains("fotov|solar", regex=True),
+            "eolica":  df["k"].str.contains("eol", regex=True),
+            "termica": df["k"].str.contains("term", regex=True),
+            "hidro":   df["k"].str.contains("hidro|hidraul", regex=True),
+            "nuclear": df["k"].str.contains("nuclear", regex=True),
+        }
+        for tipo, mask in _local_map.items():
+            if mask.any():
+                s = df[mask].groupby("din_instante")["val_geracao"].sum()
+                out[tipo] = _ensure_tz_naive_index(s.sort_index().astype(float))
         return out
     except Exception:
         return out
@@ -1004,24 +1319,74 @@ def _load_geracao_tipos_horaria_duckdb() -> Dict[str, pd.Series]:
 
 
 def _load_renovavel_disponivel_restricao_horaria() -> pd.DataFrame:
-    cols = [
-        "instante",
-        "renov_disponivel",
-        "solar_disponivel",
-        "eolica_disponivel",
-        "cod_razaorestricao_solar",
-        "dsc_restricao_solar",
-        "cod_razaorestricao_eolica",
-        "dsc_restricao_eolica",
-        "val_geracaolimitada_solar",
-        "val_geracaolimitada_eolica",
-    ]
-    if duckdb is None:
-        return pd.DataFrame(columns=cols)
+    """Restrição operacional renovável horária (solar + eólica).
 
+    Retorna DataFrame com colunas:
+        instante, renov_disponivel, solar_disponivel, eolica_disponivel,
+        cod_razaorestricao_solar, dsc_restricao_solar,
+        cod_razaorestricao_eolica, dsc_restricao_eolica,
+        val_geracaolimitada_solar, val_geracaolimitada_eolica
+
+    Fonte primária: Neon (restricao_renovavel, coluna fonte = 'solar' | 'wind').
+    Fallback: DuckDB local (restricao_fotovoltaica + restricao_eolica).
+    """
+    cols = [
+        "instante", "renov_disponivel",
+        "solar_disponivel", "eolica_disponivel",
+        "cod_razaorestricao_solar", "dsc_restricao_solar",
+        "cod_razaorestricao_eolica", "dsc_restricao_eolica",
+        "val_geracaolimitada_solar", "val_geracaolimitada_eolica",
+    ]
+    _EMPTY = pd.DataFrame(columns=cols)
+    # ── Neon ─────────────────────────────────────────────────────────
+    if _neon_available():
+        try:
+            sql = """
+                SELECT
+                    din_instante,
+                    LOWER(TRIM(fonte))            AS fonte,
+                    SUM(val_disponibilidade)      AS disponivel,
+                    SUM(val_geracaolimitada)       AS limitada
+                FROM restricao_renovavel
+                WHERE din_instante IS NOT NULL
+                  AND fonte IN ('solar', 'wind')
+                GROUP BY 1, 2
+                ORDER BY 1
+            """
+            df = _neon_fetchdf(sql)
+            if not df.empty:
+                df["din_instante"] = pd.to_datetime(df["din_instante"], errors="coerce")
+                df["disponivel"]   = pd.to_numeric(df["disponivel"], errors="coerce")
+                df["limitada"]     = pd.to_numeric(df["limitada"],   errors="coerce").fillna(0)
+                df = df.dropna(subset=["din_instante", "disponivel"])
+                solar  = df[df["fonte"] == "solar"].groupby("din_instante")[["disponivel", "limitada"]].sum()
+                eolica = df[df["fonte"] == "wind" ].groupby("din_instante")[["disponivel", "limitada"]].sum()
+                # montar output
+                all_ts = solar.index.union(eolica.index)
+                out = pd.DataFrame(index=all_ts)
+                out.index.name = "instante"
+                out["solar_disponivel"]          = solar["disponivel"].reindex(all_ts)
+                out["val_geracaolimitada_solar"]  = solar["limitada"].reindex(all_ts).fillna(0)
+                out["eolica_disponivel"]          = eolica["disponivel"].reindex(all_ts)
+                out["val_geracaolimitada_eolica"] = eolica["limitada"].reindex(all_ts).fillna(0)
+                out["renov_disponivel"] = (
+                    out["solar_disponivel"].fillna(0) + out["eolica_disponivel"].fillna(0)
+                )
+                out["cod_razaorestricao_solar"]  = None
+                out["dsc_restricao_solar"]        = None
+                out["cod_razaorestricao_eolica"]  = None
+                out["dsc_restricao_eolica"]       = None
+                out = out.reset_index()
+                if not out.empty:
+                    return out[cols].sort_values("instante")
+        except Exception:
+            pass
+    # ── DuckDB ───────────────────────────────────────────────────────
+    if duckdb is None:
+        return _EMPTY
     con = _duckdb_connect()
     if con is None:
-        return pd.DataFrame(columns=cols)
+        return _EMPTY
 
     def _load_one(table: str, prefix: str) -> pd.DataFrame:
         if not _duckdb_table_exists(con, table):
@@ -1047,7 +1412,7 @@ def _load_renovavel_disponivel_restricao_horaria() -> pd.DataFrame:
         if df.empty:
             return pd.DataFrame()
         df["instante"] = pd.to_datetime(df["instante"], errors="coerce")
-        df = df.dropna(subset=["instante"]) 
+        df = df.dropna(subset=["instante"])
         agg = df.groupby("instante", as_index=False).agg({"disponivel": "sum", "limitada": "sum"})
         top = (
             df.assign(limitada=pd.to_numeric(df["limitada"], errors="coerce").fillna(0))
@@ -1055,53 +1420,94 @@ def _load_renovavel_disponivel_restricao_horaria() -> pd.DataFrame:
             .drop_duplicates(subset=["instante"])[["instante", "cod", "dsc"]]
         )
         out = agg.merge(top, on="instante", how="left")
-        out = out.rename(columns={
+        return out.rename(columns={
             "disponivel": f"{prefix}_disponivel",
-            "limitada": f"val_geracaolimitada_{prefix}",
-            "cod": f"cod_razaorestricao_{prefix}",
-            "dsc": f"dsc_restricao_{prefix}",
+            "limitada":   f"val_geracaolimitada_{prefix}",
+            "cod":        f"cod_razaorestricao_{prefix}",
+            "dsc":        f"dsc_restricao_{prefix}",
         })
-        return out
 
     try:
-        solar = _load_one("restricao_fotovoltaica", "solar")
+        solar  = _load_one("restricao_fotovoltaica", "solar")
         eolica = _load_one("restricao_eolica", "eolica")
         if solar.empty and eolica.empty:
-            return pd.DataFrame(columns=cols)
-        if solar.empty:
-            out = eolica.copy()
-        elif eolica.empty:
-            out = solar.copy()
-        else:
-            out = solar.merge(eolica, on="instante", how="outer")
-
-        for c in ["solar_disponivel", "eolica_disponivel", "val_geracaolimitada_solar", "val_geracaolimitada_eolica"]:
-            if c not in out.columns:
-                out[c] = np.nan
-
+            return _EMPTY
+        out = solar if eolica.empty else (eolica if solar.empty else solar.merge(eolica, on="instante", how="outer"))
+        for col in ["solar_disponivel", "eolica_disponivel",
+                    "val_geracaolimitada_solar", "val_geracaolimitada_eolica"]:
+            if col not in out.columns:
+                out[col] = np.nan
         out["renov_disponivel"] = out[["solar_disponivel", "eolica_disponivel"]].fillna(0).sum(axis=1)
-        for c in [
-            "cod_razaorestricao_solar", "dsc_restricao_solar",
-            "cod_razaorestricao_eolica", "dsc_restricao_eolica",
-        ]:
-            if c not in out.columns:
-                out[c] = None
+        for col in ["cod_razaorestricao_solar", "dsc_restricao_solar",
+                    "cod_razaorestricao_eolica", "dsc_restricao_eolica"]:
+            if col not in out.columns:
+                out[col] = None
         return out[cols].sort_values("instante")
     except Exception:
-        return pd.DataFrame(columns=cols)
+        return _EMPTY
     finally:
         con.close()
-
-
 def _load_ear_ena_monthly_by_submercado(ons: Dict[str, Any]) -> Tuple[Dict[str, pd.Series], Dict[str, pd.Series]]:
-    """Consolida EAR e ENA mensais por submercado apenas via DuckDB."""
+    """EAR e ENA mensais por submercado.
+
+    Fonte primária: Neon (ear_diario_subsistema, ena_diario_subsistema).
+    Fallback: DuckDB local.
+    """
     ear_by_sub: Dict[str, pd.Series] = {}
     ena_by_sub: Dict[str, pd.Series] = {}
 
+    def _process_ear(df: pd.DataFrame, date_col: str, val_col: str) -> Dict[str, pd.Series]:
+        out: Dict[str, pd.Series] = {}
+        df = df.copy()
+        df["sub"] = df["submercado_raw"].map(_normalize_submercado_name)
+        df = df.dropna(subset=["sub"])
+        df["mes"] = pd.to_datetime(df[date_col], errors="coerce").dt.to_period("M").dt.to_timestamp("M")
+        df[val_col] = pd.to_numeric(df[val_col], errors="coerce")
+        df = df.dropna(subset=["mes", val_col])
+        for sm, grp in df.groupby("sub"):
+            monthly = grp.groupby("mes")[val_col].mean()
+            out[str(sm)] = monthly.sort_index()
+        return out
+
+    # ── Neon ─────────────────────────────────────────────────────────
+    if _neon_available():
+        try:
+            sql_ear = """
+                SELECT
+                    ear_data,
+                    UPPER(TRIM(id_subsistema))    AS submercado_raw,
+                    ear_verif_subsistema_mwmes     AS valor
+                FROM ear_diario_subsistema
+                WHERE ear_data IS NOT NULL
+                  AND ear_verif_subsistema_mwmes IS NOT NULL
+            """
+            dfe = _neon_fetchdf(sql_ear)
+            if not dfe.empty:
+                ear_by_sub = _process_ear(dfe, "ear_data", "valor")
+        except Exception:
+            pass
+        try:
+            sql_ena = """
+                SELECT
+                    ena_data,
+                    UPPER(TRIM(id_subsistema))          AS submercado_raw,
+                    ena_armazenavel_regiao_mwmed          AS valor
+                FROM ena_diario_subsistema
+                WHERE ena_data IS NOT NULL
+                  AND ena_armazenavel_regiao_mwmed IS NOT NULL
+            """
+            dfn = _neon_fetchdf(sql_ena)
+            if not dfn.empty:
+                ena_by_sub = _process_ear(dfn, "ena_data", "valor")
+        except Exception:
+            pass
+        if ear_by_sub or ena_by_sub:
+            return ear_by_sub, ena_by_sub
+
+    # ── DuckDB ───────────────────────────────────────────────────────
     con = _duckdb_connect()
     if con is None:
         return ear_by_sub, ena_by_sub
-
     try:
         if _duckdb_table_exists(con, "ear_diario_subsistema"):
             q_ear = f"""
@@ -1115,12 +1521,11 @@ def _load_ear_ena_monthly_by_submercado(ons: Dict[str, Any]) -> Tuple[Dict[str, 
             """
             dfe = con.execute(q_ear).fetchdf()
             if not dfe.empty:
-                dfe['submercado'] = dfe['submercado_raw'].map(_normalize_submercado_name)
-                dfe = dfe.dropna(subset=['submercado'])
-                for sm, grp in dfe.groupby('submercado'):
-                    idx = pd.to_datetime(grp['mes']) + pd.offsets.MonthEnd(0)
-                    ear_by_sub[str(sm)] = pd.Series(grp['valor'].values, index=idx).sort_index()
-
+                dfe["submercado"] = dfe["submercado_raw"].map(_normalize_submercado_name)
+                dfe = dfe.dropna(subset=["submercado"])
+                for sm, grp in dfe.groupby("submercado"):
+                    idx2 = pd.to_datetime(grp["mes"]) + pd.offsets.MonthEnd(0)
+                    ear_by_sub[str(sm)] = pd.Series(grp["valor"].values, index=idx2).sort_index()
         if _duckdb_table_exists(con, "ena_diario_subsistema"):
             q_ena = f"""
                 SELECT
@@ -1133,19 +1538,16 @@ def _load_ear_ena_monthly_by_submercado(ons: Dict[str, Any]) -> Tuple[Dict[str, 
             """
             dfn = con.execute(q_ena).fetchdf()
             if not dfn.empty:
-                dfn['submercado'] = dfn['submercado_raw'].map(_normalize_submercado_name)
-                dfn = dfn.dropna(subset=['submercado'])
-                for sm, grp in dfn.groupby('submercado'):
-                    idx = pd.to_datetime(grp['mes']) + pd.offsets.MonthEnd(0)
-                    ena_by_sub[str(sm)] = pd.Series(grp['valor'].values, index=idx).sort_index()
+                dfn["submercado"] = dfn["submercado_raw"].map(_normalize_submercado_name)
+                dfn = dfn.dropna(subset=["submercado"])
+                for sm, grp in dfn.groupby("submercado"):
+                    idx2 = pd.to_datetime(grp["mes"]) + pd.offsets.MonthEnd(0)
+                    ena_by_sub[str(sm)] = pd.Series(grp["valor"].values, index=idx2).sort_index()
     except Exception:
         pass
     finally:
         con.close()
-
     return ear_by_sub, ena_by_sub
-
-
 def _compute_effective_availability_margin(
     ons: Dict[str, Any],
     carga_sin_series: pd.Series
@@ -1242,6 +1644,16 @@ def _compute_advanced_cross_metrics(
         hidro = _ensure_tz_naive_index(tipos_db["hidro"])
     if not tipos_db.get("nuclear", pd.Series(dtype=float)).empty:
         nuclear = _ensure_tz_naive_index(tipos_db["nuclear"])
+    # Séries por submercado provenientes do Neon (geracao_tipo_hora c/ id_subsistema)
+    _GEN_TIPOS  = ["solar", "eolica", "termica", "hidro", "nuclear"]
+    _GEN_SUBS   = ["se", "s", "ne", "n"]
+    geracao_por_sub: Dict[str, Dict[str, pd.Series]] = {t: {} for t in _GEN_TIPOS}
+    for _gt in _GEN_TIPOS:
+        for _gs in _GEN_SUBS:
+            _key = f"{_gt}_{_gs}"
+            _s = tipos_db.get(_key, pd.Series(dtype=float))
+            if not _s.empty:
+                geracao_por_sub[_gt][_gs] = _ensure_tz_naive_index(_s)
 
     gen_parts = []
 
@@ -2048,7 +2460,17 @@ def _compute_advanced_cross_metrics(
 
         # Índice comum horário para computar todos os termos de forma vetorizada
         idx = pd.DatetimeIndex([])
-        for ser in [pld_h, cmo_dom, carga_sin, solar, eolica, termica, hidro, nuclear, thermal_inflex, thermal_merit, disp_sync_total, curtailed_h, avail_ren_h]:
+        # incluir todas as séries por submercado no índice comum
+        _base_series = [pld_h, cmo_dom, carga_sin, solar, eolica, termica, hidro, nuclear,
+                        thermal_inflex, thermal_merit, disp_sync_total, curtailed_h, avail_ren_h]
+        _sub_series = (
+            list(pld_series_by_submercado.values()) +
+            list(cmo_by_sm.values()) +
+            list(carga_por_sub.values()) +
+            [s for sub_d in geracao_por_sub.values() for s in sub_d.values()] +
+            [disp.get(f"uhe_{sk}", pd.Series(dtype=float)) for sk in ["se","s","ne","n"]]
+        )
+        for ser in _base_series + _sub_series:
             if isinstance(ser, pd.Series) and not ser.empty:
                 idx = idx.union(pd.DatetimeIndex(ser.index))
 
@@ -2113,32 +2535,116 @@ def _compute_advanced_cross_metrics(
             df_e["Curtailment_norm"] = df_e["curtailed"] / df_e["avail_ren"].replace(0, np.nan)
             df_e["Thermal_inflex_ratio"] = (df_e["thermal_inflex"] / df_e["thermal_total"].replace(0, np.nan)).clip(lower=0, upper=1)
 
-            # Step 2-10
-            
-            # SIN_cost ponderado por submercado:
-            # custo = load_se*pld_se + load_ne*pld_ne + load_s*pld_s + load_n*pld_n
-            # Fallback para load*pld (média SIN) quando séries por sub não disponíveis
-            _sin_cost = pd.Series(0.0, index=df_e.index)
-            _sub_pairs = [("se", "pld_se"), ("ne", "pld_ne"), ("s", "pld_s"), ("n", "pld_n")]
-            _any_sub = False
-            for _lk, _pk in _sub_pairs:
-                _load_col = f"load_{_lk}"
-                if _load_col in df_e.columns and _pk in df_e.columns:
-                    _l = pd.to_numeric(df_e[_load_col], errors="coerce").fillna(0)
-                    _p = pd.to_numeric(df_e[_pk], errors="coerce").fillna(0)
-                    _sin_cost += _l * _p
-                    _any_sub = True
-            if not _any_sub:
-                # Fallback: SIN total * PLD médio
-                _sin_cost = df_e["load"].fillna(0) * df_e["pld"].fillna(0)
-            df_e["SIN_cost_R$/h"] = _sin_cost
-            df_e["thermal_real_cost"] = df_e["thermal_total"] * df_e["cvu_semana"]
-            df_e["thermal_merit_cost"] = df_e["thermal_merit"] * df_e["cvu_semana"]
-            df_e["thermal_prudential_dispatch"] = df_e["thermal_total"] - df_e["thermal_merit"]
+            # ── Step 2-10: métricas econômicas por submercado ─────────────────────
+            #
+            # Convenção de chaves curtas: se | s | ne | n
+            # pld_series_by_submercado e cmo_by_sm usam chaves longas (SUDESTE/SUL/…)
+            # carga_por_sub já usa chaves curtas
+            SUBMERCADOS = ["se", "s", "ne", "n"]
+            _LONG_TO_SHORT = {"SUDESTE": "se", "SUL": "s", "NORDESTE": "ne", "NORTE": "n"}
+            _SHORT_TO_LONG = {v: k for k, v in _LONG_TO_SHORT.items()}
 
+            # — Carregar PLD por submercado → chaves curtas no df_e ————————————
+            _pld_sub: Dict[str, pd.Series] = {}
+            for _long, _short in _LONG_TO_SHORT.items():
+                _s = pld_series_by_submercado.get(_long, pd.Series(dtype=float))
+                if not _s.empty:
+                    _pld_sub[_short] = _ensure_tz_naive_index(_s)
+                    df_e[f"pld_{_short}"] = pd.to_numeric(
+                        _ensure_tz_naive_index(_s).reindex(idx), errors="coerce"
+                    )
+
+            # — Carregar CMO por submercado → chaves curtas no df_e ————————————
+            _cmo_sub: Dict[str, pd.Series] = {}
+            for _long, _short in _LONG_TO_SHORT.items():
+                _s = cmo_by_sm.get(_long, pd.Series(dtype=float))
+                if not _s.empty:
+                    _cmo_sub[_short] = _ensure_tz_naive_index(_s)
+                    df_e[f"cmo_{_short}"] = pd.to_numeric(
+                        _ensure_tz_naive_index(_s).reindex(idx), errors="coerce"
+                    )
+
+            # — Fallback: se não há pld/cmo por submercado, usa pld/cmo dominante ——
+            # (já estão em df_e["pld"] e df_e["cmo"] do bloco anterior)
+            _has_sub_pld = bool(_pld_sub)
+            _has_sub_cmo = bool(_cmo_sub)
+
+            # — Proporção de carga por submercado (para proxy de geração/disp) ——
+            # load_total = soma de todos os submercados; load_se/s/ne/n já em df_e
+            _load_total = sum(
+                df_e.get(f"load_{_sk}", pd.Series(0.0, index=df_e.index)).fillna(0)
+                for _sk in SUBMERCADOS
+            )
+            _load_total = _load_total.replace(0, np.nan)
+
+            def _frac(sk: str) -> pd.Series:
+                """Fração da carga do submercado sk em relação ao SIN total."""
+                return df_e.get(f"load_{sk}", pd.Series(0.0, index=df_e.index)).fillna(0) / _load_total.fillna(1)
+
+            # — hydro e disp_sync_uhe por submercado ——————————————————————————
+            # Fonte primária: dados reais do Neon (geracao_tipo_hora /
+            # disponibilidade_tipo_hora com id_subsistema).
+            # Fallback: proxy por fração de carga quando o Neon não tem a série.
+            for _sk in SUBMERCADOS:
+                # geração hidro real por submercado
+                _hidro_sub = geracao_por_sub.get("hidro", {}).get(_sk, pd.Series(dtype=float))
+                if not _hidro_sub.empty:
+                    df_e[f"hydro_{_sk}"] = pd.to_numeric(
+                        _ensure_tz_naive_index(_hidro_sub).reindex(idx), errors="coerce"
+                    )
+                else:
+                    # proxy: fracção da carga
+                    df_e[f"hydro_{_sk}"] = df_e["hydro"].fillna(0) * _frac(_sk)
+
+                # disponibilidade UHE real por submercado
+                _disp_uhe_sub = disp.get(f"uhe_{_sk}", pd.Series(dtype=float))
+                if not _disp_uhe_sub.empty:
+                    df_e[f"disp_sync_uhe_{_sk}"] = pd.to_numeric(
+                        _ensure_tz_naive_index(_disp_uhe_sub).reindex(idx), errors="coerce"
+                    )
+                else:
+                    # proxy: fracção da carga
+                    df_e[f"disp_sync_uhe_{_sk}"] = df_e["disp_sync_uhe"].fillna(0) * _frac(_sk)
+
+            # helper: retorna série por submercado com fallback para SIN/nSub
+            def _pld(sk: str) -> pd.Series:
+                col = f"pld_{sk}"
+                if col in df_e.columns:
+                    return pd.to_numeric(df_e[col], errors="coerce").fillna(0)
+                return pd.to_numeric(df_e["pld"], errors="coerce").fillna(0)
+
+            def _cmo(sk: str) -> pd.Series:
+                col = f"cmo_{sk}"
+                if col in df_e.columns:
+                    return pd.to_numeric(df_e[col], errors="coerce").fillna(0)
+                return pd.to_numeric(df_e["cmo"], errors="coerce").fillna(0)
+
+            def _load(sk: str) -> pd.Series:
+                col = f"load_{sk}"
+                if col in df_e.columns:
+                    return pd.to_numeric(df_e[col], errors="coerce").fillna(0)
+                return pd.to_numeric(df_e["load"], errors="coerce").fillna(0) / len(SUBMERCADOS)
+
+            def _hydro(sk: str) -> pd.Series:
+                return pd.to_numeric(df_e[f"hydro_{sk}"], errors="coerce").fillna(0)
+
+            def _disp_uhe(sk: str) -> pd.Series:
+                return pd.to_numeric(df_e[f"disp_sync_uhe_{sk}"], errors="coerce").fillna(0)
+
+            # ── SIN_cost — custo econômico total ponderado por submercado ────────
+            df_e["SIN_cost_R$/h"] = sum(
+                _load(sk) * _pld(sk) for sk in SUBMERCADOS
+            )
+
+            # ── CVU e custos térmicos (SIN total — não há decomposição por sub) ─
+            df_e["thermal_real_cost"]             = df_e["thermal_total"] * df_e["cvu_semana"]
+            df_e["thermal_merit_cost"]            = df_e["thermal_merit"] * df_e["cvu_semana"]
+            df_e["thermal_prudential_dispatch"]   = df_e["thermal_total"] - df_e["thermal_merit"]
+
+            # ── Geração mandatória e hidro necessária (SIN) ──────────────────────
             df_e["mandatory_generation"] = df_e[["wind", "solar", "nuclear", "thermal_inflex"]].sum(axis=1, min_count=1)
-            df_e["required_hydro"] = (df_e["load"] - df_e["mandatory_generation"]).clip(lower=0)
-            df_e["Hydro_gap"] = df_e["hydro"] - df_e["required_hydro"]
+            df_e["required_hydro"]       = (df_e["load"] - df_e["mandatory_generation"]).clip(lower=0)
+            df_e["Hydro_gap"]            = df_e["hydro"] - df_e["required_hydro"]
             tol = 1e-6
             df_e["system_state"] = np.where(
                 df_e["Hydro_gap"] > tol,
@@ -2146,23 +2652,62 @@ def _compute_advanced_cross_metrics(
                 np.where(df_e["Hydro_gap"].abs() <= tol, "Hydro Necessary", "Hydro Deficit"),
             )
 
+            # ── Water value — preservação hídrica ponderada por CMO por sub ─────
+            # Hydro_preserved por submercado = (disp_uhe_sk - hydro_sk).clip(0)
+            # Water_value_sk = Hydro_preserved_sk * cmo_sk
+            df_e["Water_value_R$/h"] = sum(
+                (_disp_uhe(sk) - _hydro(sk)).clip(lower=0) * _cmo(sk)
+                for sk in SUBMERCADOS
+            )
+            # Manter Hydro_preserved SIN para compatibilidade
             df_e["Hydro_preserved"] = (df_e["disp_sync_uhe"] - df_e["hydro"]).clip(lower=0)
-            df_e["Water_value_R$/h"] = df_e["Hydro_preserved"] * df_e["cmo"]
-            df_e["Curtailment_loss_R$/h"] = df_e["curtailed"] * df_e["pld"]
+
+            # ── Curtailment loss — perda de receita por submercado ───────────────
+            # curtailed é SIN total; distribuímos por fração de geração renovável
+            # (proxy: fração de carga, pois não há curtailment por submercado)
+            df_e["Curtailment_loss_R$/h"] = sum(
+                df_e["curtailed"].fillna(0) * _frac(sk) * _pld(sk)
+                for sk in SUBMERCADOS
+            )
             df_e["avoidable_curtailment"] = df_e["curtailed"] * (1 - df_e["Thermal_inflex_ratio"].fillna(1))
-            df_e["CVaR_implicit"] = (df_e["pld"] - df_e["cmo"]).clip(lower=0)
+
+            # ── CVaR implícito por submercado → soma SIN ─────────────────────────
+            # CVaR_sk = (pld_sk - cmo_sk).clip(0) * load_sk
+            # CVaR_SIN = soma / load_total  (R$/MWh ponderado pela carga)
+            _cvar_sin_cost = sum(
+                (_pld(sk) - _cmo(sk)).clip(lower=0) * _load(sk)
+                for sk in SUBMERCADOS
+            )
+            _load_sin_nz = df_e["load"].replace(0, np.nan)
+            df_e["CVaR_implicit"] = (_cvar_sin_cost / _load_sin_nz).clip(lower=0)
+            # Mascarar horas no teto (teto definido pelo PLD dominante SIN)
             df_e.loc[df_e["pld_no_teto"], "CVaR_implicit"] = np.nan
             df_e["Risk_Aversion_Gap"] = df_e["CVaR_implicit"] - df_e["cvu_semana"]
-            df_e["T_prudencia"] = np.where(
-                df_e["cmo"] > df_e["pld"],
-                df_e["Hydro_preserved"] * (df_e["cmo"] - df_e["pld"]),
-                0
+
+            # ── T_prudencia por submercado ────────────────────────────────────────
+            # T_prudencia_sk = Hydro_preserved_sk * max(cmo_sk - pld_sk, 0)
+            df_e["T_prudencia"] = sum(
+                (_disp_uhe(sk) - _hydro(sk)).clip(lower=0)
+                * (_cmo(sk) - _pld(sk)).clip(lower=0)
+                for sk in SUBMERCADOS
             )
+
+            # ── T_sistemica por submercado ────────────────────────────────────────
+            # T_sistemica_sk = geracao_sk * (cmo_sk - pld_sk)
+            # geracao_sk = geracao_total * frac_carga_sk (proxy)
+            _ger_total = df_e["geracao_total"].fillna(0)
+            df_e["T_sistemica"] = sum(
+                _ger_total * _frac(sk) * (_cmo(sk) - _pld(sk))
+                for sk in SUBMERCADOS
+            )
+
+            # ── T_eletric e T_hidro (não dependem de sub diretamente) ────────────
             df_e["T_eletric"] = df_e["thermal_merit_cost"]
-            df_e["T_hidro"] = df_e["Water_value_R$/h"]
-            df_e["T_sistemica"] = df_e["geracao_total"] * (df_e["cmo"] - df_e["pld"])
-            df_e["T_total"] = (df_e["T_eletric"] + df_e["T_hidro"] + df_e["T_prudencia"] + df_e["T_sistemica"])
-            df_e["infra_marginal_rent"] = df_e["SIN_cost_R$/h"] - (df_e["T_eletric"] + df_e["T_hidro"] + df_e["T_prudencia"] + df_e["T_sistemica"])
+            df_e["T_hidro"]   = df_e["Water_value_R$/h"]
+
+            # ── T_total e renda infra-marginal ────────────────────────────────────
+            df_e["T_total"]           = df_e["T_eletric"] + df_e["T_hidro"] + df_e["T_prudencia"] + df_e["T_sistemica"]
+            df_e["infra_marginal_rent"] = df_e["SIN_cost_R$/h"] - df_e["T_total"]
 
             economic = {
                 "dominant_submarket": dominant_sm,
@@ -2179,6 +2724,14 @@ def _compute_advanced_cross_metrics(
                 "geracao_total_hourly": _series_to_hourly_dict(df_e["geracao_total"], ndigits=4),
                 "pld_hourly": _series_to_hourly_dict(df_e["pld"], ndigits=4),
                 "cmo_hourly": _series_to_hourly_dict(df_e["cmo"], ndigits=4),
+                "pld_se_hourly": _series_to_hourly_dict(df_e["pld_se"], ndigits=4) if "pld_se" in df_e.columns else {},
+                "pld_s_hourly":  _series_to_hourly_dict(df_e["pld_s"],  ndigits=4) if "pld_s"  in df_e.columns else {},
+                "pld_ne_hourly": _series_to_hourly_dict(df_e["pld_ne"], ndigits=4) if "pld_ne" in df_e.columns else {},
+                "pld_n_hourly":  _series_to_hourly_dict(df_e["pld_n"],  ndigits=4) if "pld_n"  in df_e.columns else {},
+                "cmo_se_hourly": _series_to_hourly_dict(df_e["cmo_se"], ndigits=4) if "cmo_se" in df_e.columns else {},
+                "cmo_s_hourly":  _series_to_hourly_dict(df_e["cmo_s"],  ndigits=4) if "cmo_s"  in df_e.columns else {},
+                "cmo_ne_hourly": _series_to_hourly_dict(df_e["cmo_ne"], ndigits=4) if "cmo_ne" in df_e.columns else {},
+                "cmo_n_hourly":  _series_to_hourly_dict(df_e["cmo_n"],  ndigits=4) if "cmo_n"  in df_e.columns else {},
                 "thermal_real_cost_hourly": _series_to_hourly_dict(df_e["thermal_real_cost"], ndigits=4),
                 "thermal_merit_cost_hourly": _series_to_hourly_dict(df_e["thermal_merit_cost"], ndigits=4),
                 "thermal_prudential_dispatch_hourly": _series_to_hourly_dict(df_e["thermal_prudential_dispatch"], ndigits=4),
@@ -2629,7 +3182,35 @@ def calcular_indicadores_termicos_revisados(
 
 
 def _load_cvu_weekly_series(ons: Dict[str, Any]) -> pd.Series:
-    """Retorna série semanal média de CVU por dat_fimsemana."""
+    """Série semanal média de CVU (R$/MWh) indexada por dat_fimsemana.
+
+    Fonte primária: Neon (cvu_usina_termica).
+    Fallback: DuckDB local → arquivos CSV ONS.
+    """
+    # ── Neon ─────────────────────────────────────────────────────────
+    if _neon_available():
+        try:
+            sql = """
+                SELECT
+                    dat_fimsemana,
+                    AVG(val_cvu) AS val_cvu
+                FROM cvu_usina_termica
+                WHERE dat_fimsemana IS NOT NULL
+                  AND val_cvu > 0
+                GROUP BY 1
+                ORDER BY 1
+            """
+            df = _neon_fetchdf(sql)
+            if not df.empty:
+                df["dat_fimsemana"] = pd.to_datetime(df["dat_fimsemana"], errors="coerce")
+                df["val_cvu"]       = pd.to_numeric(df["val_cvu"], errors="coerce")
+                df = df.dropna(subset=["dat_fimsemana", "val_cvu"])
+                df = df[df["val_cvu"] > 0]
+                if not df.empty:
+                    return df.set_index("dat_fimsemana")["val_cvu"].sort_index().astype(float)
+        except Exception:
+            pass
+    # ── DuckDB ───────────────────────────────────────────────────────
     con = _duckdb_connect()
     if con is not None:
         try:
@@ -2645,17 +3226,16 @@ def _load_cvu_weekly_series(ons: Dict[str, Any]) -> pd.Series:
                 """
                 df = con.execute(q).fetchdf()
                 if not df.empty:
-                    s = pd.Series(df['val_cvu'].values, index=pd.to_datetime(df['dat_fimsemana']))
+                    s = pd.Series(df["val_cvu"].values, index=pd.to_datetime(df["dat_fimsemana"]))
                     return s.sort_index().astype(float)
         except Exception:
             pass
         finally:
             con.close()
-
+    # ── CSV ONS (fallback final) ─────────────────────────────────────
     files = _find_ons_csv_all(ons, "CVU_Usina_Termica")
     if not files:
         return pd.Series(dtype=float)
-
     frames: List[pd.DataFrame] = []
     for cvu_file in files:
         try:
@@ -2665,18 +3245,16 @@ def _load_cvu_weekly_series(ons: Dict[str, Any]) -> pd.Series:
                 continue
             df = df[["dat_iniciosemana", "dat_fimsemana", "val_cvu"]].copy()
             df["dat_iniciosemana"] = _parse_date_series(df["dat_iniciosemana"])
-            df["dat_fimsemana"] = _parse_date_series(df["dat_fimsemana"])
-            df["val_cvu"] = _normalize_br_numeric_series(df["val_cvu"])
+            df["dat_fimsemana"]    = _parse_date_series(df["dat_fimsemana"])
+            df["val_cvu"]          = _normalize_br_numeric_series(df["val_cvu"])
             df = df.dropna(subset=["dat_iniciosemana", "dat_fimsemana", "val_cvu"])
             df = df[df["val_cvu"] > 0]
             if not df.empty:
                 frames.append(df)
         except Exception:
             continue
-
     if not frames:
         return pd.Series(dtype=float)
-
     all_df = pd.concat(frames, ignore_index=True)
     weekly = (
         all_df.groupby(["dat_iniciosemana", "dat_fimsemana"], as_index=False)["val_cvu"]
@@ -2686,8 +3264,6 @@ def _load_cvu_weekly_series(ons: Dict[str, Any]) -> pd.Series:
     if weekly.empty:
         return pd.Series(dtype=float)
     return weekly.set_index("dat_fimsemana")["val_cvu"].astype(float)
-
-
 def _expand_cvu_weekly_to_daily(ons: Dict[str, Any]) -> pd.Series:
     """Expande CVU semanal para valor diário no intervalo dat_iniciosemana..dat_fimsemana."""
     con = _duckdb_connect()
