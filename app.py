@@ -20,13 +20,18 @@ except Exception:
 
 def _NEON_OK() -> bool:
     """Verifica conexão Neon em tempo de execução (não no import)."""
-    if db_neon is None:
+    import os as _os
+    import streamlit as _st
+    _url = _os.getenv("DATABASE_URL", "")
+    if not _url:
+        _st.session_state["_neon_error"] = "DATABASE_URL vazia"
         return False
     try:
-        row = db_neon.fetchone("SELECT 1")
-        return row is not None
+        import psycopg2 as _pg
+        _c = _pg.connect(_url)
+        _c.close()
+        return True
     except Exception as _e:
-        import streamlit as _st
         _st.session_state["_neon_error"] = str(_e)
         return False
 
