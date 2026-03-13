@@ -2516,17 +2516,27 @@ def _compute_advanced_cross_metrics(
             else:
                 df_e["cvu_semana"] = np.nan
 
-            # EAR/ENA diários -> horários
-            ear_pct_d = pd.Series({pd.to_datetime(k): v for k, v in (ear_percentual_diaria_sin or {}).items()}) if ear_percentual_diaria_sin else pd.Series(dtype=float)
-            ena_arm_pct_d = pd.Series({pd.to_datetime(k): v for k, v in (ena_armazenavel_percentualmlt_diaria_sin or {}).items()}) if ena_armazenavel_percentualmlt_diaria_sin else pd.Series(dtype=float)
-            if not ear_pct_d.empty:
-                df_e["ear_pct"] = ear_pct_d.reindex(pd.DatetimeIndex(df_e.index.floor("D"))).values
-            else:
-                df_e["ear_pct"] = np.nan
-            if not ena_arm_pct_d.empty:
-                df_e["ena_arm_pct"] = ena_arm_pct_d.reindex(pd.DatetimeIndex(df_e.index.floor("D"))).values
-            else:
-                df_e["ena_arm_pct"] = np.nan
+            # EAR/ENA diários → todas as horas do dia recebem o valor do dia
+            # Estratégia: reindexar a série diária no índice horário via ffill
+            # garantindo que cada hora H do dia D receba o valor de D.
+            def _daily_to_hourly(daily_dict: Optional[dict], idx_h: pd.DatetimeIndex) -> pd.Series:
+                """Expande série diária para horária: todas as horas do dia D
+                recebem o valor registrado para o dia D."""
+                if not daily_dict:
+                    return pd.Series(np.nan, index=idx_h)
+                s = pd.Series({pd.to_datetime(k): v for k, v in daily_dict.items()})
+                s.index = pd.to_datetime(s.index).normalize()  # garante meia-noite
+                s = s.sort_index()
+                # Reindexar no índice horário: primeiro preencher datas presentes,
+                # depois propagar para todas as horas do mesmo dia via ffill
+                hourly_dates = pd.DatetimeIndex(idx_h.normalize())
+                mapped = s.reindex(hourly_dates)          # NaN onde não há dado
+                mapped.index = idx_h                       # restaura índice horário
+                mapped = mapped.ffill().bfill()            # propaga valor para todas as horas
+                return mapped
+
+            df_e["ear_pct"]     = _daily_to_hourly(ear_percentual_diaria_sin,                idx)
+            df_e["ena_arm_pct"] = _daily_to_hourly(ena_armazenavel_percentualmlt_diaria_sin, idx)
 
             # Step 1 — Normalizações
             df_e["EAR_norm"] = (df_e["ear_pct"] / 100.0).clip(lower=0, upper=1)

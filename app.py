@@ -268,10 +268,13 @@ def _build_hourly_df_cached(_token: str) -> pd.DataFrame:
         "GROUP BY ear_data ORDER BY ear_data"
     )
     if not ear_df.empty:
-        ear_df["instante"] = pd.to_datetime(ear_df["instante"], errors="coerce")
+        ear_df["instante"] = pd.to_datetime(ear_df["instante"], errors="coerce").dt.normalize()
         ear_df = ear_df.dropna(subset=["instante"])
         ear_df["ear_pct"] = ear_df["ear"] / ear_df["earmaxp"].replace(0, np.nan) * 100
-        _join(_ts(pd.to_numeric(ear_df.set_index("instante")["ear_pct"], errors="coerce").rename("ear")))
+        # Série diária → expandir para cada hora do dia via resample + ffill
+        ear_s = pd.to_numeric(ear_df.set_index("instante")["ear_pct"], errors="coerce").rename("ear")
+        ear_s = ear_s.resample("h").ffill()   # cria 24 entradas por dia com mesmo valor
+        _join(_ts(ear_s))
     del ear_df
 
     # ── ENA diário ───────────────────────────────────────────────────────────
@@ -283,10 +286,13 @@ def _build_hourly_df_cached(_token: str) -> pd.DataFrame:
         "GROUP BY ena_data ORDER BY ena_data"
     )
     if not ena_df.empty:
-        ena_df["instante"] = pd.to_datetime(ena_df["instante"], errors="coerce")
+        ena_df["instante"] = pd.to_datetime(ena_df["instante"], errors="coerce").dt.normalize()
         ena_df = ena_df.dropna(subset=["instante"]).set_index("instante")
-        _join(_ts(pd.to_numeric(ena_df["ena_bruta"].rename("ena_bruta"), errors="coerce")))
-        _join(_ts(pd.to_numeric(ena_df["ena_arm"].rename("ena_arm"), errors="coerce")))
+        # Série diária → expandir para cada hora do dia via resample + ffill
+        for _col, _name in [("ena_bruta", "ena_bruta"), ("ena_arm", "ena_arm")]:
+            ena_s = pd.to_numeric(ena_df[_col].rename(_name), errors="coerce")
+            ena_s = ena_s.resample("h").ffill()
+            _join(_ts(ena_s))
     del ena_df
 
     # ── Disponibilidade sincronizada por tipo ────────────────────────────────
@@ -494,6 +500,31 @@ def _build_hourly_df_cached(_token: str) -> pd.DataFrame:
         # EAR % (já pode estar no df como ear_pct — garantir nome consistente)
         if "ear_pct" not in df.columns and "ear" in df.columns and "earmaxp" in df.columns:
             df["ear_pct"] = (df["ear"] / df["earmaxp"].replace(0, np.nan) * 100).clip(lower=0, upper=100)
+
+        # ── Normalizações para Coerência Operativa (tabs[3]) ─────────────────
+        # EAR_norm: EAR% / 100, clampado em [0, 1]
+        if "ear_pct" in df.columns:
+            df["EAR_norm"] = (df["ear_pct"] / 100.0).clip(lower=0, upper=1)
+        else:
+            df["EAR_norm"] = np.nan
+
+        # ENA_norm: ENA armazenável / capacidade máxima EAR (proxy)
+        # Usamos ena_arm normalizado pelo valor máximo histórico da série
+        if "ena_arm" in df.columns:
+            _ena_max = df["ena_arm"].max()
+            if pd.notna(_ena_max) and _ena_max > 0:
+                df["ENA_norm"] = (df["ena_arm"] / _ena_max).clip(lower=0, upper=1)
+            else:
+                df["ENA_norm"] = np.nan
+        else:
+            df["ENA_norm"] = np.nan
+
+        # Load_norm: carga / capacidade sincronizada total
+        _disp_total = _col("disp_total") if "disp_total" in df.columns else pd.Series(np.nan, index=df.index)
+        if _disp_total.notna().any():
+            df["Load_norm"] = (load_s / _disp_total.replace(0, np.nan)).clip(lower=0, upper=2)
+        else:
+            df["Load_norm"] = np.nan
 
     return _ensure_hourly(df)
 
@@ -1211,34 +1242,76 @@ def main():
         st.caption("Distribuição por tipo de restrição disponível no painel horário do core quando fornecido pelo ONS.")
 
     with tabs[3]:
+        # Ler os valores de normalizações diretamente do dff (df filtrado)
+        # EAR_norm, ENA_norm e Load_norm são calculados hora a hora no df
+        # e já expandidos corretamente para 24h/dia via resample+ffill
+        def _last_valid(col: str) -> float:
+            if col in dff.columns:
+                s = pd.to_numeric(dff[col], errors="coerce").dropna()
+                return float(s.iloc[-1]) if not s.empty else np.nan
+            return np.nan
+
+        _ear_norm   = _last_valid("EAR_norm")
+        _ena_norm   = _last_valid("ENA_norm")
+        _load_norm  = _last_valid("Load_norm")
+
         metrics = {
-            "Risk Gap": current.get("risk_gap", np.nan),
-            "CVaR": current.get("cvar_implicit", np.nan),
-            "EAR_norm": np.nan,
-            "ENA_norm": np.nan,
-            "Load pressure": np.nan,
-        }
-        metrics_norm = {
-            "risk": np.tanh(metrics["Risk Gap"]/300),
-            "cvar": metrics["CVaR"]/100,
-            "ear": 1-metrics["EAR_norm"],
-            "ena": 1-metrics["ENA_norm"],
-            "load": abs(metrics["Load pressure"]-1),
+            "Risk Gap":      current.get("risk_gap", np.nan),
+            "CVaR":          current.get("cvar_implicit", np.nan),
+            "EAR_norm":      _ear_norm,
+            "ENA_norm":      _ena_norm,
+            "Load pressure": _load_norm,
         }
 
-        norm = {}
-        if norm and not dff.empty:
-            tkey = dff.index[-1].strftime("%Y-%m-%d %H:%M:%S")
-            metrics["EAR_norm"] = (norm.get("EAR_norm") or {}).get(tkey, np.nan)
-            metrics["ENA_norm"] = (norm.get("ENA_norm") or {}).get(tkey, np.nan)
-            metrics["Load pressure"] = (norm.get("Load_norm") or {}).get(tkey, np.nan)
+        def _safe(v: float, default: float = 0.0) -> float:
+            return default if pd.isna(v) else float(v)
+
+        metrics_norm = {
+            "risk": np.tanh(_safe(metrics["Risk Gap"]) / 300),
+            "cvar": _safe(metrics["CVaR"]) / 100,
+            "ear":  1 - _safe(metrics["EAR_norm"], 0.5),   # 0.5 se ausente (neutro)
+            "ena":  1 - _safe(metrics["ENA_norm"], 0.5),
+            "load": abs(_safe(metrics["Load pressure"], 1.0) - 1),
+        }
+
         score_vals = [abs(v) for v in metrics_norm.values() if pd.notna(v)]
-        coherence = 100*(1-np.mean(score_vals))
-        coherence = np.clip(coherence,0,100)
-        color = "🟢" if coherence >= 70 else ("🟡" if coherence >= 40 else "🔴")
+        coherence = 100 * (1 - np.mean(score_vals)) if score_vals else np.nan
+        coherence = float(np.clip(coherence, 0, 100)) if pd.notna(coherence) else np.nan
+        color = "🟢" if pd.notna(coherence) and coherence >= 70 else (
+                "🟡" if pd.notna(coherence) and coherence >= 40 else "🔴")
+
         st.metric("Métrica de Coerência do SIN", "-" if pd.isna(coherence) else f"{coherence:.1f}")
         st.markdown(f"Classificação: {color}")
-        st.json(metrics)
+
+        # Mostrar detalhamento das métricas com labels legíveis
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown("**Métricas base**")
+            st.json({
+                "EAR_norm":      round(_ear_norm, 4)  if pd.notna(_ear_norm)  else None,
+                "ENA_norm":      round(_ena_norm, 4)  if pd.notna(_ena_norm)  else None,
+                "Load pressure": round(_load_norm, 4) if pd.notna(_load_norm) else None,
+                "CVaR (R$/MWh)": round(float(metrics["CVaR"]), 2) if pd.notna(metrics["CVaR"]) else None,
+                "Risk Gap":      round(float(metrics["Risk Gap"]), 2) if pd.notna(metrics["Risk Gap"]) else None,
+            })
+        with col_b:
+            st.markdown("**Scores normalizados (0 = ideal)**")
+            st.json({k: round(float(v), 4) if pd.notna(v) else None
+                     for k, v in metrics_norm.items()})
+
+        # Série temporal de EAR_norm e ENA_norm no período selecionado
+        norm_cols = [c for c in ["EAR_norm", "ENA_norm", "Load_norm"] if c in dff.columns]
+        if norm_cols:
+            _norm_df = dff[norm_cols].dropna(how="all").reset_index().rename(columns={"index": "instante"})
+            if not _norm_df.empty:
+                st.caption("Evolução das normalizações no período selecionado")
+                fig_norm = px.line(
+                    _norm_df, x="instante", y=norm_cols,
+                    template="plotly_dark",
+                    labels={"value": "Valor normalizado (0–1)", "variable": "Série"},
+                )
+                fig_norm.update_layout(yaxis_range=[0, 1.1])
+                st.plotly_chart(fig_norm, use_container_width=True)
 
     with tabs[4]:
 
