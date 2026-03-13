@@ -705,7 +705,7 @@ def main():
         <style>
           .stApp { background-color:#0b0f14; color:#f3f4f6; }
           [data-testid="stSidebar"] { display:none !important; }
-          .block-container { padding-top: 40px; }
+          .block-container { padding-top: 40px; padding-bottom: 0; margin-bottom: 0; }
           .fixed-header { position: fixed; top: 0; left:0; right:0; z-index:999; background:#0b0f14; }
           .full-bleed-line { height:0.1px; background:#c8a44d; width:100vw; margin-left:calc(50% - 50vw); }
           .tabs-layer { background: linear-gradient(180deg, #0b1222 0%, #070d1a 100%); padding:0.01rem 0.01rem 0.01rem 0.01rem; }
@@ -718,6 +718,20 @@ def main():
           }
           div[data-testid="stFormSubmitButton"] > button:hover { background:#e3bf4c !important; color:#000 !important; }
           .cards-row { margin-bottom: 5px; }
+                  /* NOVO: Reduzir espaçamento entre elementos */
+          .element-container {
+              margin-bottom: 0 !important;
+          }
+          .stMarkdown {
+              margin-bottom: 0 !important;
+          }
+          hr {
+              margin-top: 2px !important;
+              margin-bottom: 2px !important;
+          }
+          div[data-testid="stVerticalBlock"] {
+              gap: 0rem !important;
+          }
         </style>
         """,
         unsafe_allow_html=True,
@@ -1092,6 +1106,7 @@ def main():
         # HEATMAP – INFRA MARGINAL RENT
         # ===============================
 
+
         if "infra_marginal_rent" in df.columns:
 
             st.subheader("Mapa estrutural — Renda Infra-Marginal do SIN")
@@ -1101,6 +1116,13 @@ def main():
             )
 
             heat_df = df.copy()
+            
+            # FILTRO DE OUTLIERS - remover valores menores que -200 milhões
+            outliers_removidos = (heat_df["infra_marginal_rent"] < -400_000_000).sum()
+            heat_df = heat_df[heat_df["infra_marginal_rent"] >= -400_000_000]
+            
+            if outliers_removidos > 0:
+                st.info(f"🔍 Foram removidos {outliers_removidos} registros com valores inferiores a -200 milhões R$/h (outliers).")
 
             heat_df["data"] = heat_df.index.date
             heat_df["hora"] = heat_df.index.hour
@@ -1112,49 +1134,53 @@ def main():
                 aggfunc="mean"
             )
 
-            # converter índice para datetime para manipular meses
-            pivot.index = pd.to_datetime(pivot.index)
+            # verificar se há dados após o filtro
+            if pivot.empty:
+                st.warning("⚠️ Não há dados disponíveis após a remoção dos outliers.")
+            else:
+                # converter índice para datetime para manipular meses
+                pivot.index = pd.to_datetime(pivot.index)
 
-            # localizar início de cada mês
-            month_starts = pivot.index.to_series().groupby(
-                [pivot.index.year, pivot.index.month]
-            ).first()
+                # localizar início de cada mês
+                month_starts = pivot.index.to_series().groupby(
+                    [pivot.index.year, pivot.index.month]
+                ).first()
 
-            y_ticks = pd.to_datetime(month_starts.values)
-            y_labels = [d.strftime("%m-%Y") for d in y_ticks]
+                y_ticks = pd.to_datetime(month_starts.values)
+                y_labels = [d.strftime("%m-%Y") for d in y_ticks]
 
-            fig_heat = go.Figure(
-                data=go.Heatmap(
-                    z=pivot.values,
-                    x=pivot.columns,
-                    y=pivot.index,
-                    colorscale="RdBu_r",
-                    colorbar=dict(title="R$/h"),
-                    xgap=2,   # espaço entre horas
-                    ygap=0    # pequeno espaço entre dias
+                fig_heat = go.Figure(
+                    data=go.Heatmap(
+                        z=pivot.values,
+                        x=pivot.columns,
+                        y=pivot.index,
+                        colorscale="RdBu_r",
+                        colorbar=dict(title="R$/h"),
+                        xgap=2,   # espaço entre horas
+                        ygap=0    # pequeno espaço entre dias
+                    )
                 )
-            )
 
-            fig_heat.update_layout(
-                template="plotly_dark",
-                height=5000,
-                xaxis=dict(
-                    title="Hora do dia",
-                    tickmode="linear",
-                    dtick=1
-                ),
-                yaxis=dict(
-                    title="Data",
-                    tickmode="array",
-                    tickvals=y_ticks,
-                    ticktext=y_labels
+                fig_heat.update_layout(
+                    template="plotly_dark",
+                    height=5000,
+                    xaxis=dict(
+                        title="Hora do dia",
+                        tickmode="linear",
+                        dtick=1
+                    ),
+                    yaxis=dict(
+                        title="Data",
+                        tickmode="array",
+                        tickvals=y_ticks,
+                        ticktext=y_labels
+                    )
                 )
-            )
 
-            st.plotly_chart(fig_heat, width="stretch")
+                st.plotly_chart(fig_heat, width="stretch")
 
-            with st.expander("Ver dados do mapa de calor (base completa)"):
-                st.dataframe(pivot, width="stretch", height=300)
+                with st.expander("Ver dados do mapa de calor (base completa)"):
+                    st.dataframe(pivot, width="stretch", height=300)
 
     with tabs[2]:
         cdf = _plot_df(dff)
