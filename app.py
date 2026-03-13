@@ -222,7 +222,7 @@ def _build_hourly_df_cached(_token: str) -> pd.DataFrame:
     if not gen_df.empty:
         gen_df["instante"] = pd.to_datetime(gen_df["instante"], errors="coerce")
         gen_df = gen_df.dropna(subset=["instante"])
-        # tipo_geracao já vem normalizado: solar/wind/hydro/thermal/nuclear/other
+        # tipo_geracao já normalizado: solar | wind | hydro | thermal | nuclear | other
         for tipo in ("solar", "wind", "hydro", "thermal", "nuclear"):
             sub = gen_df[gen_df["tipo_geracao"] == tipo]
             if not sub.empty:
@@ -289,7 +289,7 @@ def _build_hourly_df_cached(_token: str) -> pd.DataFrame:
         _join(_ts(pd.to_numeric(ena_df["ena_arm"].rename("ena_arm"), errors="coerce")))
     del ena_df
 
-    # ── Disponibilidade por tipo ─────────────────────────────────────────────
+    # ── Disponibilidade sincronizada por tipo ────────────────────────────────
     disp_df = db_neon.fetchdf(
         "SELECT din_instante AS instante, tipo_geracao, "
         "  SUM(val_disp_sincronizada) AS disp_sinc "
@@ -300,20 +300,20 @@ def _build_hourly_df_cached(_token: str) -> pd.DataFrame:
     if not disp_df.empty:
         disp_df["instante"] = pd.to_datetime(disp_df["instante"], errors="coerce")
         disp_df = disp_df.dropna(subset=["instante"])
-        for tipo in ("hydro", "thermal", "nuclear", "solar", "wind"):
-            sub = disp_df[disp_df["tipo_geracao"] == tipo]
+        for _tipo, _col in (("hydro","disp_hydro"),("thermal","disp_thermal"),("nuclear","disp_nuclear"),("solar","disp_solar"),("wind","disp_wind")):
+            sub = disp_df[disp_df["tipo_geracao"] == _tipo]
             if not sub.empty:
-                s = sub.groupby("instante")["disp_sinc"].sum().rename(f"disp_{tipo}")
-                _join(_ts(pd.to_numeric(s, errors="coerce")))
-        disp_total = disp_df.groupby("instante")["disp_sinc"].sum().rename("disp_total")
-        _join(_ts(pd.to_numeric(disp_total, errors="coerce")))
+                _join(_ts(pd.to_numeric(sub.groupby("instante")["disp_sinc"].sum().rename(_col), errors="coerce")))
+        _join(_ts(pd.to_numeric(disp_df.groupby("instante")["disp_sinc"].sum().rename("disp_total"), errors="coerce")))
     del disp_df
 
-    # ── Restrição renovável (curtailment) ────────────────────────────────────
+    # ── Restrição renovável — curtailment solar + eólico ────────────────────
     restr_df = db_neon.fetchdf(
         "SELECT din_instante AS instante, fonte, "
-        "  SUM(val_geracao) AS gerado, SUM(val_geracaolimitada) AS limitado, "
-        "  SUM(val_disponibilidade) AS disponivel "
+        "  SUM(val_geracao) AS gerado, "
+        "  SUM(val_geracaolimitada) AS limitado, "
+        "  SUM(val_disponibilidade) AS disponivel, "
+        "  SUM(val_geracaoreferencia) AS referencia "
         "FROM restricao_renovavel "
         "WHERE din_instante IS NOT NULL "
         "GROUP BY din_instante, fonte ORDER BY din_instante"
@@ -321,13 +321,20 @@ def _build_hourly_df_cached(_token: str) -> pd.DataFrame:
     if not restr_df.empty:
         restr_df["instante"] = pd.to_datetime(restr_df["instante"], errors="coerce")
         restr_df = restr_df.dropna(subset=["instante"])
-        for fonte, sfx in (("solar", "solar"), ("wind", "wind")):
-            sub = restr_df[restr_df["fonte"] == fonte].set_index("instante")
-            if not sub.empty:
-                curtail = (sub["limitado"] - sub["gerado"]).clip(lower=0).rename(f"curtail_{sfx}")
-                fator = (sub["gerado"] / sub["disponivel"].replace(0, np.nan) * 100).rename(f"fator_cap_{sfx}")
-                _join(_ts(pd.to_numeric(curtail, errors="coerce")))
-                _join(_ts(pd.to_numeric(fator, errors="coerce")))
+        # curtailment = limitado - gerado (positivo = energia cortada)
+        _curtail_total = pd.Series(0.0, index=restr_df["instante"].unique())
+        for _fonte, _sfx in (("solar","solar"), ("wind","wind")):
+            _sub = restr_df[restr_df["fonte"] == _fonte].set_index("instante")
+            if not _sub.empty:
+                _curtail = (_sub["limitado"] - _sub["gerado"]).clip(lower=0).rename(f"curtail_{_sfx}")
+                _avail   = _sub["disponivel"].rename(f"avail_{_sfx}")
+                _join(_ts(pd.to_numeric(_curtail, errors="coerce")))
+                _join(_ts(pd.to_numeric(_avail, errors="coerce")))
+                _curtail_total = _curtail_total.add(_curtail.reindex(_curtail_total.index).fillna(0), fill_value=0)
+        _join(_ts(pd.to_numeric(_curtail_total.rename("curtail_total"), errors="coerce")))
+        # avail_ren = avail_solar + avail_wind (total disponível renovável)
+        _avail_ren = restr_df.groupby("instante")["disponivel"].sum().rename("avail_ren")
+        _join(_ts(pd.to_numeric(_avail_ren, errors="coerce")))
     del restr_df
 
     # ── Despacho GFOM ────────────────────────────────────────────────────────
@@ -335,7 +342,7 @@ def _build_hourly_df_cached(_token: str) -> pd.DataFrame:
         "SELECT din_instante AS instante, "
         "  val_verifgeracao AS gfom_ger, "
         "  val_verifconstrainedoff AS constrained_off, "
-        "  val_verifinflexibilidade AS thermal_inflex, "
+        "  val_verifinflexibilidade AS thermal_inflex_gfom, "
         "  val_verifordemmerito AS thermal_merit, "
         "  val_verifgfom AS gfom "
         "FROM despacho_gfom WHERE din_instante IS NOT NULL ORDER BY din_instante"
@@ -343,9 +350,9 @@ def _build_hourly_df_cached(_token: str) -> pd.DataFrame:
     if not gfom_df.empty:
         gfom_df["instante"] = pd.to_datetime(gfom_df["instante"], errors="coerce")
         gfom_df = gfom_df.dropna(subset=["instante"]).set_index("instante")
-        for col in ("gfom_ger", "constrained_off", "thermal_inflex", "thermal_merit", "gfom"):
-            if col in gfom_df.columns:
-                _join(_ts(pd.to_numeric(gfom_df[col].rename(col), errors="coerce")))
+        for _col in ("gfom_ger","constrained_off","thermal_inflex_gfom","thermal_merit","gfom"):
+            if _col in gfom_df.columns:
+                _join(_ts(pd.to_numeric(gfom_df[_col].rename(_col), errors="coerce")))
     del gfom_df
 
     # ── CVU médio semanal térmico ────────────────────────────────────────────
@@ -357,11 +364,10 @@ def _build_hourly_df_cached(_token: str) -> pd.DataFrame:
     if not cvu_df.empty:
         cvu_df["instante"] = pd.to_datetime(cvu_df["instante"], errors="coerce")
         cvu_df = cvu_df.dropna(subset=["instante"])
-        s = cvu_df.set_index("instante")["cvu_semana"].rename("cvu_semana")
-        _join(_ts(pd.to_numeric(s, errors="coerce")))
+        _join(_ts(pd.to_numeric(cvu_df.set_index("instante")["cvu_semana"].rename("cvu_semana"), errors="coerce")))
     del cvu_df
 
-    # ── Intercâmbio inter-subsistema ─────────────────────────────────────────
+    # ── Intercâmbio ──────────────────────────────────────────────────────────
     itc_df = db_neon.fetchdf(
         "SELECT din_instante AS instante, "
         "  id_subsistema_origem AS orig, id_subsistema_destino AS dest, "
@@ -374,11 +380,9 @@ def _build_hourly_df_cached(_token: str) -> pd.DataFrame:
         itc_df["instante"] = pd.to_datetime(itc_df["instante"], errors="coerce")
         itc_df = itc_df.dropna(subset=["instante"])
         itc_df["par"] = itc_df["orig"].str.upper() + "_" + itc_df["dest"].str.upper()
-        for par, grp in itc_df.groupby("par"):
-            s = grp.set_index("instante")["mw"].rename(f"itc_{par.lower()}")
-            _join(_ts(pd.to_numeric(s, errors="coerce")))
-        itc_total = itc_df.groupby("instante")["mw"].sum().rename("itc_total")
-        _join(_ts(pd.to_numeric(itc_total, errors="coerce")))
+        for _par, _grp in itc_df.groupby("par"):
+            _join(_ts(pd.to_numeric(_grp.set_index("instante")["mw"].rename(f"itc_{_par.lower()}"), errors="coerce")))
+        _join(_ts(pd.to_numeric(itc_df.groupby("instante")["mw"].sum().rename("itc_total"), errors="coerce")))
     del itc_df
 
     # ── Colunas derivadas ─────────────────────────────────────────────────────
@@ -389,15 +393,19 @@ def _build_hourly_df_cached(_token: str) -> pd.DataFrame:
         def _col(name):
             return pd.to_numeric(df[name], errors="coerce") if name in df.columns else z
 
-        load_s  = _col("load")
-        solar_s = _col("solar")
-        wind_s  = _col("wind")
+        load_s   = _col("load")
+        solar_s  = _col("solar")
+        wind_s   = _col("wind")
+        hydro_s  = _col("hydro")
+        thermal_s = _col("thermal")
+        nuclear_s = _col("nuclear")
 
-        df["net_load"]    = load_s - solar_s.fillna(0) - wind_s.fillna(0)
-        df["carga_total"] = load_s
+        df["net_load"]     = load_s - solar_s.fillna(0) - wind_s.fillna(0)
+        df["carga_total"]  = load_s
+        df["renov_total"]  = solar_s.fillna(0) + wind_s.fillna(0)
+        df["geracao_total"]= solar_s.fillna(0) + wind_s.fillna(0) + hydro_s.fillna(0) + thermal_s.fillna(0) + nuclear_s.fillna(0)
 
-        # SIN_cost ponderado por submercado:
-        # custo_total = load_se*pld_se + load_ne*pld_ne + load_s*pld_s + load_n*pld_n
+        # SIN_cost ponderado por submercado
         _sub_pairs = [("se", "se"), ("ne", "ne"), ("s", "s"), ("n", "n")]
         _sin_cost = pd.Series(0.0, index=df.index)
         _any_sub = False
@@ -406,13 +414,86 @@ def _build_hourly_df_cached(_token: str) -> pd.DataFrame:
             if _lc in df.columns and _pc in df.columns:
                 _sin_cost += _col(_lc).fillna(0) * _col(_pc).fillna(0)
                 _any_sub = True
-        if not _any_sub and "load" in df.columns and "pld" in df.columns:
-            # Fallback: SIN total * PLD médio
+        if not _any_sub:
             _sin_cost = _col("load").fillna(0) * _col("pld").fillna(0)
-        df["SIN_cost_R$/h"] = _sin_cost.where(_sin_cost > 0, np.nan)
+        df["sin_cost"]      = _sin_cost.where(_sin_cost > 0, np.nan)
+        df["SIN_cost_R$/h"] = df["sin_cost"]
+        df["pld_ponderado"] = (df["sin_cost"] / load_s.replace(0, np.nan)).where(load_s > 0, np.nan)
 
-        # Custo médio ponderado R$/MWh (custo_total / carga_total)
-        df["pld_ponderado"] = (df["SIN_cost_R$/h"] / load_s.replace(0, np.nan)).where(load_s > 0, np.nan)
+        # CVU semanal interpolado para horário
+        if "cvu_semana" in df.columns:
+            df["cvu_semana"] = df["cvu_semana"].ffill().bfill()
+
+        # Custo real e por mérito térmico
+        _thermal_merit = _col("thermal_merit")
+        _cvu           = _col("cvu_semana")
+        df["thermal_merit_cost"]          = _thermal_merit.fillna(0) * _cvu.fillna(0)
+        df["thermal_real_cost"]           = thermal_s.fillna(0) * _cvu.fillna(0)
+
+        # thermal_inflex: usar gfom se disponível, senão disp_thermal como proxy
+        _thermal_inflex = _col("thermal_inflex_gfom") if "thermal_inflex_gfom" in df.columns else pd.Series(0.0, index=df.index)
+        df["thermal_inflex"] = _thermal_inflex
+        df["Thermal_inflex_ratio"] = (_thermal_inflex / thermal_s.replace(0, np.nan)).clip(lower=0, upper=1)
+
+        # Disponibilidade hidro sincronizada
+        _disp_hydro = _col("disp_hydro") if "disp_hydro" in df.columns else hydro_s
+        df["disp_sync_uhe"]   = _disp_hydro
+        df["Hydro_preserved"] = (_disp_hydro - hydro_s.fillna(0)).clip(lower=0)
+        df["Water_value_R$/h"]= df["Hydro_preserved"] * _col("cmo_dominante").fillna(0)
+
+        # Curtailment total
+        _curtail_s  = _col("curtail_solar").fillna(0)
+        _curtail_w  = _col("curtail_wind").fillna(0)
+        _curtail    = (_curtail_s + _curtail_w)
+        df["curtail_total"]     = _curtail.where(_curtail > 0, np.nan)
+        df["curtailment_loss"]  = _curtail * _col("pld").fillna(0)
+        df["Curtailment_loss_R$/h"] = df["curtailment_loss"]
+
+        # CVaR implícito = (PLD - CMO).clip(0)
+        _pld_s = _col("pld")
+        _cmo_s = _col("cmo_dominante")
+        df["CVaR_implicit"] = (_pld_s - _cmo_s).clip(lower=0)
+        df["cvar_implicit"] = df["CVaR_implicit"]
+        _pld_teto = _pld_s.groupby(_pld_s.index.year).transform("max")
+        _pld_no_teto = _pld_s < _pld_teto * 0.95
+        df.loc[~_pld_no_teto, "cvar_implicit"] = np.nan
+
+        # Risk Gap = CVaR - CVU
+        df["risk_gap"] = (df["CVaR_implicit"] - _cvu).where(_cvu.notna(), np.nan)
+
+        # Geração necessária e hidro required
+        _mandatory = solar_s.fillna(0) + wind_s.fillna(0) + nuclear_s.fillna(0) + _thermal_inflex.fillna(0)
+        _req_hydro = (load_s - _mandatory).clip(lower=0)
+        _hydro_gap = hydro_s.fillna(0) - _req_hydro
+        _tol = 1e-6
+        df["system_state"] = np.where(
+            _hydro_gap > _tol, "Hydro Preservation",
+            np.where(_hydro_gap.abs() <= _tol, "Hydro Necessary", "Hydro Deficit")
+        )
+
+        # Transferências econômicas
+        df["t_prudencia"]     = np.where(_cmo_s > _pld_s, df["Hydro_preserved"] * (_cmo_s - _pld_s), 0.0)
+        df["t_hidro"]         = df["Water_value_R$/h"]
+        df["t_eletric"]       = df["thermal_merit_cost"]
+        df["t_sistemica"]     = df["geracao_total"] * (_cmo_s - _pld_s)
+        df["t_total"]         = df["t_eletric"] + df["t_hidro"] + df["t_prudencia"] + df["t_sistemica"]
+        df["infra_marginal_rent"] = df["sin_cost"] - df["t_total"]
+
+        # GFOM %
+        if "gfom" in df.columns and "gfom_ger" in df.columns:
+            df["gfom_pct"] = (_col("gfom") / _col("gfom_ger").replace(0, np.nan) * 100).clip(lower=0, upper=100)
+
+        # IPR = renov_disponível / load
+        # ISR = renov_disponível / carga_líquida
+        _avail_ren = _col("avail_ren") if "avail_ren" in df.columns else df["renov_total"]
+        _avail_ren = _avail_ren.fillna(df["renov_total"])
+        df["ipr"] = (_avail_ren / load_s.replace(0, np.nan)).clip(lower=0)
+        _net_load_s = df["net_load"].replace(0, np.nan)
+        df["isr"] = (_avail_ren / _net_load_s.abs().replace(0, np.nan)).clip(lower=0)
+
+        # EAR % (já pode estar no df como ear_pct — garantir nome consistente)
+        if "ear_pct" not in df.columns and "ear" in df.columns and "earmaxp" in df.columns:
+            df["ear_pct"] = (df["ear"] / df["earmaxp"].replace(0, np.nan) * 100).clip(lower=0, upper=100)
 
     return _ensure_hourly(df)
 
@@ -625,7 +706,7 @@ def main():
           .stApp { background-color:#0b0f14; color:#f3f4f6; }
           [data-testid="stSidebar"] { display:none !important; }
           .block-container { padding-top: 40px; }
-          .fixed-header { position: fixed; top: 0; left:0; right:0; z-index:999; background:#0b0f14; }
+          .fixed-header { position: fixed; top: 0; left:10; right:0; z-index:999; background:#0b0f14; }
           .full-bleed-line { height:0.1px; background:#c8a44d; width:100vw; margin-left:calc(50% - 50vw); }
           .tabs-layer { background: linear-gradient(180deg, #0b1222 0%, #070d1a 100%); padding:0.01rem 0.01rem 0.01rem 0.01rem; }
           label { color:#ffffff !important; font-weight:700 !important; }
@@ -854,6 +935,68 @@ def main():
         with st.expander("Ver dados do gráfico (hora a hora)"):
             plot_cols = [c for c in ["carga_total", "net_load", "solar", "wind", "hydro", "thermal", "nuclear"] if c in dff_photo.columns]
             st.dataframe(_plot_df(dff_photo[plot_cols]), width="stretch", height=280)
+
+        # ── Gráfico PLD e CMO por submercado ────────────────────────────────────
+        st.markdown("#### PLD e CMO por Submercado")
+        _fig_pld = go.Figure()
+        _SUB_COLORS = {"se": "#f59e0b", "ne": "#34d399", "s": "#60a5fa", "n": "#f472b6"}
+        _SUB_LABELS = {"se": "SE", "ne": "NE", "s": "S", "n": "N"}
+        _pld_added, _cmo_added = False, False
+        for _sk, _color in _SUB_COLORS.items():
+            _pld_col = f"pld_{_sk}"
+            if _pld_col in dff.columns:
+                _s = pd.to_numeric(dff[_pld_col], errors="coerce").dropna()
+                if not _s.empty:
+                    _fig_pld.add_trace(go.Scatter(
+                        x=_s.index, y=_s.values,
+                        name=f"PLD {_SUB_LABELS[_sk]}",
+                        line=dict(color=_color, width=1.5, dash="solid"),
+                        mode="lines", legendgroup=f"pld_{_sk}",
+                    ))
+                    _pld_added = True
+        # CMO por subsistema — buscar do Neon se não estiver no dff
+        _cmo_sub_map = {"SUDESTE": ("se", "#f59e0b"), "NORDESTE": ("ne", "#34d399"),
+                        "SUL": ("s", "#60a5fa"), "NORTE": ("n", "#f472b6")}
+        try:
+            _cmo_raw = db_neon.fetchdf(
+                "SELECT din_instante AS instante, id_subsistema, val_cmo "
+                "FROM cmo WHERE din_instante IS NOT NULL AND val_cmo IS NOT NULL "
+                "ORDER BY din_instante"
+            )
+            if not _cmo_raw.empty:
+                _cmo_raw["instante"] = pd.to_datetime(_cmo_raw["instante"], errors="coerce")
+                _cmo_raw = _cmo_raw.dropna(subset=["instante"])
+                _cmo_raw = _cmo_raw[(_cmo_raw["instante"] >= pd.Timestamp(dff.index.min())) &
+                                    (_cmo_raw["instante"] <= pd.Timestamp(dff.index.max()))]
+                for _sub_id, (_sk, _color) in _cmo_sub_map.items():
+                    _sub_df = _cmo_raw[_cmo_raw["id_subsistema"].str.upper().str.strip() == _sub_id]
+                    if not _sub_df.empty:
+                        _fig_pld.add_trace(go.Scatter(
+                            x=_sub_df["instante"], y=_sub_df["val_cmo"],
+                            name=f"CMO {_SUB_LABELS[_sk]}",
+                            line=dict(color=_color, width=1.2, dash="dash"),
+                            mode="lines", legendgroup=f"cmo_{_sk}",
+                        ))
+                        _cmo_added = True
+        except Exception:
+            pass
+        if _pld_added or _cmo_added:
+            _fig_pld.update_layout(
+                template="plotly_dark",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(11,15,20,0.95)",
+                height=340,
+                margin=dict(l=0, r=0, t=10, b=0),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0,
+                            font=dict(size=11)),
+                yaxis=dict(title="R$/MWh", gridcolor="#1e293b"),
+                xaxis=dict(gridcolor="#1e293b"),
+            )
+            st.plotly_chart(_fig_pld, width="stretch")
+            with st.expander("Ver dados PLD/CMO (hora a hora)"):
+                _pld_cmo_cols = [c for c in ["pld","pld_se","pld_ne","pld_s","pld_n","cmo_dominante"] if c in dff.columns]
+                if _pld_cmo_cols:
+                    st.dataframe(_plot_df(dff[_pld_cmo_cols]), width="stretch", height=260)
 
     with tabs[1]:
         pdf = _plot_df(dff)
