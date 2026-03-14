@@ -3,11 +3,12 @@
 # Registra uma tarefa no Agendador de Tarefas do Windows para rodar
 # update_neon.py todo dia às 00h15.
 #
-# Como usar:
+# Como usar (copie e cole linha a linha no PowerShell):
 #   1. Abra o PowerShell como Administrador
-#   2. Execute: Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
-#   3. Navegue até a pasta do projeto: cd C:\caminho\para\MA-TriaEnergia
-#   4. Execute: .\agendar_update_neon.ps1
+#   2. Execute: Set-ExecutionPolicy RemoteSigned -Scope CurrentUser   -> [S]
+#   3. Execute: Unblock-File .\agendar_update_neon.ps1
+#   4. Navegue até a pasta do projeto: cd C:\repos\Kintuadi-Energy
+#   5. Execute: .\agendar_update_neon.ps1
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Configurações — ajuste se necessário ─────────────────────────────────────
@@ -49,11 +50,12 @@ $Action  = New-ScheduledTaskAction `
 
 $Trigger = New-ScheduledTaskTrigger -Daily -At "00:15"
 
+# -StartWhenAvailable: roda assim que possível caso o PC estivesse desligado às 00h15
 $Settings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit (New-TimeSpan -Hours 2) `
     -RestartCount 2 `
     -RestartInterval (New-TimeSpan -Minutes 10) `
-    -StartWhenAvailable `       # roda assim que possível se o PC estava desligado
+    -StartWhenAvailable `
     -WakeToRun:$false
 
 $Principal = New-ScheduledTaskPrincipal `
