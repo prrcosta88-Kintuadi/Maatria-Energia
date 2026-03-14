@@ -66,16 +66,45 @@ def _git_push_empty_commit(message: str) -> bool:
         return False
 
 
+# ─── limpeza do ano corrente ─────────────────────────────────────────────────
+
+def _clear_current_year_ons(data_dir: str = "data") -> None:
+    """Remove arquivos ONS do ano corrente para forçar re-download.
+
+    Arquivos do ano em curso são sempre incompletos (dados do dia anterior
+    ainda não consolidados). Anos anteriores já estão completos e não são
+    tocados.
+    """
+    ano = datetime.now().year
+    target = Path(data_dir) / "ons" / str(ano)
+    if not target.exists():
+        log.info(f"Pasta {target} não encontrada — nada a limpar.")
+        return
+    removed = 0
+    for f in target.rglob("*"):
+        if f.is_file():
+            try:
+                f.unlink()
+                removed += 1
+            except Exception as e:
+                log.warning(f"Não foi possível remover {f}: {e}")
+    log.info(f"Limpeza do ano {ano}: {removed} arquivo(s) removido(s) em {target}")
+
+
 # ─── etapa 1: coleta ─────────────────────────────────────────────────────────
 
-def step_collect(dry_run: bool) -> bool:
+def step_collect(dry_run: bool, data_dir: str = "data") -> bool:
     log.info("=" * 60)
     log.info("ETAPA 1 — Coleta de novos dados (ONS + CCEE)")
     log.info("=" * 60)
 
     if dry_run:
-        log.info("[DRY-RUN] Pulando coleta.")
+        log.info("[DRY-RUN] Pulando limpeza e coleta.")
         return True
+
+    # Limpar arquivos do ano corrente antes de coletar para garantir
+    # que dados incompletos do dia anterior sejam re-baixados
+    _clear_current_year_ons(data_dir)
 
     try:
         from scripts.integrated_collector_v2 import KintuadiIntegratedCollectorV2
@@ -145,7 +174,7 @@ def run(dry_run: bool = False, skip_collect: bool = False, data_dir: str = "data
 
     # Etapa 1 — coleta
     if not skip_collect:
-        ok = step_collect(dry_run)
+        ok = step_collect(dry_run, data_dir)
         if not ok:
             log.warning("Coleta falhou — continuando com dados existentes em data/.")
     else:

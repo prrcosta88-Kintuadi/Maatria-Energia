@@ -22,6 +22,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from datetime import datetime
 from typing import Dict, Optional
 
 import numpy as np
@@ -51,13 +52,75 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
+
 ANO_MIN = 2021       # Filtro geral — dados a partir de 2021
+
+# ─── cache de datas máximas no Neon (consultado uma vez por execução) ─────────
+
+_MAX_DATE_CACHE: Dict[str, Optional[datetime]] = {}
+
+def _neon_max_date(table: str, date_col: str = "din_instante") -> Optional[datetime]:
+    """Retorna o MAX(date_col) já carregado na tabela do Neon.
+    Resultado em cache para evitar múltiplas consultas por execução.
+    """
+    key = f"{table}.{date_col}"
+    if key not in _MAX_DATE_CACHE:
+        try:
+            row = db_neon.fetchone(f"SELECT MAX({date_col}) FROM {table}")
+            _MAX_DATE_CACHE[key] = row[0] if row and row[0] else None
+        except Exception:
+            _MAX_DATE_CACHE[key] = None
+    return _MAX_DATE_CACHE[key]
+
+
+def _should_skip_file(fpath: Path, table: str,
+                      date_col: str = "din_instante") -> bool:
+    """Retorna True se o arquivo pode ser pulado com segurança.
+
+    Regra:
+    - Arquivos do ANO CORRENTE: NUNCA pulados.
+      O mesmo arquivo xlsx/csv é substituído diariamente com dados acrescidos,
+      então sempre precisa ser reprocessado para capturar o dia mais recente.
+    - Arquivos de ANOS ANTERIORES: pulados se o Neon já tem dados daquele
+      mês completo (MAX da tabela ultrapassa o último dia do mês do arquivo).
+      Anos anteriores são histórico imutável — não mudam após o fechamento.
+    """
+    yr = _year(fpath.name)
+    if not yr:
+        return False   # não consegue extrair ano → processar por segurança
+
+    # Ano corrente: sempre reprocessar (arquivo cresce a cada dia)
+    if yr >= datetime.now().year:
+        return False
+
+    # Anos anteriores: consultar MAX no Neon
+    max_dt = _neon_max_date(table, date_col)
+    if max_dt is None:
+        return False   # tabela vazia → processar tudo
+
+    mo = _month(fpath.name)
+
+    # Arquivo sem mês no nome (granularidade anual): pula se o Neon já tem
+    # dados do ano seguinte
+    if mo is None:
+        return max_dt.year > yr
+
+    # Arquivo mensal: pula se o Neon já tem dados além do último dia do mês
+    file_last_day = datetime(yr, mo, 28)   # 28 é conservador (todo mês tem)
+    return max_dt >= file_last_day
+
 ANO_MIN_RESTRICAO = 2023  # Restrições eólica/solar: apenas a partir de 2023
 
 # ── Mapeamento nom_tipousina → 6 tipos do dashboard ─────────────────────────
 _TIPO_MAP: Dict[str, str] = {
-    "FOTOVOLTAICA": "solar",  "SOLAR": "solar",
-    "EOLICA": "wind",         "EÓLICA": "wind",        "EOLICO": "wind",
+    # ── nomes exatos conforme arquivo ONS Geracao_Usina_Horaria_{ano}-{mes} ──
+    "HIDROELÉTRICA": "hydro",  "TÉRMICA": "thermal",
+    "FOTOVOLTAICA":  "solar",  "EOLIELÉTRICA": "wind",  "NUCLEAR": "nuclear",
+    # ── variantes sem acento / abreviações / nomes alternativos ──────────────
+    "SOLAR": "solar",          "FOTOVOLT": "solar",
+    "EOLICA": "wind",          "EÓLICA": "wind",        "EOLICO": "wind",
+    "EOLIELETRICA": "wind",    "EOLIELETRICO": "wind",  "EOLIELÉTRICO": "wind",
+    "EOL": "wind",
     "UHE": "hydro",           "PCH": "hydro",          "CGH": "hydro",
     "HIDROELETRICA": "hydro", "HIDRÁULICA": "hydro",   "HIDRAULICA": "hydro",
     "HIDRO": "hydro",
@@ -136,6 +199,12 @@ def _year(filename) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+def _month(filename) -> Optional[int]:
+    """Extrai mês do nome do arquivo, ex: Geracao_Usina_Horaria_2023-05 → 5."""
+    m = re.search(r"\d{4}-(\d{2})$", Path(filename).stem)
+    return int(m.group(1)) if m else None
+
+
 def _ts(series: pd.Series) -> pd.Series:
     """Converte para datetime com suporte a formato brasileiro dd-mm-yy."""
     r = pd.to_datetime(series, errors="coerce", dayfirst=True)
@@ -195,6 +264,9 @@ def load_geracao(ons_dir: Path, dry_run: bool) -> int:
             continue
 
         logger.info(f"Lendo geracao: {fpath.name}")
+        if _should_skip_file(fpath, "geracao_tipo_hora", "din_instante"):
+            logger.info(f"  SKIP (já no Neon): {fpath.name}")
+            continue
         df = _read(fpath)
         if df.empty:
             continue
@@ -259,6 +331,9 @@ def load_carga(ons_dir: Path, dry_run: bool) -> int:
             continue
 
         logger.info(f"Lendo carga: {fpath.name}")
+        if _should_skip_file(fpath, "curva_carga", "din_instante"):
+            logger.info(f"  SKIP (já no Neon): {fpath.name}")
+            continue
         df = _read(fpath)
         if df.empty:
             continue
@@ -319,6 +394,9 @@ def load_cmo(ons_dir: Path, dry_run: bool) -> int:
             continue
 
         logger.info(f"Lendo CMO: {fpath.name}")
+        if _should_skip_file(fpath, "cmo", "din_instante"):
+            logger.info(f"  SKIP (já no Neon): {fpath.name}")
+            continue
         df = _read(fpath)
         if df.empty:
             continue
@@ -372,6 +450,9 @@ def load_ear(ons_dir: Path, dry_run: bool) -> int:
         if not yr or yr < ANO_MIN:
             continue
         logger.info(f"Lendo EAR: {fpath.name}")
+        if _should_skip_file(fpath, "ear_diario_subsistema", "ear_data"):
+            logger.info(f"  SKIP (já no Neon): {fpath.name}")
+            continue
         df = _read(fpath)
         if df.empty:
             continue
@@ -423,6 +504,9 @@ def load_ena(ons_dir: Path, dry_run: bool) -> int:
         if not yr or yr < ANO_MIN:
             continue
         logger.info(f"Lendo ENA: {fpath.name}")
+        if _should_skip_file(fpath, "ena_diario_subsistema", "ena_data"):
+            logger.info(f"  SKIP (já no Neon): {fpath.name}")
+            continue
         df = _read(fpath)
         if df.empty:
             continue
@@ -497,6 +581,9 @@ def load_restricao(ons_dir: Path, dry_run: bool) -> int:
                 logger.info(f"Skip restricao (ano={yr} < {ANO_MIN_RESTRICAO}): {fpath.name}")
                 continue
             logger.info(f"Lendo restricao {fonte}: {fpath.name}")
+        if _should_skip_file(fpath, "restricao_renovavel", "din_instante"):
+            logger.info(f"  SKIP (já no Neon): {fpath.name}")
+            continue
             df = _read(fpath)
             if df.empty:
                 continue
@@ -597,6 +684,9 @@ def load_intercambio(ons_dir: Path, dry_run: bool) -> int:
         if not yr or yr < ANO_MIN:
             continue
         logger.info(f"Lendo intercambio: {fpath.name}")
+        if _should_skip_file(fpath, "intercambio", "din_instante"):
+            logger.info(f"  SKIP (já no Neon): {fpath.name}")
+            continue
         df = _read(fpath)
         if df.empty:
             continue
@@ -665,6 +755,9 @@ def load_disponibilidade(ons_dir: Path, dry_run: bool) -> int:
             continue
 
         logger.info(f"Lendo disponibilidade: {fpath.name}")
+        if _should_skip_file(fpath, "disponibilidade_tipo_hora", "din_instante"):
+            logger.info(f"  SKIP (já no Neon): {fpath.name}")
+            continue
         df = _read(fpath)
         if df.empty:
             continue
@@ -740,6 +833,9 @@ def load_gfom(ons_dir: Path, dry_run: bool) -> int:
             continue
 
         logger.info(f"Lendo GFOM: {fpath.name}")
+        if _should_skip_file(fpath, "despacho_gfom", "din_instante"):
+            logger.info(f"  SKIP (já no Neon): {fpath.name}")
+            continue
         df = _read(fpath)
         if df.empty:
             continue
