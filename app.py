@@ -10,9 +10,7 @@ import plotly.graph_objects as go
 import streamlit as st
 import requests
 import duckdb
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+# email via Resend API (HTTP) — smtplib removido (Render bloqueia SMTP)
 
 
 # ── Neon PostgreSQL ───────────────────────────────────────────────────────────
@@ -619,47 +617,70 @@ def _fmt_money_compact(value: Any) -> str:
 
 
 def _send_feedback(sender_email: str, message: str) -> tuple[bool, str]:
-    """Envia email de feedback para maatriaenergia@gmail.com via SMTP Gmail.
+    """Envia email de feedback via Resend API (HTTP).
 
-    Requer variáveis de ambiente no Render:
-        GMAIL_USER  — endereço Gmail remetente (ex: maatriaenergia@gmail.com)
-        GMAIL_PASS  — senha de app de 16 dígitos gerada em
-                      myaccount.google.com > Segurança > Senhas de app
+    O Render bloqueia SMTP (porta 465/587). A Resend API usa HTTPS na 443,
+    que funciona normalmente em qualquer plano do Render.
+
+    Configuração no Render → Environment:
+        RESEND_API_KEY  — chave gerada em resend.com (ex: re_xxxxxxxxxxxx)
+
+    Plano gratuito Resend: 3 000 emails/mês, sem cartão de crédito.
+    O remetente deve ser um domínio verificado no Resend OU usar o domínio
+    de teste gratuito:  onboarding@resend.dev  (só envia para o próprio email
+    da conta Resend durante testes — troque pelo domínio real em produção).
     """
-    gmail_user = os.getenv("GMAIL_USER", "")
-    gmail_pass = os.getenv("GMAIL_PASS", "")
-    if not gmail_user or not gmail_pass:
-        return False, "Credenciais de email não configuradas no servidor."
+    api_key = os.getenv("RESEND_API_KEY", "")
+    if not api_key:
+        return False, "RESEND_API_KEY não configurada no Render."
 
-    dest = "maatriaenergia@gmail.com"
+    dest        = "maatriaenergia@gmail.com"
+    from_addr   = os.getenv("RESEND_FROM", "MAÁTria Energia <onboarding@resend.dev>")
+    reply_to    = [sender_email] if sender_email else []
+
+    html_body = f"""
+    <html><body style="font-family:sans-serif;color:#222;max-width:600px">
+      <h3 style="color:#c8a44d;border-bottom:1px solid #c8a44d;padding-bottom:8px">
+        Novo feedback — MAÁTria Energia
+      </h3>
+      <p><strong>Remetente:</strong> {sender_email or '<em>não informado</em>'}</p>
+      <div style="background:#f9f9f9;border-left:4px solid #c8a44d;
+                  padding:12px 16px;margin-top:12px;white-space:pre-wrap">
+{message}
+      </div>
+    </body></html>
+    """
+
+    payload: dict = {
+        "from":    from_addr,
+        "to":      [dest],
+        "subject": f"[MAÁTria] Feedback de {sender_email or 'anônimo'}",
+        "html":    html_body,
+        "text":    f"Remetente: {sender_email or 'não informado'}\n\n{message}",
+    }
+    if reply_to:
+        payload["reply_to"] = reply_to
+
     try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"[MAÁTria] Feedback de {sender_email or 'anônimo'}"
-        msg["From"]    = gmail_user
-        msg["To"]      = dest
-        msg["Reply-To"] = sender_email if sender_email else gmail_user
-
-        body_txt = (
-            f"Remetente: {sender_email or 'não informado'}\n\n"
-            f"Mensagem:\n{message}"
+        resp = requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type":  "application/json",
+            },
+            json=payload,
+            timeout=10,
         )
-        body_html = f"""
-        <html><body style="font-family:sans-serif;color:#222">
-          <h3 style="color:#c8a44d">Novo feedback — MAÁTria Energia</h3>
-          <p><strong>Remetente:</strong> {sender_email or '<em>não informado</em>'}</p>
-          <hr style="border-color:#c8a44d"/>
-          <p style="white-space:pre-wrap">{message}</p>
-        </body></html>
-        """
-        msg.attach(MIMEText(body_txt, "plain", "utf-8"))
-        msg.attach(MIMEText(body_html, "html",  "utf-8"))
-
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(gmail_user, gmail_pass)
-            server.sendmail(gmail_user, dest, msg.as_string())
-        return True, "Mensagem enviada com sucesso!"
-    except smtplib.SMTPAuthenticationError:
-        return False, "Falha de autenticação. Verifique GMAIL_USER e GMAIL_PASS no Render."
+        if resp.status_code in (200, 201):
+            return True, "Mensagem enviada com sucesso!"
+        # Resend retorna JSON com campo "message" em caso de erro
+        try:
+            detail = resp.json().get("message", resp.text)
+        except Exception:
+            detail = resp.text
+        return False, f"Resend API retornou {resp.status_code}: {detail}"
+    except requests.exceptions.Timeout:
+        return False, "Tempo de resposta esgotado ao contatar o servidor de email."
     except Exception as e:
         return False, f"Erro ao enviar: {e}"
 
