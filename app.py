@@ -1347,18 +1347,21 @@ def main():
         cols = [c for c in ["curtail_solar", "curtail_wind", "curtail_total"] if c in cdf.columns]
         if cols:
             st.caption("Montagem: curtailment horário por fonte (solar/eólica) e total agregado.")
-            fig = go.Figure()
-            fig = px.bar(
-                pdf,
-                x="instante",
-                y=["curtail_solar", "curtail_wind"],
-                template="plotly_dark",
-                barmode="stack"
-            )
-            #fig = px.bar(cdf, x="instante", y=cols, template="plotly_dark", barmode="group")
-            st.plotly_chart(fig, width="stretch")
+            _curtail_plot_cols = [c for c in ["curtail_solar", "curtail_wind"] if c in cdf.columns]
+            if _curtail_plot_cols:
+                fig = px.bar(
+                    cdf,
+                    x="instante",
+                    y=_curtail_plot_cols,
+                    template="plotly_dark",
+                    barmode="stack",
+                    labels={"curtail_solar": "Solar", "curtail_wind": "Eólica", "value": "MW"},
+                )
+                st.plotly_chart(fig, use_container_width=True)
             with st.expander("Ver dados do gráfico (hora a hora)"):
                 st.dataframe(cdf[["instante"] + cols], width="stretch", height=280)
+        else:
+            st.info("Sem dados de curtailment no período selecionado.")
         st.caption("Distribuição por tipo de restrição disponível no painel horário do core quando fornecido pelo ONS.")
 
     with tabs[3]:
