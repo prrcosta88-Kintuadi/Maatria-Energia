@@ -10,6 +10,9 @@ import plotly.graph_objects as go
 import streamlit as st
 import requests
 import duckdb
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 
 # ── Neon PostgreSQL ───────────────────────────────────────────────────────────
@@ -615,6 +618,52 @@ def _fmt_money_compact(value: Any) -> str:
     return f"R$ {_fmt_ptbr(v, 2)}"
 
 
+def _send_feedback(sender_email: str, message: str) -> tuple[bool, str]:
+    """Envia email de feedback para maatriaenergia@gmail.com via SMTP Gmail.
+
+    Requer variáveis de ambiente no Render:
+        GMAIL_USER  — endereço Gmail remetente (ex: maatriaenergia@gmail.com)
+        GMAIL_PASS  — senha de app de 16 dígitos gerada em
+                      myaccount.google.com > Segurança > Senhas de app
+    """
+    gmail_user = os.getenv("GMAIL_USER", "")
+    gmail_pass = os.getenv("GMAIL_PASS", "")
+    if not gmail_user or not gmail_pass:
+        return False, "Credenciais de email não configuradas no servidor."
+
+    dest = "maatriaenergia@gmail.com"
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = f"[MAÁTria] Feedback de {sender_email or 'anônimo'}"
+        msg["From"]    = gmail_user
+        msg["To"]      = dest
+        msg["Reply-To"] = sender_email if sender_email else gmail_user
+
+        body_txt = (
+            f"Remetente: {sender_email or 'não informado'}\n\n"
+            f"Mensagem:\n{message}"
+        )
+        body_html = f"""
+        <html><body style="font-family:sans-serif;color:#222">
+          <h3 style="color:#c8a44d">Novo feedback — MAÁTria Energia</h3>
+          <p><strong>Remetente:</strong> {sender_email or '<em>não informado</em>'}</p>
+          <hr style="border-color:#c8a44d"/>
+          <p style="white-space:pre-wrap">{message}</p>
+        </body></html>
+        """
+        msg.attach(MIMEText(body_txt, "plain", "utf-8"))
+        msg.attach(MIMEText(body_html, "html",  "utf-8"))
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(gmail_user, gmail_pass)
+            server.sendmail(gmail_user, dest, msg.as_string())
+        return True, "Mensagem enviada com sucesso!"
+    except smtplib.SMTPAuthenticationError:
+        return False, "Falha de autenticação. Verifique GMAIL_USER e GMAIL_PASS no Render."
+    except Exception as e:
+        return False, f"Erro ao enviar: {e}"
+
+
 def _prepare_logo(path: Path) -> Optional[Path]:
     """Recorta bordas escuras do PNG para reduzir fundo/preenchimento visual."""
     if not path.exists():
@@ -827,6 +876,41 @@ def main():
             st.image(str(logo), width=200)
         else:
             st.markdown("## MAÁTria Energia")
+
+    with colc3:
+        st.markdown(
+            "<p style='color:#c8a44d;font-size:0.78rem;margin-bottom:4px;"
+            "letter-spacing:0.04em;text-transform:uppercase;font-weight:600'>"
+            "✉ Contato & Sugestões</p>",
+            unsafe_allow_html=True,
+        )
+        with st.popover("Enviar mensagem", use_container_width=True):
+            st.markdown(
+                "<span style='color:#c8a44d;font-weight:600'>MAÁTria Energia</span> — "
+                "sua mensagem chega diretamente à equipe.",
+                unsafe_allow_html=True,
+            )
+            fb_email = st.text_input(
+                "Seu e-mail (opcional)",
+                placeholder="voce@exemplo.com",
+                key="fb_email",
+            )
+            fb_msg = st.text_area(
+                "Mensagem",
+                placeholder="Sugestões, dúvidas, erros encontrados…",
+                height=130,
+                key="fb_msg",
+            )
+            if st.button("Enviar ✉", type="primary", key="fb_send"):
+                if not fb_msg.strip():
+                    st.warning("Escreva uma mensagem antes de enviar.")
+                else:
+                    with st.spinner("Enviando…"):
+                        ok, info = _send_feedback(fb_email.strip(), fb_msg.strip())
+                    if ok:
+                        st.success(info)
+                    else:
+                        st.error(info)
 
     st.markdown("<div class='full-bleed-line'></div>", unsafe_allow_html=True)
 
@@ -1846,7 +1930,8 @@ restrições de transmissão ou inflexibilidade térmica excessiva.
 ### Limitações
 
 - **ENA_norm** usa o P90 dos últimos 365 dias como denominador, calculado sobre o
-  histórico completo do banco de dados — não sobre o período selecionado na tela.
+  histórico completo do Neon — não sobre o período selecionado na tela. Em bases
+  com menos de 365 dias de história, o P90 recai sobre toda a série disponível.
 - O score de CVaR usa R$100/MWh como unidade de referência implícita.
   Em cenários de PLD próximo ao teto regulatório, o CVaR pode ser estruturalmente
   alto sem refletir incoerência real.
