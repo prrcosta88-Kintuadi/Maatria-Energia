@@ -58,6 +58,7 @@ ANO_MIN = 2021       # Filtro geral — dados a partir de 2021
 # ─── cache de datas máximas no Neon (consultado uma vez por execução) ─────────
 
 _MAX_DATE_CACHE: Dict[str, Optional[datetime]] = {}
+_FORCE_RELOAD: bool = False
 
 def _neon_max_date(table: str, date_col: str = "din_instante") -> Optional[datetime]:
     """Retorna o MAX(date_col) já carregado na tabela do Neon.
@@ -85,6 +86,10 @@ def _should_skip_file(fpath: Path, table: str,
       mês completo (MAX da tabela ultrapassa o último dia do mês do arquivo).
       Anos anteriores são histórico imutável — não mudam após o fechamento.
     """
+    # --force: desativa skip completamente
+    if _FORCE_RELOAD:
+        return False
+
     yr = _year(fpath.name)
     if not yr:
         return False   # não consegue extrair ano → processar por segurança
@@ -581,9 +586,9 @@ def load_restricao(ons_dir: Path, dry_run: bool) -> int:
                 logger.info(f"Skip restricao (ano={yr} < {ANO_MIN_RESTRICAO}): {fpath.name}")
                 continue
             logger.info(f"Lendo restricao {fonte}: {fpath.name}")
-        if _should_skip_file(fpath, "restricao_renovavel", "din_instante"):
-            logger.info(f"  SKIP (já no Neon): {fpath.name}")
-            continue
+            if _should_skip_file(fpath, "restricao_renovavel", "din_instante"):
+                logger.info(f"  SKIP (já no Neon): {fpath.name}")
+                continue
             df = _read(fpath)
             if df.empty:
                 continue
@@ -907,6 +912,9 @@ def load_cvu(ons_dir: Path, dry_run: bool) -> int:
             logger.info(f"Skip (ano={yr}): {fpath.name}")
             continue
         logger.info(f"Lendo CVU: {fpath.name}")
+        if _should_skip_file(fpath, "cvu_usina_termica", "dat_fimsemana"):
+            logger.info(f"  SKIP (já no Neon): {fpath.name}")
+            continue
         df = _read(fpath)
         if df.empty:
             continue
@@ -988,6 +996,21 @@ def load_pld(data_dir: Path, dry_run: bool) -> int:
             continue
 
         logger.info(f"Lendo PLD: {fpath.name} (ano={year})")
+        # Ano corrente sempre reprocessado; anos anteriores pulados se já no Neon
+        if not _FORCE_RELOAD and year < datetime.now().year:
+            _pld_cache_key = "pld_historical.mes_referencia_int"
+            if _pld_cache_key not in _MAX_DATE_CACHE:
+                try:
+                    row = db_neon.fetchone("SELECT MAX(mes_referencia) FROM pld_historical")
+                    val = row[0] if row and row[0] else None
+                    # mes_referencia é int YYYYMM — extrair ano
+                    _MAX_DATE_CACHE[_pld_cache_key] = int(str(val)[:4]) if val else None
+                except Exception:
+                    _MAX_DATE_CACHE[_pld_cache_key] = None
+            max_year_pld = _MAX_DATE_CACHE[_pld_cache_key]
+            if max_year_pld and max_year_pld > year:
+                logger.info(f"  SKIP (já no Neon, max_ano={max_year_pld}): {fpath.name}")
+                continue
         df = _read(fpath)
         if df.empty:
             continue
@@ -1061,6 +1084,8 @@ def main():
     parser.add_argument("--only",    default="",
                         help=f"Loader: {', '.join(LOADERS.keys())}")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--force", action="store_true",
+                        help="Ignora skip de arquivos já no Neon — reprocessa tudo")
     args = parser.parse_args()
 
     if not db_neon.is_configured():
@@ -1075,6 +1100,11 @@ def main():
     logger.info(f"Filtro: ano >= {ANO_MIN} | dir: {args.dir}")
     if args.dry_run:
         logger.info("[DRY-RUN] Nenhuma linha sera inserida.")
+    if args.force:
+        logger.info("[FORCE] Skip desativado — todos os arquivos serão reprocessados.")
+    # Sinalizar para _should_skip_file via variável de módulo
+    global _FORCE_RELOAD
+    _FORCE_RELOAD = args.force
 
     data_dir = Path(args.dir)
     only = args.only.lower().strip()
