@@ -1345,23 +1345,147 @@ def main():
     with tabs[2]:
         cdf = _plot_df(dff)
         cols = [c for c in ["curtail_solar", "curtail_wind", "curtail_total"] if c in cdf.columns]
+        
         if cols:
             st.caption("Montagem: curtailment horário por fonte (solar/eólica) e total agregado.")
+            
             _curtail_plot_cols = [c for c in ["curtail_solar", "curtail_wind"] if c in cdf.columns]
+            
             if _curtail_plot_cols:
-                fig = px.bar(
-                    cdf,
-                    x="instante",
-                    y=_curtail_plot_cols,
-                    template="plotly_dark",
-                    barmode="stack",
-                    labels={"curtail_solar": "Solar", "curtail_wind": "Eólica", "value": "MW"},
-                )
-                st.plotly_chart(fig, use_container_width=True)
-            with st.expander("Ver dados do gráfico (hora a hora)"):
-                st.dataframe(cdf[["instante"] + cols], width="stretch", height=280)
+                # Verificar se é período de um único dia ou múltiplos dias
+                is_single_day = (selected_start == selected_end)
+                
+                if is_single_day:
+                    # Para um único dia: gráfico de barras normal
+                    fig = px.bar(
+                        cdf,
+                        x="instante",
+                        y=_curtail_plot_cols,
+                        template="plotly_dark",
+                        barmode="stack",
+                        labels={"curtail_solar": "Solar", "curtail_wind": "Eólica", "value": "MW"},
+                    )
+                    fig.update_layout(
+                        title=f"Curtailment horário - {selected_start.strftime('%d/%m/%Y')}",
+                        xaxis_title="Hora do dia",
+                        yaxis_title="MW",
+                        height=400,
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                else:
+                    # Para múltiplos dias: duas visualizações complementares
+                    
+                    # 1. Heatmap para ver padrões diários/horários
+                    st.subheader("Mapa de calor - Curtailment por hora do dia")
+                    
+                    # Preparar dados para heatmap
+                    heat_curtail = dff[["curtail_total"]].copy() if "curtail_total" in dff.columns else dff[["curtail_solar", "curtail_wind"]].sum(axis=1).to_frame("curtail_total")
+                    heat_curtail["data"] = heat_curtail.index.date
+                    heat_curtail["hora"] = heat_curtail.index.hour
+                    
+                    pivot_curtail = heat_curtail.pivot_table(
+                        index="data",
+                        columns="hora",
+                        values="curtail_total",
+                        aggfunc="mean"
+                    )
+                    
+                    fig_heat = go.Figure(
+                        data=go.Heatmap(
+                            z=pivot_curtail.values,
+                            x=pivot_curtail.columns,
+                            y=pivot_curtail.index,
+                            colorscale="YlOrRd",
+                            colorbar=dict(title="MW"),
+                            xgap=1,
+                            ygap=1,
+                        )
+                    )
+                    
+                    fig_heat.update_layout(
+                        template="plotly_dark",
+                        height=400,
+                        xaxis=dict(title="Hora do dia", dtick=2),
+                        yaxis=dict(title="Data"),
+                    )
+                    st.plotly_chart(fig_heat, use_container_width=True)
+                    st.caption("🔥 Células mais claras indicam maior curtailment. O heatmap revela padrões sazonais e horários.")
+                    
+                    # 2. Gráfico de área empilhada (melhor que barras para séries longas)
+                    st.subheader("Série temporal - Curtailment por fonte")
+                    
+                    # Amostragem para não sobrecarregar se período for muito longo
+                    plot_df = cdf.copy()
+                    n_points = len(plot_df)
+                    
+                    if n_points > 1000:  # Se mais de ~40 dias
+                        st.info(f"📊 Período extenso ({n_points} horas) - exibindo amostragem a cada 6h para melhor visualização")
+                        # Amostrar a cada 6 horas
+                        plot_df = plot_df.iloc[::6].copy()
+                    
+                    fig_area = px.area(
+                        plot_df,
+                        x="instante",
+                        y=_curtail_plot_cols,
+                        template="plotly_dark",
+                        labels={
+                            "curtail_solar": "Solar", 
+                            "curtail_wind": "Eólica", 
+                            "value": "MW",
+                            "instante": "Data/Hora"
+                        },
+                        title=f"Curtailment - {selected_start.strftime('%d/%m/%Y')} a {selected_end.strftime('%d/%m/%Y')}",
+                    )
+                    fig_area.update_layout(
+                        height=450,
+                        hovermode="x unified",
+                    )
+                    st.plotly_chart(fig_area, use_container_width=True)
+                    
+                    # Estatísticas do período
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        total_curtail = dff["curtail_total"].sum() / 1000  # em MWh
+                        st.metric("Curtailment Total", f"{total_curtail:,.0f} MWh")
+                    with col2:
+                        media_curtail = dff["curtail_total"].mean()
+                        st.metric("Média Horária", f"{media_curtail:.1f} MW")
+                    with col3:
+                        max_curtail = dff["curtail_total"].max()
+                        st.metric("Pico Máximo", f"{max_curtail:.0f} MW")
+                    with col4:
+                        horas_com_curtail = (dff["curtail_total"] > 1).sum()
+                        st.metric("Horas c/ Curtailment", f"{horas_com_curtail}")
+                
+                # Expander com dados hora a hora (sempre disponível)
+                with st.expander("Ver dados detalhados (hora a hora)"):
+                    display_cols = ["instante"] + cols
+                    
+                    # Formatar DataFrame para exibição
+                    df_display = cdf[display_cols].copy()
+                    if not df_display.empty:
+                        # Arredondar valores numéricos
+                        for col in cols:
+                            if col in df_display.columns:
+                                df_display[col] = df_display[col].round(2)
+                        
+                        # Ordenar por instante (mais recente primeiro)
+                        df_display = df_display.sort_values("instante", ascending=False)
+                        
+                        st.dataframe(df_display, width="stretch", height=280)
+                        
+                        # Botão para download dos dados
+                        csv = df_display.to_csv(index=False).encode('utf-8')
+                        st.download_button(
+                            label="📥 Download CSV",
+                            data=csv,
+                            file_name=f"curtailment_{selected_start}_{selected_end}.csv",
+                            mime="text/csv",
+                        )
         else:
-            st.info("Sem dados de curtailment no período selecionado.")
+            st.info("ℹ️ Sem dados de curtailment no período selecionado.")
+        
         st.caption("Distribuição por tipo de restrição disponível no painel horário do core quando fornecido pelo ONS.")
 
     with tabs[3]:
