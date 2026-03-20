@@ -1052,6 +1052,355 @@ def _plot_feature_importance(fi: Dict[str, float]) -> go.Figure:
 # INTERFACE STREAMLIT
 # ══════════════════════════════════════════════════════════════════════════════
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEÇÃO 12 — VISUALIZAÇÕES DE CUSTO FÍSICO E ENCARGOS
+# ══════════════════════════════════════════════════════════════════════════════
+
+_IMR_OUTLIER_FLOOR = -250_000_000  # R$/h — filtro de outliers do heatmap
+
+def _plot_imr_heatmap(df: pd.DataFrame,
+                      imr_col: str = "infra_marginal_physical") -> go.Figure:
+    """Heatmap hora × dia do IMR selecionado.
+    Remove outliers abaixo de -250M R$/h antes de plotar.
+    """
+    if imr_col not in df.columns or df.empty:
+        return go.Figure()
+    s = pd.to_numeric(df[imr_col], errors="coerce").dropna()
+    if s.empty:
+        return go.Figure()
+    # Filtro de outliers
+    s = s[s >= _IMR_OUTLIER_FLOOR]
+    if s.empty:
+        return go.Figure()
+    pivot = s.to_frame("val")
+    pivot["date"] = pivot.index.date
+    pivot["hour"] = pivot.index.hour
+    mat = pivot.pivot_table(index="hour", columns="date", values="val", aggfunc="mean")
+    label_map = {
+        "infra_marginal_physical": "IMR Físico (R$/h)",
+        "infra_marginal_market":   "IMR Mercado (R$/h)",
+        "infra_marginal_system":   "IMR Sistêmico (R$/h)",
+    }
+    fig = go.Figure(go.Heatmap(
+        z=mat.values,
+        x=[str(d) for d in mat.columns],
+        y=[f"{h:02d}h" for h in mat.index],
+        colorscale="RdYlGn",
+        colorbar=dict(title="R$/h", thickness=12),
+        hovertemplate="Data: %{x}<br>Hora: %{y}<br>Valor: R$ %{z:,.0f}<extra></extra>",
+    ))
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor=_COLORS["bg"],
+        plot_bgcolor=_COLORS["panel"], height=380,
+        margin=dict(l=40, r=20, t=45, b=30),
+        title=dict(text=f"Heatmap — {label_map.get(imr_col, imr_col)}",
+                   font=dict(size=13, color="#e5e7eb")),
+        xaxis=dict(nticks=20, gridcolor="#1f2937"),
+        yaxis=dict(autorange="reversed", gridcolor="#1f2937"),
+    )
+    return fig
+
+
+def _plot_spdi_series(df: pd.DataFrame) -> go.Figure:
+    """Série temporal do SPDI com zonas de alerta."""
+    if "spdi" not in df.columns or df.empty:
+        return go.Figure()
+    s = pd.to_numeric(df["spdi"], errors="coerce").dropna()
+    daily = s.resample("D").median()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=daily.index, y=daily.values, mode="lines", name="SPDI",
+        line=dict(color=_COLORS["gold"], width=1.8),
+        hovertemplate="Data: %{x|%d/%m/%Y}<br>SPDI: %{y:.2f}×<extra></extra>",
+    ))
+    for level, color, label in [
+        (1.0, "#34d399", "Alinhado (1.0)"),
+        (1.3, "#c8a44d", "Prêmio estrutural (1.3)"),
+        (1.6, "#f87171", "Distorção forte (1.6)"),
+    ]:
+        fig.add_hline(y=level, line_color=color, line_dash="dot", line_width=1,
+                      annotation_text=label, annotation_font_color=color,
+                      annotation_font_size=10)
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor=_COLORS["bg"],
+        plot_bgcolor=_COLORS["panel"], height=320,
+        margin=dict(l=40, r=20, t=45, b=30),
+        title=dict(text="Structural Price Distortion Index (SPDI)",
+                   font=dict(size=13, color="#e5e7eb")),
+        xaxis=dict(gridcolor="#1f2937"),
+        yaxis=dict(title="SPDI (×)", gridcolor="#1f2937"),
+    )
+    return fig
+
+
+def _plot_ess_vs_market(df: pd.DataFrame) -> go.Figure:
+    """ESS cost vs Market cost — série diária."""
+    if df.empty:
+        return go.Figure()
+    fig = go.Figure()
+    for col, name, color in [
+        ("market_cost_Rh",              "Custo de Mercado (R$/h)",  _COLORS["blue"]),
+        ("physical_generation_cost_Rh", "Custo Físico (R$/h)",      _COLORS["green"]),
+        ("ess_cost_Rh",                 "Encargo ESS (R$/h)",        _COLORS["gold"]),
+        ("hidden_system_cost",          "Custo Oculto (R$/h)",       _COLORS["purple"]),
+    ]:
+        if col not in df.columns:
+            continue
+        s = pd.to_numeric(df[col], errors="coerce").dropna().resample("D").mean()
+        if s.empty:
+            continue
+        fig.add_trace(go.Scatter(
+            x=s.index, y=s.values, mode="lines", name=name,
+            line=dict(color=color, width=1.5),
+            hovertemplate=f"{name}: R$ %{{y:,.0f}}<extra></extra>",
+        ))
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor=_COLORS["bg"],
+        plot_bgcolor=_COLORS["panel"], height=360,
+        margin=dict(l=40, r=20, t=45, b=30),
+        title=dict(text="Decomposição de Custos do Sistema (média diária)",
+                   font=dict(size=13, color="#e5e7eb")),
+        xaxis=dict(gridcolor="#1f2937"),
+        yaxis=dict(title="R$/h", gridcolor="#1f2937"),
+        legend=dict(orientation="h", y=1.05, font=dict(size=10)),
+    )
+    return fig
+
+
+def _plot_eii_series(df: pd.DataFrame) -> go.Figure:
+    """Encargo Intensity Index — série diária."""
+    if "encargo_intensity_index" not in df.columns or df.empty:
+        return go.Figure()
+    s = pd.to_numeric(df["encargo_intensity_index"], errors="coerce").dropna()
+    daily = s.resample("D").median()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=daily.index, y=daily.values * 100, mode="lines", name="EII (%)",
+        line=dict(color=_COLORS["purple"], width=1.8),
+        fill="tozeroy", fillcolor=_hex_rgba(_COLORS["purple"], 0.13),
+        hovertemplate="Data: %{x|%d/%m/%Y}<br>EII: %{y:.1f}%<extra></extra>",
+    ))
+    fig.add_hline(y=5,  line_color=_COLORS["gold"], line_dash="dot",
+                  annotation_text="Estresse (5%)",           annotation_font_color=_COLORS["gold"])
+    fig.add_hline(y=10, line_color=_COLORS["red"],  line_dash="dot",
+                  annotation_text="Intervenção elevada (10%)", annotation_font_color=_COLORS["red"])
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor=_COLORS["bg"],
+        plot_bgcolor=_COLORS["panel"], height=300,
+        margin=dict(l=40, r=20, t=45, b=30),
+        title=dict(text="Encargo Intensity Index — ESS / Custo de Mercado",
+                   font=dict(size=13, color="#e5e7eb")),
+        xaxis=dict(gridcolor="#1f2937"),
+        yaxis=dict(title="EII (%)", gridcolor="#1f2937"),
+    )
+    return fig
+
+
+def render_charges_tab(df: pd.DataFrame) -> None:
+    """
+    Tab premium de Encargos & Custo Físico.
+    Chamar com: with tabs[N]: render_charges_tab(df)
+    """
+    st.markdown("""
+    <div style='background:#111827;border-left:3px solid #a78bfa;border-radius:8px;
+    padding:14px 18px;margin-bottom:16px'>
+    <strong style='color:#a78bfa'>⚡ Encargos ESS & Custo Físico do Sistema</strong><br>
+    <span style='font-size:.82rem;color:#9ca3af'>
+    Compara o preço de mercado (PLD × carga) com o custo físico real de operação
+    (geração térmica × CVU + hidro × CMO + encargos ESS).
+    Dados ESS obtidos via API CCEE — processados em memória.
+    </span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Verificar colunas novas
+    new_cols = ["ess_cost_Rh", "physical_generation_cost_Rh",
+                "market_cost_Rh", "spdi", "encargo_intensity_index"]
+    missing = [col for col in new_cols if col not in df.columns]
+    if missing:
+        st.warning(
+            f"Colunas ainda não calculadas: `{'`, `'.join(missing)}`. "
+            "Verifique se `ccee_charges.py` está instalado e a API CCEE está acessível."
+        )
+
+    # Seletor de IMR
+    imr_options = {k: v for k, v in {
+        "infra_marginal_physical": "IMR Físico ← recomendado",
+        "infra_marginal_market":   "IMR Mercado",
+        "infra_marginal_system":   "IMR Sistêmico",
+    }.items() if k in df.columns}
+
+    imr_col = "infra_marginal_physical"
+    if imr_options:
+        imr_col = st.selectbox(
+            "Métrica de Renda Infra-Marginal",
+            options=list(imr_options.keys()),
+            format_func=lambda x: imr_options.get(x, x),
+        )
+
+    # KPIs
+    def _last30(col):
+        if col not in df.columns:
+            return pd.Series(dtype=float)
+        s = pd.to_numeric(df[col], errors="coerce").dropna()
+        cut = s.index.max() - pd.Timedelta(days=30) if not s.empty else s.index.min()
+        return s[s.index >= cut]
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    imr_s  = _last30(imr_col)
+    spdi_s = _last30("spdi")
+    eii_s  = _last30("encargo_intensity_index")
+    hsc_s  = _last30("Hidden_system_cost_R$/MWh")
+    ess_s  = _last30("ess_cost_Rh")
+
+    def _fmt(s, pct=False, suffix=""):
+        if s.empty or s.isna().all():
+            return "N/D"
+        v = float(s.median())
+        return f"{v:.1%}" if pct else f"R$ {v:,.0f}{suffix}"
+
+    k1.metric("IMR Corrigido mediana (30d)",
+              _fmt(_last30("infra_marginal_rent_corrigido")),
+              help="IMR = Receita − (T_total + Encargos)")
+    k2.metric("Structural Gap mediana (30d)",
+              _fmt(_last30("Structural_gap_R$/MWh"), suffix="/MWh"),
+              help="PLD − Custo real unitário")
+    k3.metric("SPDI mediana (30d)",
+              "N/D" if spdi_s.empty else f"{float(spdi_s.median()):.2f}×")
+    k4.metric("Hidden Cost mediana (30d)",
+              _fmt(hsc_s, suffix="/MWh"))
+    k5.metric("Encargo Intensity (30d)", _fmt(eii_s, pct=True))
+
+    ka, kb, kc = st.columns(3)
+    ka.metric("Encargos Total mediana", _fmt(_last30("Encargos_total_R$/h"), suffix="/h"))
+    kb.metric("Custo Real mediana",     _fmt(_last30("Custo_real_R$/h"),     suffix="/h"))
+    kc.metric("Custo Real Unitário",    _fmt(_last30("Custo_real_R$/MWh"),   suffix="/MWh"))
+
+    st.markdown("---")
+
+    gtabs = st.tabs([
+        "🌡 Heatmap IMR", "📈 SPDI", "💰 Decomposição Custos",
+        "📊 Encargo Intensity", "🔍 Fechamento Econômico", "📋 Tabela resumo",
+    ])
+
+    with gtabs[0]:
+        st.plotly_chart(_plot_imr_heatmap(df, imr_col), use_container_width=True, key="charges_heatmap")
+        if imr_col in df.columns:
+            _n_out = int((pd.to_numeric(df[imr_col], errors="coerce").dropna() < _IMR_OUTLIER_FLOOR).sum())
+            if _n_out > 0:
+                st.caption(f"⚠️ {_n_out} registros abaixo de R$ -250M/h removidos (outliers).")
+            st.markdown("- IMR ≈ 0 → preço economicamente consistente com o sistema físico  \n- IMR > 0 (verde) → presença de renda infra-marginal / prêmio estrutural  \n- IMR < 0 (vermelho) → custo sistêmico elevado ou distorções operativas não refletidas no preço")
+
+    with gtabs[1]:
+        st.plotly_chart(_plot_spdi_series(df), use_container_width=True, key="charges_spdi")
+        st.markdown("**≈ 1,0** alinhado · **> 1,3** prêmio estrutural · **> 1,6** distorção forte")
+
+    with gtabs[2]:
+        st.plotly_chart(_plot_ess_vs_market(df), use_container_width=True, key="charges_ess_market")
+        st.caption("Custo Oculto = ESS + GFOM (despacho fora do mérito).")
+
+    with gtabs[3]:
+        st.plotly_chart(_plot_eii_series(df), use_container_width=True, key="charges_eii")
+        st.markdown("**< 5%** normal · **5–10%** estresse · **> 10%** intervenção elevada")
+
+    with gtabs[4]:
+        st.markdown("#### Fechamento Econômico Completo")
+        st.caption("Separação entre (a) custo físico modelado, (b) encargos ocultos e (c) receita de mercado.")
+
+        # Structural Gap série diária
+        _sg_col = "Structural_gap_R$/MWh"
+        _cr_col = "Custo_real_R$/MWh"
+        if _sg_col in df.columns or _cr_col in df.columns:
+            _fig_gap = go.Figure()
+            if "pld" in df.columns:
+                _s = pd.to_numeric(df["pld"], errors="coerce").dropna().resample("D").mean()
+                _fig_gap.add_trace(go.Scatter(x=_s.index, y=_s.values,
+                    name="PLD (R$/MWh)", line=dict(color="#f59e0b", width=2)))
+            if _cr_col in df.columns:
+                _s = pd.to_numeric(df[_cr_col], errors="coerce").dropna().resample("D").mean()
+                _fig_gap.add_trace(go.Scatter(x=_s.index, y=_s.values,
+                    name="Custo Real (R$/MWh)", line=dict(color="#f87171", width=2)))
+            if _sg_col in df.columns:
+                _daily_sg = pd.to_numeric(df[_sg_col], errors="coerce").dropna().resample("D").mean()
+                _fig_gap.add_trace(go.Bar(x=_daily_sg.index, y=_daily_sg.values,
+                    name="Structural Gap", opacity=0.6,
+                    marker_color=["#34d399" if v >= 0 else "#f87171"
+                                  for v in _daily_sg.values]))
+            _fig_gap.add_hline(y=0, line_color="#6b7280", line_dash="dot")
+            _fig_gap.update_layout(
+                template="plotly_dark", paper_bgcolor=_COLORS["bg"],
+                plot_bgcolor=_COLORS["panel"], height=360,
+                margin=dict(l=40, r=20, t=45, b=30),
+                title=dict(text="PLD vs Custo Real + Structural Gap (R$/MWh)",
+                           font=dict(size=13, color="#e5e7eb")),
+                xaxis=dict(gridcolor="#1f2937"), yaxis=dict(gridcolor="#1f2937"),
+                legend=dict(orientation="h", y=1.05),
+            )
+            st.plotly_chart(_fig_gap, use_container_width=True, key="charges_structural_gap")
+
+        # Cascata de custo
+        st.markdown("##### Cascata de custo (médias do período)")
+        _wf = []
+        for lbl, col, sign in [
+            ("Receita (sin_cost)",      "market_cost_Rh",               1),
+            ("− Custo Físico (T_total)","t_total",                      -1),
+            ("− Encargos",              "Encargos_total_R$/h",          -1),
+            ("= IMR Corrigido",         "infra_marginal_rent_corrigido", 1),
+        ]:
+            if col in df.columns:
+                v = float(pd.to_numeric(df[col], errors="coerce").mean())
+                _wf.append({"Componente": lbl, "R$/h (média)": round(v * sign, 0)})
+        if _wf:
+            st.dataframe(pd.DataFrame(_wf).set_index("Componente"), use_container_width=True)
+
+        st.info(
+            "**IMR Corrigido** = Receita − (T_total + Encargos)  \n"
+            "Quando IMR Corrigido < IMR Original → encargos absorvendo prêmio aparente."
+        )
+
+    with gtabs[5]:
+        cols_show = [
+            ("market_cost_Rh",                 "Custo Mercado (R$/h)"),
+            ("physical_generation_cost_Rh",    "Custo Físico (R$/h)"),
+            ("Encargos_total_R$/h",            "Encargos Total (R$/h)"),
+            ("ESS_total_R$",                   "ESS Total (R$/h)"),
+            ("constrained_off_R$",             "Constrained-Off (R$/h)"),
+            ("constrained_on_R$",              "Constrained-On (R$/h)"),
+            ("seguranca_energetica_R$",        "Segurança Energética (R$/h)"),
+            ("reserva_operativa_R$",           "Reserva Operativa (R$/h)"),
+            ("Custo_real_R$/h",                "Custo Real do Sistema (R$/h)"),
+            ("Custo_real_R$/MWh",              "Custo Real Unitário (R$/MWh)"),
+            ("Hidden_system_cost_R$/MWh",      "Hidden System Cost (R$/MWh)"),
+            ("infra_marginal_rent_corrigido",  "IMR Corrigido (R$/h)"),
+            ("infra_marginal_physical",        "IMR Físico (R$/h)"),
+            ("infra_marginal_market",          "IMR Mercado (R$/h)"),
+            ("Structural_gap_R$/MWh",          "Structural Gap (R$/MWh)"),
+            ("spdi",                           "SPDI (×)"),
+            ("encargo_intensity_index",        "EII (%)"),
+            ("structural_drift",               "Structural Drift"),
+        ]
+        rows = []
+        for col, lbl in cols_show:
+            if col not in df.columns:
+                continue
+            s = pd.to_numeric(df[col], errors="coerce").dropna()
+            if s.empty:
+                continue
+            rows.append({
+                "Indicador":    lbl,
+                "Mínimo":       f"{s.min():,.2f}",
+                "Mediana":      f"{s.median():,.2f}",
+                "Média":        f"{s.mean():,.2f}",
+                "Máximo":       f"{s.max():,.2f}",
+                "Últimas 720h": f"{s.iloc[-720:].mean():,.2f}" if len(s) >= 720 else "N/D",
+            })
+        if rows:
+            st.dataframe(pd.DataFrame(rows).set_index("Indicador"), use_container_width=True)
+        else:
+            st.info("Dados de encargos não disponíveis — verifique a conexão com a API CCEE.")
+
+
 def render_premium_tab(df: pd.DataFrame) -> None:
     """Renderiza a tab premium. Chamar dentro de `with tabs[N]:` no app.py."""
 

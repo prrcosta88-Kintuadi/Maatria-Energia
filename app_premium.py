@@ -13,7 +13,15 @@ import duckdb
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from premium_engine import render_premium_tab
+from premium_engine import render_premium_tab, render_charges_tab
+try:
+    from ccee_charges import enrich_df as _enrich_df
+    _CHARGES_OK = True
+except (ImportError, Exception) as _charges_err:
+    _CHARGES_OK = False
+    def _enrich_df(df): return df  # fallback sem encargos
+from auth import render_login, render_sidebar, simulation_guard, get_current_user
+from profile import render_profile_page
 
 
 # ── Neon PostgreSQL ───────────────────────────────────────────────────────────
@@ -428,6 +436,7 @@ def _build_hourly_df_cached(_token: str) -> pd.DataFrame:
         thermal_s = _col("thermal")
         nuclear_s = _col("nuclear")
 
+        df["load"]         = load_s          # necessário para ccee_charges.enrich_df
         df["net_load"]     = load_s - solar_s.fillna(0) - wind_s.fillna(0)
         df["carga_total"]  = load_s
         df["renov_total"]  = solar_s.fillna(0) + wind_s.fillna(0)
@@ -503,7 +512,8 @@ def _build_hourly_df_cached(_token: str) -> pd.DataFrame:
         df["t_prudencia"]     = np.where(_cmo_s > _pld_s, df["Hydro_preserved"] * (_cmo_s - _pld_s), 0.0)
         df["t_hidro"]         = df["Water_value_R$/h"]
         df["t_eletric"]       = df["thermal_merit_cost"]
-        df["t_sistemica"]     = df["geracao_total"] * (_cmo_s - _pld_s)
+        # t_sistemica corrigida: distorção |PLD−CMO| × carga líquida
+        df["t_sistemica"]     = ((_pld_s - _cmo_s).abs() * df["net_load"].fillna(0)).where(_pld_s.notna() & _cmo_s.notna(), np.nan)
         df["t_total"]         = df["t_eletric"] + df["t_hidro"] + df["t_prudencia"] + df["t_sistemica"]
         df["infra_marginal_rent"] = df["sin_cost"] - df["t_total"]
 
@@ -553,6 +563,11 @@ def _build_hourly_df_cached(_token: str) -> pd.DataFrame:
         else:
             df["Load_norm"] = np.nan
 
+    # Enriquecer com encargos ESS e métricas de custo físico (em memória)
+    try:
+        df = _enrich_df(df)
+    except Exception:
+        pass
     return _ensure_hourly(df)
 
 
@@ -802,108 +817,14 @@ def _latest_operational_dates(core: Dict[str, Any]) -> Dict[str, Optional[date]]
 
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# AUTENTICAÇÃO
-# Configurar no Render → Environment Variables:
-#   PREMIUM_USERS = usuario1:senha1,usuario2:senha2
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _load_allowed_users() -> dict:
-    import hashlib
-    users = {}
-    for pair in os.getenv("PREMIUM_USERS", "").split(","):
-        pair = pair.strip()
-        if ":" not in pair:
-            continue
-        user, pwd = pair.split(":", 1)
-        user = user.strip().lower()
-        pwd  = pwd.strip()
-        if user and pwd:
-            users[user] = hashlib.sha256(pwd.encode()).hexdigest()
-    return users
-
-
-def _check_credentials(username: str, password: str) -> bool:
-    import hashlib
-    users = _load_allowed_users()
-    if not users:
-        return False
-    h = hashlib.sha256(password.encode()).hexdigest()
-    return users.get(username.strip().lower()) == h
-
-
-def _render_login() -> bool:
-    if "authenticated" not in st.session_state:
-        st.session_state["authenticated"] = False
-    if st.session_state["authenticated"]:
-        return True
-
-    st.markdown("""
-    <style>
-    .login-container{max-width:420px;margin:80px auto 0 auto;background:#111827;
-        border:1px solid #c8a44d44;border-radius:16px;padding:40px 36px}
-    .login-title{text-align:center;font-size:1.3rem;font-weight:700;color:#c8a44d;
-        letter-spacing:.08em;text-transform:uppercase;margin-bottom:4px}
-    .login-sub{text-align:center;font-size:.78rem;color:#6b7280;margin-bottom:28px}
-    .badge-premium{display:inline-block;background:#c8a44d22;border:1px solid #c8a44d66;
-        color:#c8a44d;font-size:.68rem;font-weight:700;letter-spacing:.14em;
-        padding:3px 10px;border-radius:4px;text-transform:uppercase}
-    </style>
-    """, unsafe_allow_html=True)
-
-    _, col, _ = st.columns([1, 1.6, 1])
-    with col:
-        st.markdown("""
-        <div class='login-container'>
-          <div style='text-align:center;margin-bottom:12px'>
-            <span class='badge-premium'>✦ Acesso Premium</span>
-          </div>
-          <div class='login-title'>MAÁTria Energia</div>
-          <div class='login-sub'>Plataforma de Análise do Mercado Elétrico Brasileiro</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        username = st.text_input("Usuário", placeholder="seu usuário",
-                                 key="login_user", label_visibility="collapsed")
-        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
-        password = st.text_input("Senha", type="password", placeholder="sua senha",
-                                 key="login_pwd", label_visibility="collapsed")
-        st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
-
-        if st.button("Entrar →", type="primary", use_container_width=True):
-            if not username or not password:
-                st.error("Preencha usuário e senha.")
-            elif _check_credentials(username, password):
-                st.session_state["authenticated"] = True
-                st.session_state["login_user_name"] = username.strip().lower()
-                st.rerun()
-            else:
-                st.error("Usuário ou senha incorretos.")
-
-        st.markdown(
-            "<div style='text-align:center;margin-top:20px;font-size:.72rem;color:#4b5563'>"
-            "Acesso restrito a assinantes. Dúvidas: maatriaenergia@gmail.com</div>",
-            unsafe_allow_html=True,
-        )
-    return False
-
-
-def _render_logout() -> None:
-    user = st.session_state.get("login_user_name", "")
-    with st.sidebar:
-        st.markdown(f"**Usuário:** `{user}`")
-        if st.button("Sair", use_container_width=True):
-            st.session_state["authenticated"] = False
-            st.session_state["login_user_name"] = ""
-            st.rerun()
-
-
 def main():
     st.set_page_config(page_title="MAÁTria Energia | Premium", layout="wide", initial_sidebar_state="collapsed")
 
-    if not _render_login():
+    # ── Autenticação via Neon (monetization.py + auth.py) ──────────────
+    if not render_login():
         st.stop()
-    _render_logout()
+    render_sidebar()
+    user = get_current_user()
 
     st.markdown(
         """
@@ -916,12 +837,88 @@ def main():
           .tabs-layer { background: linear-gradient(180deg, #0b1222 0%, #070d1a 100%); padding:0.01rem 0.01rem 0.01rem 0.01rem; }
           label { color:#ffffff !important; font-weight:700 !important; }
           .stTabs [data-baseweb="tab-list"] { gap: 0.15rem; flex-wrap: nowrap !important; overflow-x: auto !important; scrollbar-width: thin; }
-          .stTabs [data-baseweb="tab"] { color:#e5e7eb; border-radius:6px; padding:0.25rem 0.45rem; font-size:0.78rem; white-space:nowrap; }
+          .stTabs [data-baseweb="tab"] { color:#e5e7eb; border-radius:6px; padding:0.2rem 0.2rem; font-size:0.3rem; white-space:nowrap; }
           .stTabs [aria-selected="true"] { background:#152238 !important; color:#f8fafc !important; border:1px solid #c8a44d !important; }
+          /* ── Botão ANALISAR (form submit) ── */
           div[data-testid="stFormSubmitButton"] > button {
-            background:#d4af37 !important; color:#111827 !important; font-weight:800 !important; border:0px solid #b38f2b !important;
+            background:#c8a44d !important; color:#111827 !important;
+            font-weight:700 !important; border:none !important;
+            transition: background .15s;
           }
-          div[data-testid="stFormSubmitButton"] > button:hover { background:#e3bf4c !important; color:#000 !important; }
+          div[data-testid="stFormSubmitButton"] > button:hover,
+          div[data-testid="stFormSubmitButton"] > button:active,
+          div[data-testid="stFormSubmitButton"] > button:focus {
+            background:#e3bf4c !important; color:#000 !important; outline:none !important;
+          }
+
+          /* ── Todos os st.button, download, popover ── */
+          div[data-testid="stButton"] > button,
+          div[data-testid="stDownloadButton"] > button,
+          div[data-testid="stPopover"] > button,
+          button[kind="secondary"],
+          button[kind="primary"] {
+            background:#c8a44d !important; color:#111827 !important;
+            font-weight:700 !important; border:none !important;
+            transition: background .15s;
+          }
+          div[data-testid="stButton"] > button:hover,
+          div[data-testid="stButton"] > button:active,
+          div[data-testid="stButton"] > button:focus,
+          div[data-testid="stDownloadButton"] > button:hover,
+          div[data-testid="stDownloadButton"] > button:active,
+          div[data-testid="stDownloadButton"] > button:focus,
+          div[data-testid="stPopover"] > button:hover,
+          div[data-testid="stPopover"] > button:active,
+          div[data-testid="stPopover"] > button:focus,
+          button[kind="secondary"]:hover,
+          button[kind="secondary"]:active,
+          button[kind="secondary"]:focus,
+          button[kind="primary"]:hover,
+          button[kind="primary"]:active,
+          button[kind="primary"]:focus {
+            background:#e3bf4c !important; color:#000 !important; outline:none !important;
+            box-shadow: none !important;
+          }
+          /* Garantir que botões nunca fiquem brancos no clique */
+          button:active, button:focus {
+            background:#c8a44d !important; color:#111827 !important;
+            box-shadow: none !important; outline: none !important;
+          }
+
+          /* ── Expanders (ex.: "1) Propósito da Plataforma") ── */
+          details[data-testid="stExpander"] summary,
+          div[data-testid="stExpander"] summary {
+            background:#c8a44d !important; color:#111827 !important;
+            font-weight:700 !important; border-radius:6px !important;
+            padding:0.45rem 0.75rem !important; border:none !important;
+            transition: background .15s;
+          }
+          details[data-testid="stExpander"] summary:hover,
+          div[data-testid="stExpander"] summary:hover {
+            background:#e3bf4c !important;
+          }
+          /* Seta do expander em preto para contrastar com fundo dourado */
+          details[data-testid="stExpander"] summary svg,
+          div[data-testid="stExpander"] summary svg {
+            fill:#111827 !important; stroke:#111827 !important;
+          }
+
+          /* ── Inputs de texto e textarea — evitar branco no default ── */
+          .stTextInput input,
+          .stTextArea textarea {
+            background:#111827 !important; color:#f3f4f6 !important;
+            border:1px solid #374151 !important; border-radius:6px !important;
+          }
+          .stTextInput input:focus,
+          .stTextArea textarea:focus {
+            background:#111827 !important; color:#f3f4f6 !important;
+            border:1px solid #c8a44d !important; outline:none !important;
+            box-shadow: 0 0 0 2px #c8a44d33 !important;
+          }
+          .stTextInput input::placeholder,
+          .stTextArea textarea::placeholder {
+            color:#6b7280 !important;
+          }
           .cards-row { margin-bottom: 5px; }
                   /* NOVO: Reduzir espaçamento entre elementos */
           .element-container {
@@ -989,6 +986,40 @@ def main():
             unsafe_allow_html=True,
         )
         with st.popover("Enviar mensagem", use_container_width=True):
+            # CSS inline para garantir estilo dentro do popover
+            st.markdown("""
+            <style>
+              div[data-testid="stPopover"] .stTextInput input,
+              div[data-testid="stPopover"] .stTextArea textarea,
+              .stPopover .stTextInput input,
+              .stPopover .stTextArea textarea {
+                background:#111827 !important; color:#f3f4f6 !important;
+                border:1px solid #374151 !important; border-radius:6px !important;
+              }
+              div[data-testid="stPopover"] .stTextInput input:focus,
+              div[data-testid="stPopover"] .stTextArea textarea:focus,
+              .stPopover .stTextInput input:focus,
+              .stPopover .stTextArea textarea:focus {
+                background:#111827 !important; color:#f3f4f6 !important;
+                border:1px solid #c8a44d !important; outline:none !important;
+                box-shadow: 0 0 0 2px #c8a44d33 !important;
+              }
+              div[data-testid="stPopover"] .stTextInput input::placeholder,
+              div[data-testid="stPopover"] .stTextArea textarea::placeholder {
+                color:#6b7280 !important;
+              }
+              div[data-testid="stPopover"] button {
+                background:#c8a44d !important; color:#111827 !important;
+                font-weight:700 !important; border:none !important;
+              }
+              div[data-testid="stPopover"] button:hover,
+              div[data-testid="stPopover"] button:active,
+              div[data-testid="stPopover"] button:focus {
+                background:#e3bf4c !important; color:#000 !important;
+                outline:none !important; box-shadow:none !important;
+              }
+            </style>
+            """, unsafe_allow_html=True)
             st.markdown(
                 "<span style='color:#c8a44d;font-weight:600'>MAÁTria Energia</span> — "
                 "sua mensagem chega diretamente à equipe.",
@@ -1060,14 +1091,14 @@ def main():
     st.markdown("<div class='full-bleed-line'></div>", unsafe_allow_html=True)
 
     tabs = st.tabs([
+        "👤 Meu Perfil",
         "📸 Fotografia Operativa",
-        "💰 Decomposição Econômica",
-        "⚡ Curtailment & Restrições",
-        "🧠 Coerência Operativa",
-        "🔋 Simulação BESS",
-        "📊 Matriz Horária do SIN",
-        "📘 Metodologia & Glossário",
+        "🔋 Curtailment & Sim. BESS",
+        "⚡ Encargos & Custo Físico",
         "✦ Price Justification Engine",
+        "🧠 Coerência Oper.",
+        "📊 Matriz Horária (SIN)",
+        "📘 Metodologia & Glossário",
     ])
 
     st.markdown("<div class='full-bleed-line'></div>", unsafe_allow_html=True)
@@ -1082,6 +1113,18 @@ def main():
 
     selected_start = st.session_state.get("date_start", default_day)
     selected_end = st.session_state.get("date_end", default_day)
+
+    # Restrição de histórico para plano free: máx 30 dias
+    _user_now = get_current_user()
+    if _user_now and getattr(_user_now, "history_days", None):
+        _hist_limit = pd.Timestamp.now().date() - pd.Timedelta(days=_user_now.history_days)
+        if selected_start < _hist_limit:
+            selected_start = _hist_limit
+            st.info(
+                f"⚠️ Seu plano **{_user_now.plan_type.title()}** permite apenas "
+                f"{_user_now.history_days} dias de histórico. "
+                "Faça upgrade para acessar o histórico completo."
+            )
 
     dff = df[(df.index.date >= selected_start) & (df.index.date <= selected_end)].copy()
     if dff.empty:
@@ -1122,6 +1165,9 @@ def main():
     total_sistemica = pd.to_numeric(dff.get("t_sistemica", pd.Series(dtype=float)), errors="coerce").sum(min_count=1)
     total_eletrica = pd.to_numeric(dff.get("t_eletric", pd.Series(dtype=float)), errors="coerce").sum(min_count=1)
     total_infra_marginal = pd.to_numeric(dff.get("infra_marginal_rent", pd.Series(dtype=float)), errors="coerce").sum(min_count=1)
+    total_encargos       = pd.to_numeric(dff.get("Encargos_total_R$/h", pd.Series(dtype=float)), errors="coerce").sum(min_count=1)
+    total_custo_real     = pd.to_numeric(dff.get("Custo_real_R$/h", pd.Series(dtype=float)), errors="coerce").sum(min_count=1)
+    total_imr_corrigido  = pd.to_numeric(dff.get("infra_marginal_rent_corrigido", pd.Series(dtype=float)), errors="coerce").sum(min_count=1)
     total_curt_loss = pd.to_numeric(dff.get("curtailment_loss", pd.Series(dtype=float)), errors="coerce").sum(min_count=1)
     total_gfom = pd.to_numeric(dff.get("gfom_pct", pd.Series(dtype=float)), errors="coerce").sum(min_count=1)
     total_isr = pd.to_numeric(dff.get("isr", pd.Series(dtype=float)), errors="coerce").sum(min_count=1)
@@ -1135,7 +1181,10 @@ def main():
         ("Custo Hídrico", _fmt_money_compact(total_agua), "#14b8a6"),
         ("Custo Elétrico", _fmt_money_compact(total_eletrica), "#FFEE00"),
         ("Custo Sistêmico", _fmt_money_compact(total_sistemica), "#004918"),
-        ("Custo Infra-marginal", _fmt_money_compact(total_infra_marginal), "#3D0049"),
+        ("Custo Infra-marginal",    _fmt_money_compact(total_infra_marginal), "#3D0049"),
+        ("Encargos do Sistema",      _fmt_money_compact(total_encargos),      "#7c3aed"),
+        ("Custo Real do Sistema",    _fmt_money_compact(total_custo_real),    "#dc2626"),
+        ("IMR Corrigido",            _fmt_money_compact(total_imr_corrigido), "#059669"),
         ("Curtailment", f"{_fmt_ptbr(current.get('curtail_total', np.nan),2)} MWmed", "#a78bfa"),
         ("Valor (R$) Curtailment", _fmt_money_compact(total_curt_loss), "#eab308"),
         ("GFOM", _fmt_ptbr(total_gfom,2), "#38bdf8"),
@@ -1182,6 +1231,13 @@ def main():
         st.dataframe(_plot_df(dff[card_cols]), width="stretch", height=320)
 
     with tabs[0]:
+        _profile_user = get_current_user()
+        if _profile_user:
+            render_profile_page(_profile_user)
+        else:
+            st.warning("Faça login para acessar seu perfil.")
+
+    with tabs[1]:
         _ref_dates = [d for d in (latest_operational.get("load"), latest_operational.get("generation")) if d]
         _last_date = max(_ref_dates).strftime("%d/%m/%Y") if _ref_dates else "N/D"
         st.caption(f"Dados extraídos até o dia **{_last_date}**.")
@@ -1191,18 +1247,29 @@ def main():
         labels = {
             "hydro": "Hidro", "thermal": "Térmica", "nuclear": "Nuclear", "solar": "Solar", "wind": "Eólica"
         }
+        _single_day = (selected_start == selected_end)
+        _n_days = (selected_end - selected_start).days + 1
+        if _single_day:
+            _dff_gen = dff_photo
+        elif _n_days <= 7:
+            _dff_gen = dff
+        else:
+            _gen_cols_r = [col for col in ["hydro","thermal","nuclear","solar","wind",
+                                           "carga_total","net_load"] if col in dff.columns]
+            _dff_gen = dff[_gen_cols_r].resample("D").mean()
         for src in ["hydro", "thermal", "nuclear", "solar", "wind"]:
-            if src in dff_photo.columns:
-                fig.add_bar(x=dff_photo.index, y=dff_photo[src], name=labels[src])
-        if "carga_total" in dff_photo.columns:
-            fig.add_scatter(x=dff_photo.index, y=dff_photo["carga_total"], name="Carga Total", mode="lines")
-        if "net_load" in dff_photo.columns:
-            fig.add_scatter(x=dff_photo.index, y=dff_photo["net_load"], name="Carga Líquida", mode="lines")
+            if src in _dff_gen.columns:
+                fig.add_bar(x=_dff_gen.index, y=_dff_gen[src], name=labels[src])
+        if "carga_total" in _dff_gen.columns:
+            fig.add_scatter(x=_dff_gen.index, y=_dff_gen["carga_total"], name="Carga Total", mode="lines")
+        if "net_load" in _dff_gen.columns:
+            fig.add_scatter(x=_dff_gen.index, y=_dff_gen["net_load"], name="Carga Líquida", mode="lines")
         fig.update_layout(template="plotly_dark", barmode="stack", height=420)
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, width="stretch", key="foto_gen_chart")
         with st.expander("Ver dados do gráfico (hora a hora)"):
-            plot_cols = [c for c in ["carga_total", "net_load", "solar", "wind", "hydro", "thermal", "nuclear"] if c in dff_photo.columns]
-            st.dataframe(_plot_df(dff_photo[plot_cols]), width="stretch", height=280)
+            plot_cols = [col for col in ["carga_total","net_load","solar","wind",
+                                         "hydro","thermal","nuclear"] if col in _dff_gen.columns]
+            st.dataframe(_plot_df(_dff_gen[plot_cols]), width="stretch", height=280)
 
         # ── Gráfico PLD e CMO por submercado ────────────────────────────────────
         st.markdown("#### PLD e CMO por Submercado")
@@ -1311,219 +1378,26 @@ def main():
                 if not _tbl.empty:
                     st.dataframe(_tbl, width="stretch", height=260)
 
-    with tabs[1]:
-        pdf = _plot_df(dff)
-        decomp_cols = [c for c in ["t_hidro", "t_sistemica", "t_prudencia", "t_eletric"] if c in pdf.columns]
-        if decomp_cols:
-            st.caption("Montagem: decomposição econômica horária `T_total = T_hidro + T_sistêmica + T_prudência`.")
-            label_map = {
-                "t_hidro": "Custo Hídrico", "t_sistemica": "Custo Sistêmico", "t_prudencia": "Custo Prudencial", "t_eletric": "Custo elétrico"
-            }
-            fig = go.Figure()
-            fig = px.bar(
-                pdf,
-                x="instante",
-                y=decomp_cols,
-                template="plotly_dark",
-                barmode="stack"
-            )
-            # adicionar linha
-            fig.add_scatter(
-                x=pdf["instante"],
-                y=pdf["sin_cost"],
-                mode="lines",
-                name="Custo Total SIN",
-                line=dict(width=3)
-            ) 
-            fig.update_layout(title="Decomposição horária empilhada (R$/h)")
-            st.plotly_chart(fig, width="stretch")
-            with st.expander("Ver dados do gráfico (hora a hora)"):
-                st.dataframe(pdf[["instante"] + decomp_cols], width="stretch", height=280)
-
-        if {"thermal", "thermal_prudential_dispatch"}.issubset(dff.columns):
-            g2 = _plot_df(dff[["thermal", "thermal_prudential_dispatch"]])
-            thermal_labels = {
-            "thermal": "Geração Térmica Total", "thermal_prudential_dispatch": "Geração Térmica Prudencial"
-            }
-            fig2 = px.line(g2, x="instante", y=["thermal", "thermal_prudential_dispatch"], template="plotly_dark", labels=thermal_labels)
-            fig2.update_layout(title="Despacho térmico total vs despacho prudencial (MWmed)")
-            st.plotly_chart(fig2, width="stretch")
-            st.caption("A segunda curva mostra a parcela térmica associada à prudência operativa.")
-            with st.expander("Ver dados do gráfico térmico (hora a hora)"):
-                st.dataframe(g2, width="stretch", height=260)
-
-        # ===============================
-        # HEATMAP – INFRA MARGINAL RENT
-        # ===============================
-
-
-        if "infra_marginal_rent" in df.columns:
-
-            st.subheader("Mapa estrutural — Renda Infra-Marginal do SIN")
-            st.caption(
-                "Mapa calculado sobre toda a base histórica disponível. "
-                "Os dados são diários, mas o eixo Y marca as mudanças de mês."
-            )
-
-            heat_df = df.copy()
-            
-            # FILTRO DE OUTLIERS - remover valores menores que -200 milhões
-            outliers_removidos = (heat_df["infra_marginal_rent"] < -400_000_000).sum()
-            heat_df = heat_df[heat_df["infra_marginal_rent"] >= -400_000_000]
-            
-            if outliers_removidos > 0:
-                st.info(f"🔍 Foram removidos {outliers_removidos} registros com valores inferiores a -200 milhões R$/h (outliers).")
-
-            heat_df["data"] = heat_df.index.date
-            heat_df["hora"] = heat_df.index.hour
-
-            pivot = heat_df.pivot_table(
-                index="data",
-                columns="hora",
-                values="infra_marginal_rent",
-                aggfunc="mean"
-            )
-
-            # verificar se há dados após o filtro
-            if pivot.empty:
-                st.warning("⚠️ Não há dados disponíveis após a remoção dos outliers.")
-            else:
-                # converter índice para datetime para manipular meses
-                pivot.index = pd.to_datetime(pivot.index)
-
-                # localizar início de cada mês
-                month_starts = pivot.index.to_series().groupby(
-                    [pivot.index.year, pivot.index.month]
-                ).first()
-
-                y_ticks = pd.to_datetime(month_starts.values)
-                y_labels = [d.strftime("%m-%Y") for d in y_ticks]
-
-                fig_heat = go.Figure(
-                    data=go.Heatmap(
-                        z=pivot.values,
-                        x=pivot.columns,
-                        y=pivot.index,
-                        colorscale="RdBu_r",
-                        colorbar=dict(title="R$/h"),
-                        xgap=2,   # espaço entre horas
-                        ygap=0    # pequeno espaço entre dias
-                    )
-                )
-
-                fig_heat.update_layout(
-                    template="plotly_dark",
-                    height=5000,
-                    xaxis=dict(
-                        title="Hora do dia",
-                        tickmode="linear",
-                        dtick=1
-                    ),
-                    yaxis=dict(
-                        title="Data",
-                        tickmode="array",
-                        tickvals=y_ticks,
-                        ticktext=y_labels
-                    )
-                )
-
-                st.plotly_chart(fig_heat, width="stretch")
-
-                with st.expander("Ver dados do mapa de calor (base completa)"):
-                    st.dataframe(pivot, width="stretch", height=300)
-
     with tabs[2]:
         cdf = _plot_df(dff)
         cols = [c for c in ["curtail_solar", "curtail_wind", "curtail_total"] if c in cdf.columns]
         if cols:
             st.caption("Montagem: curtailment horário por fonte (solar/eólica) e total agregado.")
-            fig = go.Figure()
+            _curt_y = [col for col in ["curtail_solar", "curtail_wind"] if col in cdf.columns]
             fig = px.bar(
-                pdf,
+                cdf,
                 x="instante",
-                y=["curtail_solar", "curtail_wind"],
+                y=_curt_y if _curt_y else cols,
                 template="plotly_dark",
                 barmode="stack"
             )
-            #fig = px.bar(cdf, x="instante", y=cols, template="plotly_dark", barmode="group")
-            st.plotly_chart(fig, width="stretch")
+            st.plotly_chart(fig, width="stretch", key="curtail_chart")
             with st.expander("Ver dados do gráfico (hora a hora)"):
                 st.dataframe(cdf[["instante"] + cols], width="stretch", height=280)
         st.caption("Distribuição por tipo de restrição disponível no painel horário do core quando fornecido pelo ONS.")
 
-    with tabs[3]:
-        # Ler os valores de normalizações diretamente do dff (df filtrado)
-        # EAR_norm, ENA_norm e Load_norm são calculados hora a hora no df
-        # e já expandidos corretamente para 24h/dia via resample+ffill
-        def _last_valid(col: str) -> float:
-            if col in dff.columns:
-                s = pd.to_numeric(dff[col], errors="coerce").dropna()
-                return float(s.iloc[-1]) if not s.empty else np.nan
-            return np.nan
-
-        _ear_norm   = _last_valid("EAR_norm")
-        _ena_norm   = _last_valid("ENA_norm")
-        _load_norm  = _last_valid("Load_norm")
-
-        metrics = {
-            "Risk Gap":      current.get("risk_gap", np.nan),
-            "CVaR":          current.get("cvar_implicit", np.nan),
-            "EAR_norm":      _ear_norm,
-            "ENA_norm":      _ena_norm,
-            "Load pressure": _load_norm,
-        }
-
-        def _safe(v: float, default: float = 0.0) -> float:
-            return default if pd.isna(v) else float(v)
-
-        metrics_norm = {
-            "risk": np.tanh(_safe(metrics["Risk Gap"]) / 300),
-            "cvar": _safe(metrics["CVaR"]) / 100,
-            "ear":  1 - _safe(metrics["EAR_norm"], 0.5),   # 0.5 se ausente (neutro)
-            "ena":  1 - _safe(metrics["ENA_norm"], 0.5),
-            "load": abs(_safe(metrics["Load pressure"], 1.0) - 1),
-        }
-
-        score_vals = [abs(v) for v in metrics_norm.values() if pd.notna(v)]
-        coherence = 100 * (1 - np.mean(score_vals)) if score_vals else np.nan
-        coherence = float(np.clip(coherence, 0, 100)) if pd.notna(coherence) else np.nan
-        color = "🟢" if pd.notna(coherence) and coherence >= 70 else (
-                "🟡" if pd.notna(coherence) and coherence >= 40 else "🔴")
-
-        st.metric("Métrica de Coerência do SIN", "-" if pd.isna(coherence) else f"{coherence:.1f}")
-        st.markdown(f"Classificação: {color}")
-
-        # Mostrar detalhamento das métricas com labels legíveis
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.markdown("**Métricas base**")
-            st.json({
-                "EAR_norm":      round(_ear_norm, 4)  if pd.notna(_ear_norm)  else None,
-                "ENA_norm":      round(_ena_norm, 4)  if pd.notna(_ena_norm)  else None,
-                "Load pressure": round(_load_norm, 4) if pd.notna(_load_norm) else None,
-                "CVaR (R$/MWh)": round(float(metrics["CVaR"]), 2) if pd.notna(metrics["CVaR"]) else None,
-                "Risk Gap":      round(float(metrics["Risk Gap"]), 2) if pd.notna(metrics["Risk Gap"]) else None,
-            })
-        with col_b:
-            st.markdown("**Scores normalizados (0 = ideal)**")
-            st.json({k: round(float(v), 4) if pd.notna(v) else None
-                     for k, v in metrics_norm.items()})
-
-        # Série temporal de EAR_norm e ENA_norm no período selecionado
-        norm_cols = [c for c in ["EAR_norm", "ENA_norm", "Load_norm"] if c in dff.columns]
-        if norm_cols:
-            _norm_df = dff[norm_cols].dropna(how="all").reset_index().rename(columns={"index": "instante"})
-            if not _norm_df.empty:
-                st.caption("Evolução das normalizações no período selecionado")
-                fig_norm = px.line(
-                    _norm_df, x="instante", y=norm_cols,
-                    template="plotly_dark",
-                    labels={"value": "Valor normalizado (0–1)", "variable": "Série"},
-                )
-                fig_norm.update_layout(yaxis_range=[0, 1.1])
-                st.plotly_chart(fig_norm, use_container_width=True)
-
-    with tabs[4]:
+        st.markdown("---")
+        st.markdown("### 🔋 Simulação BESS")
 
         sim_shift = st.slider(
             "Percentual de deslocamento do curtailment solar para 19h–23h",
@@ -1629,7 +1503,90 @@ def main():
             key="bess_generation_after"
         )
 
+    with tabs[3]:
+        render_charges_tab(df)
+
+    with tabs[4]:
+        can_sim, _u, sim_reason = simulation_guard()
+        if can_sim:
+            render_premium_tab(df)
+        else:
+            st.warning(f'⚠️ {sim_reason}')
+            st.info('Adquira créditos ou faça upgrade em **👤 Meu Perfil**.')
+
     with tabs[5]:
+        # Ler os valores de normalizações diretamente do dff (df filtrado)
+        # EAR_norm, ENA_norm e Load_norm são calculados hora a hora no df
+        # e já expandidos corretamente para 24h/dia via resample+ffill
+        def _last_valid(col: str) -> float:
+            if col in dff.columns:
+                s = pd.to_numeric(dff[col], errors="coerce").dropna()
+                return float(s.iloc[-1]) if not s.empty else np.nan
+            return np.nan
+
+        _ear_norm   = _last_valid("EAR_norm")
+        _ena_norm   = _last_valid("ENA_norm")
+        _load_norm  = _last_valid("Load_norm")
+
+        metrics = {
+            "Risk Gap":      current.get("risk_gap", np.nan),
+            "CVaR":          current.get("cvar_implicit", np.nan),
+            "EAR_norm":      _ear_norm,
+            "ENA_norm":      _ena_norm,
+            "Load pressure": _load_norm,
+        }
+
+        def _safe(v: float, default: float = 0.0) -> float:
+            return default if pd.isna(v) else float(v)
+
+        metrics_norm = {
+            "risk": np.tanh(_safe(metrics["Risk Gap"]) / 300),
+            "cvar": _safe(metrics["CVaR"]) / 100,
+            "ear":  1 - _safe(metrics["EAR_norm"], 0.5),   # 0.5 se ausente (neutro)
+            "ena":  1 - _safe(metrics["ENA_norm"], 0.5),
+            "load": abs(_safe(metrics["Load pressure"], 1.0) - 1),
+        }
+
+        score_vals = [abs(v) for v in metrics_norm.values() if pd.notna(v)]
+        coherence = 100 * (1 - np.mean(score_vals)) if score_vals else np.nan
+        coherence = float(np.clip(coherence, 0, 100)) if pd.notna(coherence) else np.nan
+        color = "🟢" if pd.notna(coherence) and coherence >= 70 else (
+                "🟡" if pd.notna(coherence) and coherence >= 40 else "🔴")
+
+        st.metric("Métrica de Coerência do SIN", "-" if pd.isna(coherence) else f"{coherence:.1f}")
+        st.markdown(f"Classificação: {color}")
+
+        # Mostrar detalhamento das métricas com labels legíveis
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown("**Métricas base**")
+            st.json({
+                "EAR_norm":      round(_ear_norm, 4)  if pd.notna(_ear_norm)  else None,
+                "ENA_norm":      round(_ena_norm, 4)  if pd.notna(_ena_norm)  else None,
+                "Load pressure": round(_load_norm, 4) if pd.notna(_load_norm) else None,
+                "CVaR (R$/MWh)": round(float(metrics["CVaR"]), 2) if pd.notna(metrics["CVaR"]) else None,
+                "Risk Gap":      round(float(metrics["Risk Gap"]), 2) if pd.notna(metrics["Risk Gap"]) else None,
+            })
+        with col_b:
+            st.markdown("**Scores normalizados (0 = ideal)**")
+            st.json({k: round(float(v), 4) if pd.notna(v) else None
+                     for k, v in metrics_norm.items()})
+
+        # Série temporal de EAR_norm e ENA_norm no período selecionado
+        norm_cols = [c for c in ["EAR_norm", "ENA_norm", "Load_norm"] if c in dff.columns]
+        if norm_cols:
+            _norm_df = dff[norm_cols].dropna(how="all").reset_index().rename(columns={"index": "instante"})
+            if not _norm_df.empty:
+                st.caption("Evolução das normalizações no período selecionado")
+                fig_norm = px.line(
+                    _norm_df, x="instante", y=norm_cols,
+                    template="plotly_dark",
+                    labels={"value": "Valor normalizado (0–1)", "variable": "Série"},
+                )
+                fig_norm.update_layout(yaxis_range=[0, 1.1])
+                st.plotly_chart(fig_norm, use_container_width=True)
+
+    with tabs[6]:
         matrix_cols = [
             c for c in ["pld","cmo_dominante","load","net_load","hydro","thermal","nuclear","solar","wind","gfom_pct","curtail_total","ear","ena","risk_gap","system_state"] if c in dff.columns
         ]
@@ -1639,433 +1596,321 @@ def main():
             st.dataframe(m, width="stretch", height=420)
             st.download_button("Exportar CSV", data=m.reset_index().to_csv(index=False).encode("utf-8"), file_name="matriz_horaria_sin.csv", mime="text/csv")
 
-    with tabs[6]:
+    with tabs[7]:
 
         st.markdown("### 📘 Metodologia & Glossário")
-        st.caption("Guia conceitual da plataforma: como os indicadores são calculados e como interpretar a operação do SIN.")
+        st.caption("Fundamentos técnicos da MAÁTria Energia: reconstrução econômica do sistema e análise avançada da formação de preços no SIN.")
 
-        with st.expander("🎯 1) Propósito da Plataforma", expanded=False):
-            st.markdown("""
+    with st.expander("🎯 1) Propósito da Plataforma", expanded=False):
+        st.markdown("""
 A plataforma **não tem como objetivo prever o PLD**.
 
-O foco é analisar a **coerência entre condições físicas do sistema e os sinais econômicos observados**, permitindo interpretar a operação do SIN em base **hora a hora**.
+O foco é reconstruir, a partir de dados observáveis e modelagem proprietária, a **estrutura econômica real do sistema elétrico**, permitindo avaliar:
 
-A análise cruza informações de:
+- coerência entre preço e custo
+- presença de distorções operativas
+- impacto econômico de encargos e decisões sistêmicas
 
-- hidrologia
-- disponibilidade de geração
-- despacho térmico
-- penetração de renováveis
-- curtailment
-- preços marginais (PLD e CMO)
+---
 
-**Fotografia Operativa do SIN**
+### Princípio central
 
-é um diagnóstico instantâneo da condição **física, energética e econômica** do sistema.
+O mercado observa:
+
+`PLD`
+
+A plataforma reconstrói:
+
+`Custo físico + encargos + efeitos operativos`
+
+---
+
+### Resultado
+
+Uma leitura baseada em:
+
+- fundamentos econômicos do sistema  
+- dinâmica real de operação  
+- não apenas no modelo marginal  
+
+---
+
+### Fotografia Operativa do SIN
+
+Cada hora representa uma combinação única de:
+
+- condição física  
+- decisão operativa  
+- sinal econômico  
+
+A plataforma transforma essa combinação em **diagnóstico econômico estruturado do sistema**.
 """)
-            st.info("Interprete esta aba como um guia de leitura do sistema elétrico, não como um modelo de previsão de preços.")
 
-        with st.expander("⚙️ 2) Conceitos Fundamentais do SIN", expanded=False):
-            st.markdown("""
-**Carga (Demanda)**  
-Energia total consumida pelo sistema em uma determinada hora.
+    with st.expander("⚙️ 2) Estrutura Física do Sistema", expanded=False):
+        st.markdown("""
+### Carga (Load)
+Demanda total atendida pelo sistema em cada hora.
 
-**Geração**  
-Energia efetivamente produzida pelas diferentes fontes do sistema.
+---
 
-**Carga Líquida**  
-Parcela da demanda que precisa ser atendida por fontes **flexíveis** (hidrelétricas e térmicas).
+### Geração
+Energia produzida por diferentes fontes:
 
-**Fórmula**
+- hidráulicas
+- térmicas
+- renováveis intermitentes
+- nucleares
 
-`Carga Líquida = Carga − (Solar + Eólica)`
+---
 
-**Valor da Água**
+### Carga Líquida
 
-Representa o custo de oportunidade de utilizar água armazenada nos reservatórios agora em vez de preservá-la para uso futuro.
+Representa a parcela da demanda que precisa ser atendida por fontes **controláveis e despacháveis**.
 
-Como aproximação operacional, utilizamos o **CMO (Custo Marginal de Operação)** como proxy desse valor.
+---
+
+### Valor da Água (Proxy Econômico)
+
+O custo de oportunidade da água é estimado por meio de proxies econômicos baseados no despacho ótimo do sistema.
+
+Importante:
+
+- não representa custo contábil direto  
+- reflete decisão intertemporal de uso de recurso hídrico  
 """)
 
-        with st.expander("📊 3) Métricas Principais", expanded=False):
-            st.markdown("""
-### GFOM (Geração Fora da Ordem de Mérito)
+    with st.expander("📊 3) Indicadores Operativos", expanded=False):
+        st.markdown("""
+### GFOM — Geração Fora da Ordem de Mérito
 
-Indica a parcela da geração térmica despachada **fora da lógica econômica do mérito de custo**.
+Indica despacho térmico realizado fora da lógica puramente econômica.
 
-**Fórmula**
+Sinaliza:
 
-`GFOM = Térmica_GFOM / Térmica_Total`
-
-**Interpretação típica**
-
-- `< 5%` → despacho majoritariamente econômico  
-- `5–15%` → despacho misto  
-- `> 15%` → presença relevante de decisão operativa
+- restrições operativas  
+- decisões conservadoras  
+- limitações do sistema  
 
 ---
 
 ### Curtailment
 
-Energia renovável **disponível mas não utilizada pelo sistema**.
+Energia renovável disponível que não é absorvida pelo sistema.
 
-Principais causas:
+Indica:
 
-- restrições de transmissão
-- estabilidade elétrica
-- saturação de geração
-- inflexibilidade de usinas térmicas ou nucleares
-
-**Leitura econômica**
-
-energia de baixo custo que deixa de ser utilizada.
+- restrições de transmissão  
+- saturação estrutural  
+- inflexibilidade operacional  
 
 ---
 
-### IPR — Índice de Pressão Renovável
+### IPR — Pressão Renovável
 
-Mede o peso das renováveis sobre a demanda.
-
-`IPR = Renovável Disponível / Carga`
+Mede a participação das renováveis na carga total.
 
 ---
 
-### ISR — Índice de Saturação Renovável
+### ISR — Saturação Renovável
 
-Avalia a pressão renovável sobre a parcela flexível da demanda.
+Avalia a pressão das renováveis sobre a parcela flexível do sistema.
 
-`ISR = Renovável Disponível / Carga Líquida`
-
-Quando:
-
-`ISR > 1`
-
-há risco de **saturação estrutural de geração renovável**.
+Valores elevados indicam risco de **descolamento entre oferta e capacidade de absorção**.
 
 ---
 
-### EAR — Energia Armazenada
+### EAR / ENA
 
-Estoque de energia contido nos reservatórios hidráulicos.
+- EAR: nível de armazenamento energético  
+- ENA: fluxo hidrológico  
 
-Representa a **segurança energética futura do sistema**.
-
----
-
-### ENA — Energia Natural Afluente
-
-Energia hidrológica que entra naturalmente no sistema por meio das vazões.
-
-Interpretação:
-
-- **ENA alta** → tendência de alívio hidrológico  
-- **ENA baixa** → aumento do risco de escassez
+Base da avaliação de risco estrutural do sistema
 """)
 
-            st.warning("Interprete sempre IPR e ISR junto com o curtailment para distinguir excesso renovável de restrições elétricas.")
-
-        with st.expander("💰 4) Decomposição Econômica do Sistema", expanded=False):
-            st.markdown("""
-A plataforma separa o custo horário do sistema em componentes econômicos.
-
-### Estrutura central
-
-`T_total = T_elétrico + T_hidro + T_prudência + T_sistêmica`
-
-onde:
-
-**T_elétrico — Custo Estrutural de Geração**
-
-Representa o custo mínimo necessário para atender a carga considerando o despacho por mérito econômico.
-
-Principal componente:
-
-`Térmica por mérito × CVU médio`
+    with st.expander("💰 4) Reconstrução do Custo do Sistema", expanded=False):
+        st.markdown("""
+A plataforma reconstrói o custo do sistema em múltiplas camadas, utilizando dados observáveis e modelagem econômica.
 
 ---
 
-**T_hidro — Custo Hidrológico**
+### 1) Custo Físico
 
-Valor econômico associado ao uso da água armazenada.
-
-A água funciona como um **ativo energético armazenável**, cujo valor é aproximado pelo **CMO**.
+Estimativa do custo mínimo necessário para atender a carga, baseada na composição da geração e no custo marginal do sistema.
 
 ---
 
-**T_prudência — Custo de Decisão Operativa**
+### 2) Encargos do Sistema (ESS)
 
-Representa o custo adicional associado a decisões conservadoras do operador, como:
+Componentes que não são integralmente refletidos no PLD, incluindo:
 
-- preservação de reservatórios
-- despacho térmico preventivo
-- restrições operativas
+- restrições operativas  
+- serviços ancilares  
+- segurança energética  
+- decisões sistêmicas  
 
 ---
 
-**T_sistêmica — Ajuste Estrutural do Sistema**
+### 3) Custo Real do Sistema
 
-Captura diferenças entre o valor econômico do mercado e o custo físico da geração.
+Integra o custo físico com encargos e efeitos operativos, representando a **exposição econômica total do sistema**.
 
-Pode assumir valores positivos ou negativos dependendo da condição estrutural do sistema.
-""")
+---
 
-        with st.expander("🛡️ 5) CVaR e Aversão ao Risco", expanded=False):
-            st.markdown("""
-O planejamento da operação considera cenários hidrológicos adversos.
+### 4) Receita de Mercado
 
-Para isso são utilizados mecanismos de **aversão ao risco**, como o **CVaR (Conditional Value at Risk)**.
+Valor econômico da energia transacionada, derivado do preço observado.
 
-Exemplo de parametrização usada no setor:
-
-`(15%, 40%)`
-
-significando:
-
-- análise dos **15% piores cenários hidrológicos**
-- com **peso de 40% na decisão operativa**
-
-Maior aversão ao risco tende a produzir:
-
-- maior preservação hídrica
-- maior despacho térmico
-- maior pressão sobre o PLD
-
-### CVaR Implícito Observado
-
-A plataforma estima uma aproximação do valor implícito da aversão ao risco:
-
-`CVaR_implícito = max(PLD − CMO, 0)`
-
-Quando o **PLD atinge o teto regulatório**, o valor implícito não é observável diretamente.
-""")
-
-        with st.expander("📉 6) Risk Aversion Gap", expanded=False):
-            st.markdown("""
-O **Risk Aversion Gap** compara o nível de aversão ao risco observado com o custo médio da geração térmica.
-
-**Definição**
-
-`Risk Gap = CVaR_implícito − CVU_médio`
-
-**Interpretação**
-
-- **positivo** → operação conservadora  
-- **próximo de zero** → operação neutra  
-- **negativo** → sistema em regime de abundância energética
-""")
-
-        with st.expander("💧 7) Teste de Necessidade Hidráulica", expanded=False):
-            st.markdown("""
-Esse teste avalia quanto da geração hidráulica é **estruturalmente necessária** para atender a demanda.
-
-### Passo 1 — Geração mandatória
-
-`Renováveis + Nuclear + Térmica Inflexível`
-
-### Passo 2 — Hidro necessária
-
-`Hidro_necessária = Carga − Geração_mandatória`
-
-### Passo 3 — Comparação com a geração observada
-
-- `Hidro observada > Hidro necessária`  
-→ sistema com forte presença hidráulica
-
-- `Hidro observada < Hidro necessária`  
-→ maior dependência térmica
-""")
-
-        with st.expander("🧾 8) Custo Econômico do SIN (R$/h)", expanded=False):
-            st.markdown("""
-A exposição econômica total do sistema pode ser aproximada por:
-
-`Custo SIN = Carga × PLD`
-
-Esse valor representa o **valor econômico da energia liquidada no mercado** naquela hora.
-
-Ele não corresponde diretamente ao custo físico de geração.
-""")
-
-        with st.expander("📊 9) Infra-Marginal Rent", expanded=False):
-            st.markdown("""
-Chamamos de **Infra-Marginal Rent** a diferença entre:
-
-`Valor econômico da energia`  
-e  
-`Custo físico estimado de produção`.
-
-Na plataforma:
-
-`Infra_marginal = Custo SIN − T_total`
+---
 
 ### Interpretação
 
-**Infra-marginal positivo**
-
-O valor pago pelo mercado é maior que o custo físico de geração.
-
-Isso ocorre tipicamente quando:
-
-- o PLD é definido por usinas marginais caras
-- grande parte da geração vem de fontes mais baratas (hidro, renováveis)
-
-Nesse caso, **geradores recebem renda infra-marginal**.
-
----
-
-**Infra-marginal negativo**
-
-O valor econômico do mercado é inferior ao custo físico estimado.
-
-Isso ocorre em situações como:
-
-- excesso estrutural de oferta
-- saturação renovável
-- PLD muito baixo
-
-Nesse caso, o sistema está operando com **sinais de preço comprimidos**.
+A diferença entre receita e custo revela a estrutura econômica do sistema e suas distorções.
 """)
 
-        with st.expander("🌡️ 10) Heatmap de Infra-Marginal ao Longo do Tempo", expanded=False):
-            st.markdown("""
-O mapa de calor apresentado no dashboard mostra a evolução histórica da diferença entre:
+    with st.expander("📊 5) Infra-Marginal Rent (IMR)", expanded=False):
+        st.markdown("""
+O Infra-Marginal Rent mede o excedente econômico entre o valor de mercado da energia e os custos do sistema.
 
-`Custo SIN` e `T_total`.
+A plataforma utiliza múltiplas abordagens complementares para capturar diferentes dimensões desse fenômeno.
 
-Cada célula representa **uma hora de operação do sistema**.
+---
 
-Esse gráfico permite identificar **regimes estruturais de mercado**, como:
+### Interpretação
 
-**Regime de escassez**
+- **positivo** → presença de renda infra-marginal  
+- **próximo de zero** → equilíbrio econômico  
+- **negativo** → pressão de custo ou distorção estrutural  
 
-PLD elevado e forte renda infra-marginal.
+---
 
-**Regime de abundância**
+### Insight chave
 
-PLD baixo e compressão de receitas.
+O IMR revela aquilo que o preço isoladamente não mostra:
 
-**Transições estruturais**
-
-Mudanças de comportamento ao longo das estações hidrológicas ou da expansão renovável.
-
-Por utilizar toda a base histórica disponível, o heatmap permite visualizar **padrões operativos recorrentes do SIN**.
+> a diferença entre valor econômico e custo real do sistema
 """)
 
-        with st.expander("🏷️ 11) Coerência Operativa do SIN", expanded=False):
-            st.markdown("""
-## Coerência Operativa do SIN
+    with st.expander("📈 6) Métricas Proprietárias", expanded=False):
+        st.markdown("""
+### SPDI — Structural Price Distortion Index
 
-A aba **Coerência Operativa** avalia se o comportamento econômico observado no mercado
-(PLD, CVaR, Risk Gap) é **internamente consistente com as condições físicas do sistema**
-(armazenamento, afluência e pressão de carga). Um sistema coerente é aquele em que
-os preços refletem fielmente o estado físico — sem distorções regulatórias, anomalias
-de despacho ou ruídos de formação de preços.
+Mede o grau de distorção entre preço e custo físico.
 
 ---
 
-### Normalizações — o que são e por que existem
+### Encargo Intensity Index
 
-Cada variável do SIN opera em uma escala diferente (MW, MWmês, R$/MWh, %).
-Para combiná-las em um único indicador é necessário **normalizar** cada série para
-o intervalo **[0, 1]**, onde 0 representa o extremo mais favorável e 1 o mais crítico.
-
-| Variável | Fórmula de normalização | Interpretação do valor |
-|---|---|---|
-| **EAR_norm** | EAR% ÷ 100 | 0 = reservatório vazio · 1 = cheio |
-| **ENA_norm** | ENA_arm ÷ max(ENA_arm histórico) | 0 = afluência mínima · 1 = máxima |
-| **Load_norm** | Carga / Capacidade sincronizada | 0 = sistema folgado · 1 = no limite |
-| **CVaR** | (PLD − CMO).clip(0) em R$/MWh | divergência entre preço e custo marginal |
-| **Risk Gap** | CVaR − CVU semanal | prêmio de risco além do custo variável |
-
-> **Nota sobre EAR_norm e ENA_norm:** por serem dados diários (publicados uma vez por dia
-> pelo ONS), o mesmo valor é atribuído a todas as 24 horas do dia correspondente.
-> Isso é metodologicamente correto — o armazenamento e a afluência são grandezas
-> de fluxo diário, não horário.
+Avalia o peso relativo dos encargos na estrutura econômica do sistema.
 
 ---
 
-### Scores normalizados — como funcionam
+### Hidden System Cost
 
-Cada variável é convertida em um **score de desvio** (quanto aquela dimensão contribui
-para a incoerência do sistema). O score ideal é **0** (sem desvio); scores próximos de
-**1** indicam pressão máxima naquela dimensão.
-
-| Score | Fórmula | Lógica |
-|---|---|---|
-| **ear** | 1 − EAR_norm | Reservatórios baixos → maior risco |
-| **ena** | 1 − ENA_norm | Afluência baixa → menor folga hídrica |
-| **load** | abs(Load_norm − 1) | Carga muito próxima da capacidade → risco operativo |
-| **cvar** | CVaR ÷ 100 | Divergência PLD/CMO como fração de R$100/MWh |
-| **risk** | tanh(Risk Gap ÷ 300) | Prêmio de risco saturado em ±1 (300 R$/MWh como referência) |
-
-A função `tanh` no score de risco evita que valores extremos de Risk Gap dominem
-o indicador — ela comprime a escala de forma suave, preservando o sinal direcional
-mas limitando o peso de outliers.
+Captura custos não refletidos diretamente no preço de mercado.
 
 ---
 
-### Métrica de Coerência do SIN — score final
+### Structural Gap
 
-O score final é calculado como:
-
-```
-Coerência (%) = 100 × (1 − média dos scores)
-```
-
-**Interpretação:**
-
-| Faixa | Sinal | Significado |
-|---|---|---|
-| 🟢 ≥ 70 | Coerente | Preços consistentes com o estado físico |
-| 🟡 40–70 | Atenção | Alguma divergência entre sinal físico e econômico |
-| 🔴 < 40 | Incoerente | Pressão severa ou descolamento significativo |
-
-**Exemplo prático:** um sistema com EAR baixo (EAR_norm = 0,30), afluência reduzida
-(ENA_norm = 0,40) e PLD muito acima do CMO (CVaR alto) terá scores individuais
-elevados em todas as dimensões, resultando em Coerência < 40 — sinal de stress
-sistêmico consistente, onde o preço alto reflete genuinamente as condições físicas.
-
-Por outro lado, se o PLD estiver alto mas EAR e ENA estiverem em níveis confortáveis,
-a Coerência também será baixa — mas por incoerência: o preço não encontra respaldo
-nas condições físicas do reservatório, o que pode indicar distorção regulatória,
-restrições de transmissão ou inflexibilidade térmica excessiva.
+Diferença entre preço observado e custo econômico reconstruído.
 
 ---
 
-### Limitações
+### Structural Drift
 
-- **ENA_norm** usa o P90 dos últimos 365 dias como denominador, calculado sobre o
-  histórico completo do Neon — não sobre o período selecionado na tela. Em bases
-  com menos de 365 dias de história, o P90 recai sobre toda a série disponível.
-- O score de CVaR usa R$100/MWh como unidade de referência implícita.
-  Em cenários de PLD próximo ao teto regulatório, o CVaR pode ser estruturalmente
-  alto sem refletir incoerência real.
-- Dados ausentes (NaN) recebem score neutro de **0,5**, para não penalizar nem
-  beneficiar a métrica na ausência de informação.
+Mede a evolução estrutural do sistema ao longo do tempo, capturando mudanças persistentes na relação entre preço e custo.
 """)
 
-        with st.expander("🧭 12) Como Interpretar o Dashboard", expanded=False):
-            st.markdown("""
-### Roteiro sugerido de leitura
+    with st.expander("🌡️ 7) Heatmap de IMR", expanded=False):
+        st.markdown("""
+Cada célula representa uma hora de operação do sistema.
 
-1️⃣ selecione o período de análise  
-2️⃣ observe os indicadores principais  
-3️⃣ verifique o score de coerência operativa  
-4️⃣ analise a decomposição econômica  
-5️⃣ identifique causas de curtailment  
-6️⃣ observe o heatmap histórico  
-7️⃣ utilize a simulação BESS
+---
+
+### Interpretação
+
+O mapa evidencia o desvio econômico entre:
+
+`valor de mercado` e `custo reconstruído do sistema`
+
+---
+
+### Leitura das cores
+
+- **Verde** → excedente econômico positivo (renda infra-marginal)  
+- **Neutro** → alinhamento entre preço e custo  
+- **Vermelho** → pressão de custo ou distorção  
+
+---
+
+### Valor analítico
+
+Permite identificar:
+
+- regimes estruturais de mercado  
+- ciclos operativos  
+- mudanças na dinâmica econômica  
+
+---
+
+### Insight
+
+O heatmap revela a evolução da eficiência econômica do sistema ao longo do tempo.
+""")
+
+    with st.expander("⚖️ 8) Coerência Econômica do SIN", expanded=False):
+        st.markdown("""
+A plataforma avalia se os sinais de preço são consistentes com as condições físicas do sistema.
+
+---
+
+### Base da análise
+
+- hidrologia  
+- carga  
+- geração  
+- custos  
+- encargos  
+
+---
+
+### Interpretação
+
+- coerente → preço alinhado aos fundamentos  
+- incoerente → presença de distorções estruturais  
+
+---
+
+### Aplicação
+
+Identificação de:
+
+- intervenções sistêmicas  
+- ineficiências operativas  
+- sinais artificiais de preço  
+""")
+
+    with st.expander("🧭 9) Como Interpretar o Dashboard", expanded=False):
+        st.markdown("""
+### Fluxo recomendado
+
+1. Observe o custo reconstruído  
+2. Compare com o preço de mercado  
+3. Analise encargos  
+4. Avalie o IMR  
+5. Verifique distorções (SPDI / Gap)  
+6. Analise o heatmap  
+7. Identifique padrões estruturais  
+
+---
 
 ### Objetivo final
 
-Avaliar se o comportamento observado do **PLD** está **coerente com as condições físicas do SIN**.
+Responder com precisão:
+
+> O preço observado reflete o custo econômico real do sistema?
 """)
-
-            st.success("Combine sempre sinais físicos (carga, geração, reservatórios) com sinais econômicos (PLD, CMO e custos).")
-
-    with tabs[7]:
-        render_premium_tab(df)
-
+        
 if __name__ == "__main__":
 
     main()

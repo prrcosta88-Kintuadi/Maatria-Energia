@@ -2428,8 +2428,10 @@ def _compute_advanced_cross_metrics(
 
         # GFOM componentes
         gfom_comp = _load_gfom_components_hourly()
-        thermal_inflex = _ensure_tz_naive_index(gfom_comp.get("inflex_pura", pd.Series(dtype=float))) if not gfom_comp.empty else pd.Series(dtype=float)
-        thermal_merit = _ensure_tz_naive_index(gfom_comp.get("ordem_merito", pd.Series(dtype=float))) if not gfom_comp.empty else pd.Series(dtype=float)
+        thermal_inflex    = _ensure_tz_naive_index(gfom_comp.get("inflex_pura",    pd.Series(dtype=float))) if not gfom_comp.empty else pd.Series(dtype=float)
+        thermal_merit     = _ensure_tz_naive_index(gfom_comp.get("ordem_merito",   pd.Series(dtype=float))) if not gfom_comp.empty else pd.Series(dtype=float)
+        # constrained_off e constrained_on já estão no gfom_comp (Neon)
+        constrained_off_h = _ensure_tz_naive_index(gfom_comp.get("constrained_off", pd.Series(dtype=float))) if not gfom_comp.empty else pd.Series(dtype=float)
 
         # Capacidade sincronizada total
         disp = _load_disponibilidade_horaria()
@@ -2498,8 +2500,9 @@ def _compute_advanced_cross_metrics(
             df_e["thermal_total"] = pd.to_numeric(termica.reindex(idx), errors="coerce")
             df_e["hydro"] = pd.to_numeric(hidro.reindex(idx), errors="coerce")
             df_e["nuclear"] = pd.to_numeric(nuclear.reindex(idx), errors="coerce")
-            df_e["thermal_inflex"] = pd.to_numeric(thermal_inflex.reindex(idx), errors="coerce")
-            df_e["thermal_merit"] = pd.to_numeric(thermal_merit.reindex(idx), errors="coerce")
+            df_e["thermal_inflex"]  = pd.to_numeric(thermal_inflex.reindex(idx),    errors="coerce")
+            df_e["thermal_merit"]   = pd.to_numeric(thermal_merit.reindex(idx),     errors="coerce")
+            df_e["constrained_off"] = pd.to_numeric(constrained_off_h.reindex(idx), errors="coerce").fillna(0)
             df_e["disp_sync_total"] = pd.to_numeric(disp_sync_total.reindex(idx), errors="coerce")
             df_e["disp_sync_uhe"] = pd.to_numeric(disp_sync_uhe.reindex(idx), errors="coerce")
             df_e["disp_sync_ute"] = pd.to_numeric(disp_sync_ute.reindex(idx), errors="coerce")
@@ -2702,22 +2705,66 @@ def _compute_advanced_cross_metrics(
                 for sk in SUBMERCADOS
             )
 
-            # ── T_sistemica por submercado ────────────────────────────────────────
-            # T_sistemica_sk = geracao_sk * (cmo_sk - pld_sk)
-            # geracao_sk = geracao_total * frac_carga_sk (proxy)
-            _ger_total = df_e["geracao_total"].fillna(0)
-            df_e["T_sistemica"] = sum(
-                _ger_total * _frac(sk) * (_cmo(sk) - _pld(sk))
-                for sk in SUBMERCADOS
-            )
+            # ── T_sistemica corrigida (Step 5) ───────────────────────────────────
+            # Nova fórmula: |PLD − CMO| × net_load
+            # Captura distorção de preço aplicada à carga flexível — mais realista
+            # que geracao × (CMO − PLD) que mistura geração e preço de formas opostas
+            _net_load_e = (df_e["load"] - df_e.get("wind", pd.Series(0, index=df_e.index)).fillna(0)
+                           - df_e.get("solar", pd.Series(0, index=df_e.index)).fillna(0)).clip(lower=0)
+            _pld_sin    = pd.to_numeric(df_e["pld"], errors="coerce").fillna(0)
+            _cmo_sin    = pd.to_numeric(df_e["cmo"], errors="coerce").fillna(0)
+            df_e["T_sistemica"] = (_pld_sin - _cmo_sin).abs() * _net_load_e
 
             # ── T_eletric e T_hidro (não dependem de sub diretamente) ────────────
             df_e["T_eletric"] = df_e["thermal_merit_cost"]
             df_e["T_hidro"]   = df_e["Water_value_R$/h"]
 
-            # ── T_total e renda infra-marginal ────────────────────────────────────
+            # ── T_total e renda infra-marginal (metodologia original) ─────────────
             df_e["T_total"]           = df_e["T_eletric"] + df_e["T_hidro"] + df_e["T_prudencia"] + df_e["T_sistemica"]
             df_e["infra_marginal_rent"] = df_e["SIN_cost_R$/h"] - df_e["T_total"]
+
+            # ── Step 1: Custo físico de geração ───────────────────────────────────
+            # C_fisico = thermal_total × CVU + hydro × CMO_dominante
+            _thermal_cost_phys = df_e["thermal_total"].fillna(0) * df_e["cvu_semana"].fillna(0)
+            _hydro_cost_phys   = df_e["hydro"].fillna(0) * _cmo_sin
+            _phys_cost_e       = (_thermal_cost_phys + _hydro_cost_phys).where(
+                df_e["load"] > 0, np.nan)
+            df_e["physical_generation_cost_Rh"] = _phys_cost_e
+
+            # ── Step 2: Custo sistêmico = físico + encargos (ESS placeholder) ─────
+            # ESS é carregado via ccee_charges no app — aqui usamos 0 como base
+            df_e["system_generation_cost_Rh"] = _phys_cost_e   # atualizado pelo enrich_df
+
+            # ── Step 3: Três indicadores IMR ──────────────────────────────────────
+            _sin_cost_e = pd.to_numeric(df_e["SIN_cost_R$/h"], errors="coerce")
+
+            # IMR Mercado = sin_cost − T_total (metodologia original renomeada)
+            df_e["infra_marginal_market"]   = _sin_cost_e - df_e["T_total"]
+
+            # IMR Físico = sin_cost − custo físico  ← métrica principal
+            df_e["infra_marginal_physical"] = (_sin_cost_e - _phys_cost_e).where(
+                _sin_cost_e.notna() & _phys_cost_e.notna(), np.nan)
+
+            # IMR Sistêmico = sin_cost − custo sistêmico (= físico sem ESS por ora)
+            df_e["infra_marginal_system"]   = df_e["infra_marginal_physical"]  # igual até ESS
+
+            # ── Step 4: SPDI = sin_cost / custo físico ────────────────────────────
+            df_e["spdi"] = (_sin_cost_e / _phys_cost_e.replace(0, np.nan)).clip(
+                lower=0, upper=10).where(_sin_cost_e.notna() & _phys_cost_e.notna(), np.nan)
+
+            # ── Step 6: Structural Drift via IMR físico ────────────────────────────
+            # rolling_mean(IMR_físico, 30d) / mean(IMR_físico_2021)
+            _imr_phys_e  = pd.to_numeric(df_e["infra_marginal_physical"], errors="coerce")
+            _rolling_30d = _imr_phys_e.rolling(720, min_periods=24).mean()
+            _mask_2021   = df_e.index.year == 2021
+            _base_2021   = float(_imr_phys_e[_mask_2021].mean())                            if _mask_2021.sum() >= 24 else np.nan
+            if np.isnan(_base_2021) or _base_2021 == 0:
+                _base_2021 = float(_imr_phys_e.quantile(0.10))                              if not _imr_phys_e.dropna().empty else 1.0
+            if _base_2021 and not np.isnan(_base_2021) and _base_2021 != 0:
+                df_e["structural_drift"] = (_rolling_30d / abs(_base_2021)).clip(
+                    lower=0.1, upper=10.0)
+            else:
+                df_e["structural_drift"] = np.nan
 
             economic = {
                 "dominant_submarket": dominant_sm,
@@ -2759,6 +2806,21 @@ def _compute_advanced_cross_metrics(
                 "T_total_hourly": _series_to_hourly_dict(df_e["T_total"], ndigits=4),
                 "T_eletric_hourly": _series_to_hourly_dict(df_e["T_eletric"], ndigits=4),
                 "T_hidro_hourly": _series_to_hourly_dict(df_e["T_hidro"], ndigits=4),
+                # Novas métricas — Steps 1–4 e 6
+                "physical_generation_cost_hourly": _series_to_hourly_dict(
+                    df_e["physical_generation_cost_Rh"], ndigits=4),
+                "infra_marginal_market_hourly": _series_to_hourly_dict(
+                    df_e["infra_marginal_market"], ndigits=4),
+                "infra_marginal_physical_hourly": _series_to_hourly_dict(
+                    df_e["infra_marginal_physical"], ndigits=4),
+                "infra_marginal_system_hourly": _series_to_hourly_dict(
+                    df_e["infra_marginal_system"], ndigits=4),
+                "spdi_hourly": _series_to_hourly_dict(df_e["spdi"], ndigits=4),
+                "structural_drift_hourly": _series_to_hourly_dict(
+                    df_e.get("structural_drift", pd.Series(dtype=float)), ndigits=4),
+                # Novos indicadores — fechamento econômico completo (prompt.txt)
+                "constrained_off_hourly": _series_to_hourly_dict(
+                    df_e.get("constrained_off", pd.Series(dtype=float)), ndigits=4),
             }
     except Exception as e:
         step_errors["economic_decomposition"] = str(e)
