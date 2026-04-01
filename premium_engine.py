@@ -21,6 +21,7 @@ import calendar
 import os
 import warnings
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -31,6 +32,44 @@ import requests
 import streamlit as st
 
 warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*sklearn\.utils\.parallel\.delayed.*",
+    category=UserWarning,
+)
+
+try:
+    import duckdb
+except ImportError:
+    duckdb = None
+
+try:
+    import psycopg2
+except ImportError:
+    psycopg2 = None
+
+try:
+    from adaptive_pld_forward_engine import (
+        AUTH_TABLE_NAME as _ADAPTIVE_AUTH_TABLE,
+        LOCAL_TABLE_NAME as _ADAPTIVE_LOCAL_TABLE,
+        QUALITY_AUTH_TABLE_NAME as _ADAPTIVE_QUALITY_AUTH_TABLE,
+        QUALITY_LOCAL_TABLE_NAME as _ADAPTIVE_QUALITY_LOCAL_TABLE,
+        QUALITY_SUMMARY_AUTH_TABLE_NAME as _ADAPTIVE_QUALITY_SUMMARY_AUTH_TABLE,
+        QUALITY_SUMMARY_LOCAL_TABLE_NAME as _ADAPTIVE_QUALITY_SUMMARY_LOCAL_TABLE,
+        AdaptivePLDForwardEngine,
+    )
+    _ADAPTIVE_OK = True
+    _ADAPTIVE_ERR = ""
+except Exception as _adaptive_err:
+    AdaptivePLDForwardEngine = None
+    _ADAPTIVE_OK = False
+    _ADAPTIVE_ERR = str(_adaptive_err)
+    _ADAPTIVE_LOCAL_TABLE = "adaptive_pld_forward_hourly"
+    _ADAPTIVE_AUTH_TABLE = "maat_adaptive_pld_forward_hourly"
+    _ADAPTIVE_QUALITY_LOCAL_TABLE = "adaptive_pld_forward_quality_hourly"
+    _ADAPTIVE_QUALITY_AUTH_TABLE = "maat_adaptive_pld_forward_quality_hourly"
+    _ADAPTIVE_QUALITY_SUMMARY_LOCAL_TABLE = "adaptive_pld_forward_quality_summary"
+    _ADAPTIVE_QUALITY_SUMMARY_AUTH_TABLE = "maat_adaptive_pld_forward_quality_summary"
 
 # ─── sklearn / scipy (opcionais) ─────────────────────────────────────────────
 try:
@@ -71,6 +110,16 @@ def _hex_rgba(hex_color: str, alpha: float = 0.2) -> str:
 _REGIME_BREAKS = [pd.Timestamp("2023-08-01"), pd.Timestamp("2025-03-01")]
 _REGIME_LABELS = ["pré-solar (2021–ago/2023)", "transição (ago/2023–fev/2025)", "curtailment (mar/2025–hoje)"]
 _DECAY_HALF_LIFE_YEARS = 1.5
+_ADAPTIVE_FORWARD_HOURS = 24 * 30 * 6
+_ADAPTIVE_FORWARD_PATHS = 1000
+_ADAPTIVE_FORWARD_CACHE_TTL = 6 * 3600
+_ADAPTIVE_FORWARD_CONTEXT_DAYS = 45
+_ADAPTIVE_SUBMARKETS = {
+    "SE": {"history_col": "pld_se", "label": "SE/CO", "color": _COLORS["blue"]},
+    "S": {"history_col": "pld_s", "label": "Sul", "color": _COLORS["green"]},
+    "NE": {"history_col": "pld_ne", "label": "Nordeste", "color": _COLORS["gold"]},
+    "N": {"history_col": "pld_n", "label": "Norte", "color": _COLORS["purple"]},
+}
 
 # ─── CCEE resource IDs ───────────────────────────────────────────────────────
 _CCEE_RESOURCES = {
@@ -1057,12 +1106,12 @@ def _plot_feature_importance(fi: Dict[str, float]) -> go.Figure:
 # SEÇÃO 12 — VISUALIZAÇÕES DE CUSTO FÍSICO E ENCARGOS
 # ══════════════════════════════════════════════════════════════════════════════
 
-_IMR_OUTLIER_FLOOR = -250_000_000  # R$/h — filtro de outliers do heatmap
+_IMR_OUTLIER_FLOOR = -200_000_000  # R$/h — filtro de outliers do heatmap
 
 def _plot_imr_heatmap(df: pd.DataFrame,
                       imr_col: str = "infra_marginal_physical") -> go.Figure:
     """Heatmap hora × dia do IMR selecionado.
-    Remove outliers abaixo de -250M R$/h antes de plotar.
+    Remove outliers abaixo de -200M R$/h antes de plotar.
     """
     if imr_col not in df.columns or df.empty:
         return go.Figure()
@@ -1107,6 +1156,7 @@ def _plot_spdi_series(df: pd.DataFrame) -> go.Figure:
     if "spdi" not in df.columns or df.empty:
         return go.Figure()
     s = pd.to_numeric(df["spdi"], errors="coerce").dropna()
+    s = s[(s > 0) & (s < 9.8)]
     daily = s.resample("D").median()
     fig = go.Figure()
     fig.add_trace(go.Scatter(
@@ -1289,8 +1339,10 @@ def render_charges_tab(df: pd.DataFrame) -> None:
         if imr_col in df.columns:
             _n_out = int((pd.to_numeric(df[imr_col], errors="coerce").dropna() < _IMR_OUTLIER_FLOOR).sum())
             if _n_out > 0:
-                st.caption(f"⚠️ {_n_out} registros abaixo de R$ -250M/h removidos (outliers).")
-            st.markdown("- IMR ≈ 0 → preço economicamente consistente com o sistema físico  \n- IMR > 0 (verde) → presença de renda infra-marginal / prêmio estrutural  \n- IMR < 0 (vermelho) → custo sistêmico elevado ou distorções operativas não refletidas no preço")
+                st.caption(f"⚠️ {_n_out} registros abaixo de R$ -200M/h removidos (outliers). "
+                           "Verde = alinhado ao custo físico. Vermelho = prêmio elevado.")
+            else:
+                st.caption("Verde = mercado alinhado ao custo físico. Vermelho = prêmio elevado.")
 
     with gtabs[1]:
         st.plotly_chart(_plot_spdi_series(df), use_container_width=True, key="charges_spdi")
@@ -1401,6 +1453,1257 @@ def render_charges_tab(df: pd.DataFrame) -> None:
             st.info("Dados de encargos não disponíveis — verifique a conexão com a API CCEE.")
 
 
+def _adaptive_auth_url() -> str:
+    return os.getenv("DATABASE_URL_AUTH", os.getenv("DATABASE_URL", ""))
+
+
+def _normalize_adaptive_forward_table(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+
+    out = frame.copy()
+    for col in ("generated_at", "forecast_ts"):
+        if col in out.columns:
+            out[col] = pd.to_datetime(out[col], errors="coerce")
+            try:
+                if getattr(out[col].dt, "tz", None) is not None:
+                    out[col] = out[col].dt.tz_localize(None)
+            except Exception:
+                pass
+
+    int_cols = ("horizon_hour", "era_id", "n_paths")
+    dt_cols = {"generated_at", "forecast_ts"}
+    text_cols = {"run_id", "model_version", "history_source"}
+
+    for col in int_cols:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").astype("Int64")
+
+    for col in out.columns:
+        if col not in dt_cols and col not in text_cols and col not in int_cols:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    if "forecast_ts" in out.columns:
+        out = out.sort_values("forecast_ts").reset_index(drop=True)
+    return out
+
+
+def _normalize_adaptive_quality_table(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+
+    out = frame.copy()
+    dt_cols = {
+        "generated_at",
+        "generated_date",
+        "forecast_ts",
+        "actual_date",
+        "updated_at",
+        "actual_start_ts",
+        "actual_end_ts",
+    }
+    text_cols = {
+        "engine_name",
+        "run_id",
+        "lead_bucket",
+        "dominant_regime",
+        "model_version",
+    }
+    int_cols = {
+        "horizon_hour",
+        "era_id",
+        "dominant_regime_id",
+        "inside_band",
+        "below_p10",
+        "above_p90",
+        "window_days",
+        "n_obs",
+    }
+
+    for col in dt_cols.intersection(out.columns):
+        out[col] = pd.to_datetime(out[col], errors="coerce")
+        try:
+            if getattr(out[col].dt, "tz", None) is not None:
+                out[col] = out[col].dt.tz_localize(None)
+        except Exception:
+            pass
+
+    for col in int_cols.intersection(out.columns):
+        out[col] = pd.to_numeric(out[col], errors="coerce").astype("Int64")
+
+    for col in out.columns:
+        if col not in dt_cols and col not in text_cols and col not in int_cols:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    sort_cols = [col for col in ("window_days", "lead_bucket", "forecast_ts", "generated_at") if col in out.columns]
+    if sort_cols:
+        out = out.sort_values(sort_cols).reset_index(drop=True)
+    return out
+
+
+def _load_latest_adaptive_forward_from_duckdb(
+    duckdb_path: str | Path = "data/kintuadi.duckdb",
+) -> pd.DataFrame:
+    if duckdb is None:
+        return pd.DataFrame()
+
+    db_path = Path(duckdb_path)
+    if not db_path.exists():
+        return pd.DataFrame()
+
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        try:
+            tables = set(con.execute("SHOW TABLES").df()["name"].str.lower().tolist())
+        except Exception:
+            tables = set()
+
+        if _ADAPTIVE_LOCAL_TABLE.lower() not in tables:
+            return pd.DataFrame()
+
+        query = f"""
+            WITH latest AS (
+                SELECT run_id
+                FROM {_ADAPTIVE_LOCAL_TABLE}
+                ORDER BY generated_at DESC, run_id DESC
+                LIMIT 1
+            )
+            SELECT *
+            FROM {_ADAPTIVE_LOCAL_TABLE}
+            WHERE run_id = (SELECT run_id FROM latest)
+            ORDER BY forecast_ts
+        """
+        return _normalize_adaptive_forward_table(con.execute(query).df())
+    finally:
+        con.close()
+
+
+def _load_latest_adaptive_forward_from_auth() -> pd.DataFrame:
+    if psycopg2 is None:
+        return pd.DataFrame()
+
+    auth_url = _adaptive_auth_url()
+    if not auth_url:
+        return pd.DataFrame()
+
+    conn = psycopg2.connect(auth_url)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT to_regclass(%s)", (_ADAPTIVE_AUTH_TABLE,))
+        exists = cur.fetchone()
+        cur.close()
+        if not exists or not exists[0]:
+            return pd.DataFrame()
+
+        query = f"""
+            WITH latest AS (
+                SELECT run_id
+                FROM {_ADAPTIVE_AUTH_TABLE}
+                ORDER BY generated_at DESC, run_id DESC
+                LIMIT 1
+            )
+            SELECT *
+            FROM {_ADAPTIVE_AUTH_TABLE}
+            WHERE run_id = (SELECT run_id FROM latest)
+            ORDER BY forecast_ts
+        """
+        return _normalize_adaptive_forward_table(pd.read_sql_query(query, conn))
+    except Exception:
+        return pd.DataFrame()
+    finally:
+        conn.close()
+
+
+@st.cache_data(show_spinner=False, ttl=_ADAPTIVE_FORWARD_CACHE_TTL)
+def _load_latest_adaptive_forward_cached() -> tuple[pd.DataFrame, str]:
+    local = _load_latest_adaptive_forward_from_duckdb()
+    if not local.empty:
+        return local, "duckdb_local"
+
+    auth = _load_latest_adaptive_forward_from_auth()
+    if not auth.empty:
+        return auth, "neon_auth"
+
+    return pd.DataFrame(), "missing"
+
+
+def _load_adaptive_quality_from_duckdb(
+    duckdb_path: str | Path = "data/kintuadi.duckdb",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if duckdb is None:
+        return pd.DataFrame(), pd.DataFrame()
+
+    db_path = Path(duckdb_path)
+    if not db_path.exists():
+        return pd.DataFrame(), pd.DataFrame()
+
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        try:
+            tables = set(con.execute("SHOW TABLES").df()["name"].str.lower().tolist())
+        except Exception:
+            tables = set()
+
+        obs = pd.DataFrame()
+        summary = pd.DataFrame()
+        if _ADAPTIVE_QUALITY_LOCAL_TABLE.lower() in tables:
+            obs = _normalize_adaptive_quality_table(
+                con.execute(
+                    f"""
+                    SELECT *
+                    FROM {_ADAPTIVE_QUALITY_LOCAL_TABLE}
+                    ORDER BY forecast_ts, generated_at
+                    """
+                ).df()
+            )
+        if _ADAPTIVE_QUALITY_SUMMARY_LOCAL_TABLE.lower() in tables:
+            summary = _normalize_adaptive_quality_table(
+                con.execute(
+                    f"""
+                    SELECT *
+                    FROM {_ADAPTIVE_QUALITY_SUMMARY_LOCAL_TABLE}
+                    ORDER BY window_days, lead_bucket
+                    """
+                ).df()
+            )
+        return obs, summary
+    finally:
+        con.close()
+
+
+def _load_adaptive_quality_from_auth() -> tuple[pd.DataFrame, pd.DataFrame]:
+    if psycopg2 is None:
+        return pd.DataFrame(), pd.DataFrame()
+
+    auth_url = _adaptive_auth_url()
+    if not auth_url:
+        return pd.DataFrame(), pd.DataFrame()
+
+    conn = psycopg2.connect(auth_url)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT to_regclass(%s), to_regclass(%s)", (_ADAPTIVE_QUALITY_AUTH_TABLE, _ADAPTIVE_QUALITY_SUMMARY_AUTH_TABLE))
+        exists = cur.fetchone()
+        cur.close()
+        if not exists:
+            return pd.DataFrame(), pd.DataFrame()
+
+        obs = pd.DataFrame()
+        summary = pd.DataFrame()
+        if exists[0]:
+            obs = _normalize_adaptive_quality_table(
+                pd.read_sql_query(
+                    f"SELECT * FROM {_ADAPTIVE_QUALITY_AUTH_TABLE} ORDER BY forecast_ts, generated_at",
+                    conn,
+                )
+            )
+        if len(exists) > 1 and exists[1]:
+            summary = _normalize_adaptive_quality_table(
+                pd.read_sql_query(
+                    f"SELECT * FROM {_ADAPTIVE_QUALITY_SUMMARY_AUTH_TABLE} ORDER BY window_days, lead_bucket",
+                    conn,
+                )
+            )
+        return obs, summary
+    except Exception:
+        return pd.DataFrame(), pd.DataFrame()
+    finally:
+        conn.close()
+
+
+@st.cache_data(show_spinner=False, ttl=_ADAPTIVE_FORWARD_CACHE_TTL)
+def _load_adaptive_quality_cached() -> tuple[pd.DataFrame, pd.DataFrame, str]:
+    obs_local, summary_local = _load_adaptive_quality_from_duckdb()
+    if not obs_local.empty or not summary_local.empty:
+        return obs_local, summary_local, "duckdb_local"
+
+    obs_auth, summary_auth = _load_adaptive_quality_from_auth()
+    if not obs_auth.empty or not summary_auth.empty:
+        return obs_auth, summary_auth, "neon_auth"
+
+    return pd.DataFrame(), pd.DataFrame(), "missing"
+
+
+def _run_adaptive_forward_now(
+    hourly_df: pd.DataFrame,
+    persist: bool = True,
+    horizon_hours: int = _ADAPTIVE_FORWARD_HOURS,
+    n_paths: int = _ADAPTIVE_FORWARD_PATHS,
+):
+    if not _ADAPTIVE_OK or AdaptivePLDForwardEngine is None:
+        raise RuntimeError(
+            "AdaptivePLDForwardEngine indisponivel."
+            + (f" Detalhe: {_ADAPTIVE_ERR}" if _ADAPTIVE_ERR else "")
+        )
+
+    engine = AdaptivePLDForwardEngine(
+        duckdb_path="data/kintuadi.duckdb",
+        horizon_hours=horizon_hours,
+        n_paths=n_paths,
+    )
+    return engine.run(hourly_df=hourly_df, persist=persist)
+
+
+def _adaptive_regime_label(low: float, mid: float, high: float) -> str:
+    mapping = {
+        "Abundancia": float(low),
+        "Normal": float(mid),
+        "Stress": float(high),
+    }
+    return max(mapping, key=mapping.get)
+
+
+def _adaptive_scalar(value: Any, default: float = 0.0) -> float:
+    try:
+        scalar = float(pd.to_numeric(value, errors="coerce"))
+        if np.isnan(scalar):
+            return float(default)
+        return scalar
+    except Exception:
+        return float(default)
+
+
+def _adaptive_run_summary(forward_df: pd.DataFrame) -> Dict[str, Any]:
+    lead = forward_df.iloc[0]
+    tail = forward_df.iloc[-1]
+    return {
+        "generated_at": pd.to_datetime(lead.get("generated_at")),
+        "source": str(lead.get("history_source", "n/d")),
+        "run_id": str(lead.get("run_id", "")),
+        "current_era": int(_adaptive_scalar(lead.get("era_id"), default=0.0)),
+        "regime_label": _adaptive_regime_label(
+            _adaptive_scalar(lead.get("regime_prob_low"), default=0.0),
+            _adaptive_scalar(lead.get("regime_prob_mid"), default=0.0),
+            _adaptive_scalar(lead.get("regime_prob_high"), default=0.0),
+        ),
+        "regime_low": _adaptive_scalar(lead.get("regime_prob_low"), default=0.0),
+        "regime_mid": _adaptive_scalar(lead.get("regime_prob_mid"), default=0.0),
+        "regime_high": _adaptive_scalar(lead.get("regime_prob_high"), default=0.0),
+        "pld_p50_final": _adaptive_scalar(tail.get("pld_p50"), default=0.0),
+        "pld_p10_final": _adaptive_scalar(tail.get("pld_p10"), default=0.0),
+        "pld_p90_final": _adaptive_scalar(tail.get("pld_p90"), default=0.0),
+        "spdi_final": _adaptive_scalar(tail.get("expected_spdi"), default=0.0),
+        "cost_final": _adaptive_scalar(tail.get("expected_custo_fisico"), default=0.0),
+        "confidence_global": _adaptive_scalar(lead.get("confidence_score_global"), default=0.0),
+        "abundance_final": _adaptive_scalar(tail.get("scenario_abundance"), default=0.0),
+        "base_final": _adaptive_scalar(tail.get("scenario_base"), default=0.0),
+        "stress_final": _adaptive_scalar(tail.get("scenario_stress"), default=0.0),
+    }
+
+
+def _adaptive_history_context(
+    history_df: pd.DataFrame,
+    col_name: str,
+    cutoff: pd.Timestamp,
+    upper_clip: Optional[float] = None,
+) -> pd.Series:
+    if col_name not in history_df.columns:
+        return pd.Series(dtype=float)
+
+    hist = pd.to_numeric(history_df[col_name], errors="coerce").dropna()
+    if hist.empty:
+        return hist
+
+    hist.index = pd.to_datetime(hist.index, errors="coerce")
+    hist = hist[~hist.index.isna()]
+    hist = hist.sort_index()
+    hist = hist[hist.index >= cutoff]
+    if upper_clip is not None:
+        hist = hist[hist < upper_clip]
+    return hist
+
+
+def _derive_adaptive_submarket_forward(
+    history_df: pd.DataFrame,
+    forward_df: pd.DataFrame,
+) -> pd.DataFrame:
+    if forward_df.empty or "forecast_ts" not in forward_df.columns or "pld" not in history_df.columns:
+        return forward_df.copy()
+
+    out = forward_df.copy()
+    history = history_df.copy()
+    history.index = pd.to_datetime(history.index, errors="coerce")
+    history = history[~history.index.isna()].sort_index()
+    if history.empty:
+        return out
+
+    sin_hist = pd.to_numeric(history["pld"], errors="coerce")
+    forecast_keys = pd.DataFrame({"forecast_ts": pd.to_datetime(out["forecast_ts"], errors="coerce")})
+    forecast_keys["month"] = forecast_keys["forecast_ts"].dt.month.astype(int)
+    forecast_keys["hour"] = forecast_keys["forecast_ts"].dt.hour.astype(int)
+    recent_cutoff = forecast_keys["forecast_ts"].min() - pd.Timedelta(days=180)
+
+    for submarket, spec in _ADAPTIVE_SUBMARKETS.items():
+        history_col = spec["history_col"]
+        if history_col not in history.columns:
+            continue
+
+        spread = pd.to_numeric(history[history_col], errors="coerce") - sin_hist
+        spread = spread.replace([np.inf, -np.inf], np.nan).dropna()
+        if len(spread) < 24:
+            continue
+
+        clip_low = float(spread.quantile(0.01))
+        clip_high = float(spread.quantile(0.99))
+        spread = spread.clip(lower=clip_low, upper=clip_high)
+        spread_df = pd.DataFrame({"spread": spread})
+        spread_df["month"] = spread_df.index.month.astype(int)
+        spread_df["hour"] = spread_df.index.hour.astype(int)
+        recent_df = spread_df[spread_df.index >= recent_cutoff]
+
+        lookup = forecast_keys.copy()
+        lookup = lookup.merge(
+            recent_df.groupby(["month", "hour"])["spread"].median().rename("spread_recent_mh"),
+            left_on=["month", "hour"],
+            right_index=True,
+            how="left",
+        )
+        lookup = lookup.merge(
+            spread_df.groupby(["month", "hour"])["spread"].median().rename("spread_all_mh"),
+            left_on=["month", "hour"],
+            right_index=True,
+            how="left",
+        )
+        lookup = lookup.merge(
+            recent_df.groupby("hour")["spread"].median().rename("spread_recent_h"),
+            left_on="hour",
+            right_index=True,
+            how="left",
+        )
+        lookup = lookup.merge(
+            spread_df.groupby("hour")["spread"].median().rename("spread_all_h"),
+            left_on="hour",
+            right_index=True,
+            how="left",
+        )
+        lookup = lookup.merge(
+            spread_df.groupby("month")["spread"].median().rename("spread_month"),
+            left_on="month",
+            right_index=True,
+            how="left",
+        )
+
+        weighted_sum = np.zeros(len(lookup), dtype=float)
+        weight_sum = np.zeros(len(lookup), dtype=float)
+        for col_name, weight in [
+            ("spread_recent_mh", 0.40),
+            ("spread_all_mh", 0.30),
+            ("spread_recent_h", 0.15),
+            ("spread_all_h", 0.10),
+            ("spread_month", 0.05),
+        ]:
+            values = pd.to_numeric(lookup[col_name], errors="coerce")
+            mask = values.notna().to_numpy(dtype=bool)
+            if mask.any():
+                weighted_sum[mask] += values.to_numpy(dtype=float)[mask] * weight
+                weight_sum[mask] += weight
+
+        spread_base = float(spread.median())
+        spread_est = np.where(weight_sum > 0, weighted_sum / weight_sum, spread_base)
+        spread_est = np.clip(spread_est, clip_low, clip_high)
+        spread_col = f"spread_{submarket.lower()}"
+        out[spread_col] = spread_est
+
+        for source_col, target_col in [
+            ("expected_pld", f"expected_pld_{submarket.lower()}"),
+            ("pld_p10", f"pld_{submarket.lower()}_p10"),
+            ("pld_p50", f"pld_{submarket.lower()}_p50"),
+            ("pld_p90", f"pld_{submarket.lower()}_p90"),
+            ("scenario_abundance", f"scenario_abundance_{submarket.lower()}"),
+            ("scenario_base", f"scenario_base_{submarket.lower()}"),
+            ("scenario_stress", f"scenario_stress_{submarket.lower()}"),
+        ]:
+            if source_col in out.columns:
+                out[target_col] = pd.to_numeric(out[source_col], errors="coerce") + spread_est
+
+    return out
+
+
+def _plot_adaptive_pld_forward(history_df: pd.DataFrame, forward_df: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+
+    cutoff = pd.to_datetime(forward_df["forecast_ts"].min()) - pd.Timedelta(days=_ADAPTIVE_FORWARD_CONTEXT_DAYS)
+    hist = _adaptive_history_context(history_df, "pld", cutoff=cutoff)
+    if not hist.empty:
+        fig.add_trace(go.Scatter(
+            x=hist.index,
+            y=hist.values,
+            mode="lines",
+            name="PLD historico",
+            line=dict(color=_COLORS["blue"], width=1.4),
+            hovertemplate="Data: %{x|%d/%m/%Y %H:%M}<br>PLD: R$ %{y:,.0f}<extra></extra>",
+        ))
+
+    x_vals = forward_df["forecast_ts"]
+    fig.add_trace(go.Scatter(
+        x=list(x_vals) + list(x_vals[::-1]),
+        y=list(forward_df["pld_p90"]) + list(forward_df["pld_p10"][::-1]),
+        fill="toself",
+        fillcolor=_hex_rgba(_COLORS["blue"], 0.18),
+        line=dict(color="rgba(0,0,0,0)"),
+        hoverinfo="skip",
+        name="Banda P10-P90",
+    ))
+    fig.add_trace(go.Scatter(
+        x=x_vals,
+        y=forward_df["pld_p50"],
+        mode="lines",
+        name="PLD P50",
+        line=dict(color=_COLORS["gold"], width=2.0),
+        hovertemplate="Data: %{x|%d/%m/%Y %H:%M}<br>P50: R$ %{y:,.0f}<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=x_vals,
+        y=forward_df["scenario_abundance"],
+        mode="lines",
+        name="Cenario abundance",
+        line=dict(color=_COLORS["green"], width=1.1, dash="dot"),
+    ))
+    fig.add_trace(go.Scatter(
+        x=x_vals,
+        y=forward_df["scenario_base"],
+        mode="lines",
+        name="Cenario base",
+        line=dict(color="#d1d5db", width=1.0, dash="dash"),
+    ))
+    fig.add_trace(go.Scatter(
+        x=x_vals,
+        y=forward_df["scenario_stress"],
+        mode="lines",
+        name="Cenario stress",
+        line=dict(color=_COLORS["red"], width=1.1, dash="dot"),
+    ))
+    forward_start = pd.to_datetime(x_vals.iloc[0])
+    fig.add_shape(
+        type="line",
+        x0=forward_start,
+        x1=forward_start,
+        y0=0,
+        y1=1,
+        xref="x",
+        yref="paper",
+        line=dict(color="#6b7280", dash="dot", width=1),
+    )
+    fig.add_annotation(
+        x=forward_start,
+        y=1,
+        xref="x",
+        yref="paper",
+        text="Inicio do forward",
+        showarrow=False,
+        xanchor="left",
+        yanchor="bottom",
+        font=dict(size=10, color="#9ca3af"),
+        bgcolor="rgba(11,18,34,0.65)",
+    )
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=_COLORS["bg"],
+        plot_bgcolor=_COLORS["panel"],
+        height=420,
+        margin=dict(l=40, r=20, t=45, b=30),
+        title=dict(
+            text="PLD horario - historico recente + forward estrutural (6 meses)",
+            font=dict(size=13, color="#e5e7eb"),
+        ),
+        xaxis=dict(gridcolor="#1f2937"),
+        yaxis=dict(title="R$/MWh", gridcolor="#1f2937"),
+        legend=dict(orientation="h", y=1.08, font=dict(size=10)),
+    )
+    return fig
+
+
+def _plot_adaptive_submarket_forward(
+    history_df: pd.DataFrame,
+    forward_df: pd.DataFrame,
+    submarket: str,
+) -> go.Figure:
+    spec = _ADAPTIVE_SUBMARKETS.get(submarket.upper())
+    if spec is None:
+        return go.Figure()
+
+    p10_col = f"pld_{submarket.lower()}_p10"
+    p50_col = f"pld_{submarket.lower()}_p50"
+    p90_col = f"pld_{submarket.lower()}_p90"
+    if any(col not in forward_df.columns for col in (p10_col, p50_col, p90_col)):
+        return go.Figure()
+
+    fig = go.Figure()
+    cutoff = pd.to_datetime(forward_df["forecast_ts"].min()) - pd.Timedelta(days=_ADAPTIVE_FORWARD_CONTEXT_DAYS)
+    hist = _adaptive_history_context(history_df, spec["history_col"], cutoff=cutoff)
+    if not hist.empty:
+        fig.add_trace(go.Scatter(
+            x=hist.index,
+            y=hist.values,
+            mode="lines",
+            name=f"{spec['label']} historico",
+            line=dict(color="#94a3b8", width=1.2),
+            hovertemplate="Data: %{x|%d/%m/%Y %H:%M}<br>PLD: R$ %{y:,.0f}<extra></extra>",
+        ))
+
+    x_vals = forward_df["forecast_ts"]
+    fig.add_trace(go.Scatter(
+        x=list(x_vals) + list(x_vals[::-1]),
+        y=list(forward_df[p90_col]) + list(forward_df[p10_col][::-1]),
+        fill="toself",
+        fillcolor=_hex_rgba(spec["color"], 0.16),
+        line=dict(color="rgba(0,0,0,0)"),
+        hoverinfo="skip",
+        name="Banda P10-P90",
+        showlegend=False,
+    ))
+    fig.add_trace(go.Scatter(
+        x=x_vals,
+        y=forward_df[p50_col],
+        mode="lines",
+        name=f"{spec['label']} P50",
+        line=dict(color=spec["color"], width=1.8),
+        hovertemplate="Data: %{x|%d/%m/%Y %H:%M}<br>P50: R$ %{y:,.0f}<extra></extra>",
+        showlegend=False,
+    ))
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=_COLORS["bg"],
+        plot_bgcolor=_COLORS["panel"],
+        height=280,
+        margin=dict(l=36, r=16, t=42, b=26),
+        title=dict(
+            text=f"{spec['label']} - forward derivado do SIN + spread historico",
+            font=dict(size=12, color="#e5e7eb"),
+        ),
+        xaxis=dict(gridcolor="#1f2937"),
+        yaxis=dict(title="R$/MWh", gridcolor="#1f2937"),
+    )
+    return fig
+
+
+def _plot_adaptive_spdi_forward(history_df: pd.DataFrame, forward_df: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+
+    hist = _adaptive_history_context(
+        history_df,
+        "spdi",
+        cutoff=pd.Timestamp.now() - pd.Timedelta(days=90),
+        upper_clip=9.8,
+    )
+    if not hist.empty:
+        hist = hist[hist > 0]
+        hist_daily = hist.resample("D").median()
+        if not hist_daily.empty:
+            fig.add_trace(go.Scatter(
+                x=hist_daily.index,
+                y=hist_daily.values,
+                mode="lines",
+                name="SPDI historico",
+                line=dict(color=_COLORS["gold"], width=1.6),
+                hovertemplate="Data: %{x|%d/%m/%Y}<br>SPDI: %{y:.2f}x<extra></extra>",
+            ))
+
+    daily = (
+        forward_df.set_index("forecast_ts")[["spdi_p10", "spdi_p50", "spdi_p90", "expected_spdi"]]
+        .resample("D")
+        .median()
+        .dropna(how="all")
+        .reset_index()
+    )
+    if not daily.empty:
+        fig.add_trace(go.Scatter(
+            x=list(daily["forecast_ts"]) + list(daily["forecast_ts"][::-1]),
+            y=list(daily["spdi_p90"]) + list(daily["spdi_p10"][::-1]),
+            fill="toself",
+            fillcolor=_hex_rgba(_COLORS["blue"], 0.18),
+            line=dict(color="rgba(0,0,0,0)"),
+            hoverinfo="skip",
+            name="Banda P10-P90",
+        ))
+        fig.add_trace(go.Scatter(
+            x=daily["forecast_ts"],
+            y=daily["spdi_p50"],
+            mode="lines",
+            name="SPDI P50",
+            line=dict(color=_COLORS["gold"], width=1.8, dash="dash"),
+        ))
+
+    for level, color, label in [
+        (1.0, "#34d399", "Alinhado (1.0)"),
+        (1.3, "#c8a44d", "Premio estrutural (1.3)"),
+        (1.6, "#f87171", "Distorsao forte (1.6)"),
+    ]:
+        fig.add_hline(
+            y=level,
+            line_color=color,
+            line_dash="dot",
+            line_width=1,
+            annotation_text=label,
+            annotation_font_color=color,
+            annotation_font_size=10,
+        )
+
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=_COLORS["bg"],
+        plot_bgcolor=_COLORS["panel"],
+        height=320,
+        margin=dict(l=40, r=20, t=45, b=30),
+        title=dict(
+            text="SPDI esperado por regime - mesma leitura visual da aba de encargos",
+            font=dict(size=13, color="#e5e7eb"),
+        ),
+        xaxis=dict(gridcolor="#1f2937"),
+        yaxis=dict(title="SPDI (x)", gridcolor="#1f2937"),
+        legend=dict(orientation="h", y=1.08, font=dict(size=10)),
+    )
+    return fig
+
+
+def _plot_adaptive_cost_forward(forward_df: pd.DataFrame) -> go.Figure:
+    daily = (
+        forward_df.set_index("forecast_ts")[["expected_custo_fisico", "pld_p50"]]
+        .resample("D")
+        .mean()
+        .dropna(how="all")
+        .reset_index()
+    )
+    fig = go.Figure()
+    if not daily.empty:
+        fig.add_trace(go.Scatter(
+            x=daily["forecast_ts"],
+            y=daily["expected_custo_fisico"],
+            mode="lines",
+            name="Custo fisico esperado",
+            line=dict(color=_COLORS["green"], width=1.8),
+        ))
+        fig.add_trace(go.Scatter(
+            x=daily["forecast_ts"],
+            y=daily["pld_p50"],
+            mode="lines",
+            name="PLD P50",
+            line=dict(color=_COLORS["gold"], width=1.8),
+        ))
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=_COLORS["bg"],
+        plot_bgcolor=_COLORS["panel"],
+        height=320,
+        margin=dict(l=40, r=20, t=45, b=30),
+        title=dict(
+            text="Relacao estrutural: custo fisico projetado versus PLD P50",
+            font=dict(size=13, color="#e5e7eb"),
+        ),
+        xaxis=dict(gridcolor="#1f2937"),
+        yaxis=dict(title="R$/MWh", gridcolor="#1f2937"),
+        legend=dict(orientation="h", y=1.08, font=dict(size=10)),
+    )
+    return fig
+
+
+def _adaptive_quality_lead_label(bucket: str) -> str:
+    mapping = {
+        "all": "Todos",
+        "h001_024": "1-24h",
+        "h025_072": "25-72h",
+        "h073_168": "73-168h",
+        "h169_336": "169-336h",
+        "h337_720": "337-720h",
+        "h721_1440": "721-1440h",
+        "h1441_2160": "1441-2160h",
+        "h2161_plus": "2161h+",
+    }
+    return mapping.get(str(bucket), str(bucket))
+
+
+def _adaptive_quality_latest_row(
+    quality_summary_df: pd.DataFrame,
+    window_days: int = 30,
+    lead_bucket: str = "all",
+) -> Dict[str, Any]:
+    if quality_summary_df.empty:
+        return {}
+    summary = quality_summary_df.copy()
+    summary["window_days"] = pd.to_numeric(summary["window_days"], errors="coerce")
+    row = summary[
+        (summary["window_days"] == int(window_days))
+        & (summary["lead_bucket"].astype(str) == str(lead_bucket))
+    ]
+    if row.empty:
+        return {}
+    return row.iloc[0].to_dict()
+
+
+def _adaptive_quality_last_issue(quality_obs_df: pd.DataFrame) -> pd.DataFrame:
+    if quality_obs_df.empty or "forecast_ts" not in quality_obs_df.columns:
+        return pd.DataFrame()
+    out = quality_obs_df.copy()
+    out["forecast_ts"] = pd.to_datetime(out["forecast_ts"], errors="coerce")
+    out["generated_at"] = pd.to_datetime(out["generated_at"], errors="coerce")
+    out = out.dropna(subset=["forecast_ts", "generated_at"])
+    if out.empty:
+        return out
+    out = out.sort_values(["forecast_ts", "generated_at"])
+    return out.drop_duplicates(subset=["forecast_ts"], keep="last").reset_index(drop=True)
+
+
+def _plot_adaptive_quality_error_trend(quality_obs_df: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    last_issue = _adaptive_quality_last_issue(quality_obs_df)
+    if last_issue.empty:
+        return fig
+
+    daily = (
+        last_issue.assign(actual_date=lambda x: pd.to_datetime(x["forecast_ts"]).dt.normalize())
+        .groupby("actual_date")
+        .agg(
+            mae=("abs_error", "mean"),
+            mape_pct=("ape", lambda s: float(pd.to_numeric(s, errors="coerce").mean() * 100.0)),
+            band_coverage=("inside_band", "mean"),
+        )
+        .reset_index()
+        .sort_values("actual_date")
+    )
+    if daily.empty:
+        return fig
+
+    daily["mae_7d"] = daily["mae"].rolling(7, min_periods=1).mean()
+    daily["coverage_7d"] = daily["band_coverage"].rolling(7, min_periods=1).mean()
+
+    fig.add_trace(go.Bar(
+        x=daily["actual_date"],
+        y=daily["mae"],
+        name="MAE diario",
+        marker_color=_hex_rgba(_COLORS["blue"], 0.45),
+        hovertemplate="Data: %{x|%d/%m/%Y}<br>MAE: R$ %{y:,.0f}<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=daily["actual_date"],
+        y=daily["mae_7d"],
+        mode="lines",
+        name="MAE movel 7d",
+        line=dict(color=_COLORS["gold"], width=2.0),
+        hovertemplate="Data: %{x|%d/%m/%Y}<br>MAE 7d: R$ %{y:,.0f}<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=daily["actual_date"],
+        y=daily["coverage_7d"] * 100.0,
+        mode="lines",
+        name="Cobertura banda 7d",
+        line=dict(color=_COLORS["green"], width=1.8, dash="dot"),
+        yaxis="y2",
+        hovertemplate="Data: %{x|%d/%m/%Y}<br>Cobertura 7d: %{y:.1f}%<extra></extra>",
+    ))
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=_COLORS["bg"],
+        plot_bgcolor=_COLORS["panel"],
+        height=340,
+        margin=dict(l=40, r=40, t=45, b=30),
+        title=dict(
+            text="Qualidade do último forecast emitido antes do PLD realizado",
+            font=dict(size=13, color="#e5e7eb"),
+        ),
+        xaxis=dict(gridcolor="#1f2937"),
+        yaxis=dict(title="Erro absoluto (R$/MWh)", gridcolor="#1f2937"),
+        yaxis2=dict(
+            title="Cobertura (%)",
+            overlaying="y",
+            side="right",
+            range=[0, 100],
+            showgrid=False,
+            tickformat=".0f",
+        ),
+        legend=dict(orientation="h", y=1.08, font=dict(size=10)),
+    )
+    return fig
+
+
+def _plot_adaptive_quality_by_lead(quality_summary_df: pd.DataFrame, window_days: int = 30) -> go.Figure:
+    fig = go.Figure()
+    if quality_summary_df.empty:
+        return fig
+
+    summary = quality_summary_df.copy()
+    summary["window_days"] = pd.to_numeric(summary["window_days"], errors="coerce")
+    summary = summary[
+        (summary["window_days"] == int(window_days))
+        & (summary["lead_bucket"].astype(str) != "all")
+    ].copy()
+    if summary.empty:
+        return fig
+
+    summary["lead_label"] = summary["lead_bucket"].map(_adaptive_quality_lead_label)
+    fig.add_trace(go.Bar(
+        x=summary["lead_label"],
+        y=summary["weighted_mae"],
+        name="MAE ponderado",
+        marker_color=_COLORS["gold"],
+        hovertemplate="Horizonte: %{x}<br>MAE ponderado: R$ %{y:,.0f}<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=summary["lead_label"],
+        y=summary["band_coverage"] * 100.0,
+        mode="lines+markers",
+        name="Cobertura P10-P90",
+        line=dict(color=_COLORS["blue"], width=2.0),
+        marker=dict(size=7),
+        yaxis="y2",
+        hovertemplate="Horizonte: %{x}<br>Cobertura: %{y:.1f}%<extra></extra>",
+    ))
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=_COLORS["bg"],
+        plot_bgcolor=_COLORS["panel"],
+        height=320,
+        margin=dict(l=40, r=40, t=45, b=30),
+        title=dict(
+            text=f"Perfil de qualidade por horizonte observado ({window_days} dias)",
+            font=dict(size=13, color="#e5e7eb"),
+        ),
+        xaxis=dict(gridcolor="#1f2937"),
+        yaxis=dict(title="MAE ponderado (R$/MWh)", gridcolor="#1f2937"),
+        yaxis2=dict(
+            title="Cobertura (%)",
+            overlaying="y",
+            side="right",
+            range=[0, 100],
+            showgrid=False,
+            tickformat=".0f",
+        ),
+        legend=dict(orientation="h", y=1.08, font=dict(size=10)),
+    )
+    return fig
+
+
+def _render_adaptive_forward_section(df: pd.DataFrame) -> None:
+    st.markdown("""
+    <div class='epje-card' style='border-left-color:#60a5fa'>
+      <strong style='color:#60a5fa'>Adaptive PLD Forward Engine</strong><br>
+      <span style='font-size:.84rem;color:#9ca3af'>
+        Estrutura unica para o PJE: o PLD nao e previsto diretamente.
+        O motor simula o SIN, estima o custo fisico e aplica o SPDI por era,
+        regime, mes e hora, sempre com decomposicao entre tendencia e choque.
+      </span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if not _ADAPTIVE_OK:
+        st.warning("AdaptivePLDForwardEngine indisponivel no ambiente atual.")
+        if _ADAPTIVE_ERR:
+            st.caption(_ADAPTIVE_ERR)
+        return
+
+    forward_df, source_tag = _load_latest_adaptive_forward_cached()
+    refresh_now = False
+    stale_snapshot = False
+
+    if not forward_df.empty and "generated_at" in forward_df.columns:
+        last_generated = pd.to_datetime(forward_df["generated_at"].iloc[0], errors="coerce")
+        if pd.notna(last_generated):
+            stale_snapshot = (pd.Timestamp.utcnow().tz_localize(None) - last_generated) > pd.Timedelta(days=7)
+
+    action_col, info_col = st.columns([1, 2])
+    with action_col:
+        refresh_now = st.button("Atualizar forecast estrutural", key="btn_adaptive_forward_refresh")
+    with info_col:
+        st.caption(
+            "Horizonte: 6 meses horarios | Monte Carlo: 1000 trajetorias | "
+            "Retreino automatico semanal."
+        )
+
+    if stale_snapshot:
+        st.caption("Snapshot com mais de 7 dias. O app vai tentar recalcular agora para alinhar o SPDI recente.")
+
+    if refresh_now or forward_df.empty or stale_snapshot:
+        with st.spinner("Executando AdaptivePLDForwardEngine..."):
+            try:
+                result = _run_adaptive_forward_now(
+                    df,
+                    persist=True,
+                    horizon_hours=_ADAPTIVE_FORWARD_HOURS,
+                    n_paths=_ADAPTIVE_FORWARD_PATHS,
+                )
+                forward_df = _normalize_adaptive_forward_table(result.hourly_table)
+                source_tag = "computed_now"
+                _load_latest_adaptive_forward_cached.clear()
+                _load_adaptive_quality_cached.clear()
+            except Exception as exc:
+                if forward_df.empty:
+                    st.error(f"Nao foi possivel gerar o forward estrutural: {exc}")
+                    return
+                st.warning(f"Falha ao recalcular agora. Exibindo ultimo snapshot disponivel. Detalhe: {exc}")
+
+    if forward_df.empty:
+        st.info("Nenhum snapshot estrutural disponivel ainda.")
+        return
+
+    forward_df = _derive_adaptive_submarket_forward(df, forward_df)
+    quality_obs_df, quality_summary_df, quality_source = _load_adaptive_quality_cached()
+    summary = _adaptive_run_summary(forward_df)
+    generated_at = summary["generated_at"]
+    generated_label = (
+        generated_at.strftime("%d/%m/%Y %H:%M") if isinstance(generated_at, pd.Timestamp) and not pd.isna(generated_at) else "n/d"
+    )
+    st.caption(
+        f"Snapshot: {generated_label} | fonte: {source_tag} | run_id: `{summary['run_id'][:24]}`"
+    )
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Era estrutural", f"Era {summary['current_era']}")
+    k2.metric(
+        "Regime dominante",
+        summary["regime_label"],
+        f"stress {summary['regime_high']:.0%}",
+    )
+    k3.metric(
+        "PLD P50 no fim do horizonte",
+        f"R$ {summary['pld_p50_final']:,.0f}",
+        f"P10-P90: {summary['pld_p10_final']:,.0f} / {summary['pld_p90_final']:,.0f}",
+    )
+    k4.metric(
+        "Confianca global",
+        f"{summary['confidence_global']:.0%}",
+        f"SPDI final {summary['spdi_final']:.2f}x",
+    )
+
+    s1, s2, s3 = st.columns(3)
+    s1.metric("Scenario abundance", f"R$ {summary['abundance_final']:,.0f}")
+    s2.metric("Scenario base", f"R$ {summary['base_final']:,.0f}")
+    s3.metric("Scenario stress", f"R$ {summary['stress_final']:,.0f}", f"Custo fisico: R$ {summary['cost_final']:,.0f}")
+
+    forecast_start = pd.to_datetime(forward_df["forecast_ts"].min())
+    forecast_end = pd.to_datetime(forward_df["forecast_ts"].max())
+    default_end = min(forecast_start + pd.Timedelta(days=60), forecast_end)
+    selected_window = st.slider(
+        "Periodo exibido no forward",
+        min_value=forecast_start.to_pydatetime(),
+        max_value=forecast_end.to_pydatetime(),
+        value=(forecast_start.to_pydatetime(), default_end.to_pydatetime()),
+        format="DD/MM/YY HH:mm",
+        key="adaptive_forward_window",
+    )
+    window_start = pd.Timestamp(selected_window[0])
+    window_end = pd.Timestamp(selected_window[1])
+    display_forward_df = forward_df[
+        (forward_df["forecast_ts"] >= window_start)
+        & (forward_df["forecast_ts"] <= window_end)
+    ].copy()
+    if display_forward_df.empty:
+        display_forward_df = forward_df.copy()
+    st.caption(
+        f"Exibindo {len(display_forward_df):,} horas entre "
+        f"{window_start.strftime('%d/%m/%Y %H:%M')} e {window_end.strftime('%d/%m/%Y %H:%M')}."
+    )
+
+    tabs = st.tabs([
+        "PLD Forward 6M",
+        "SPDI & Custo Fisico",
+        "Qualidade do forecast",
+        "Tabela horaria",
+        "Metodologia",
+    ])
+
+    with tabs[0]:
+        st.plotly_chart(
+            _plot_adaptive_pld_forward(df, display_forward_df),
+            use_container_width=True,
+            key="adaptive_pld_forward",
+        )
+        st.caption(
+            "Faixa azul = P10-P90. Linha dourada = P50. Linhas tracejadas = 3 futuros representativos extraidos do Monte Carlo."
+        )
+        st.markdown("##### Visao por submercado")
+        sub_cols = st.columns(2)
+        for idx, submarket in enumerate(_ADAPTIVE_SUBMARKETS):
+            with sub_cols[idx % 2]:
+                sub_fig = _plot_adaptive_submarket_forward(df, display_forward_df, submarket)
+                if sub_fig.data:
+                    st.plotly_chart(
+                        sub_fig,
+                        use_container_width=True,
+                        key=f"adaptive_pld_forward_{submarket.lower()}",
+                    )
+                else:
+                    st.info(f"Serie de PLD {submarket} indisponivel no historico carregado.")
+        st.caption(
+            "SE, S, NE e N sao derivados do forward estrutural do SIN com camada de spread horario historico por submercado. "
+            "O filtro de periodo acima vale para todos os graficos e para a tabela exportavel."
+        )
+
+    with tabs[1]:
+        st.plotly_chart(
+            _plot_adaptive_spdi_forward(df, display_forward_df),
+            use_container_width=True,
+            key="adaptive_spdi_forward",
+        )
+        st.caption("Pontos historicos com SPDI clipado no teto tecnico (10x) sao removidos do grafico para evitar leitura contaminada por dados incompletos.")
+        st.plotly_chart(
+            _plot_adaptive_cost_forward(display_forward_df),
+            use_container_width=True,
+            key="adaptive_cost_forward",
+        )
+        st.markdown(
+            "**Formula estrutural:** `PLD = custo_fisico x SPDI`  \n"
+            "O SPDI entra como distorcao economica regime-aware; o custo fisico carrega a dinamica do sistema."
+        )
+
+    with tabs[2]:
+        if quality_summary_df.empty:
+            st.info(
+                "Historico de qualidade ainda indisponivel. Ele passa a aparecer assim que existirem snapshots suficientes "
+                "para comparar forecast vs PLD realizado."
+            )
+        else:
+            st.caption(
+                f"Fonte da auditoria de qualidade: {quality_source}. "
+                "A comparacao usa o PLD oficial realizado ja carregado no banco e todos os snapshots observados do adaptive forward."
+            )
+            quality_window = st.radio(
+                "Janela de avaliacao",
+                options=[30, 90, 180],
+                format_func=lambda value: f"{value} dias",
+                horizontal=True,
+                key="adaptive_quality_window",
+            )
+            quality_row = _adaptive_quality_latest_row(quality_summary_df, window_days=quality_window, lead_bucket="all")
+            if quality_row:
+                q1, q2, q3, q4 = st.columns(4)
+                q1.metric("MAE ponderado", f"R$ {float(quality_row.get('weighted_mae', 0.0)):,.0f}")
+                q2.metric("MAPE ponderado", f"{float(quality_row.get('weighted_mape_pct', 0.0)):.1f}%")
+                q3.metric("Bias ponderado", f"R$ {float(quality_row.get('weighted_bias', 0.0)):+,.0f}")
+                q4.metric("Cobertura P10-P90", f"{float(quality_row.get('band_coverage', 0.0)):.0%}")
+            else:
+                st.info("Nao ha observacoes suficientes nesta janela.")
+
+            if not quality_obs_df.empty:
+                st.plotly_chart(
+                    _plot_adaptive_quality_error_trend(quality_obs_df),
+                    use_container_width=True,
+                    key="adaptive_quality_error_trend",
+                )
+            st.plotly_chart(
+                _plot_adaptive_quality_by_lead(quality_summary_df, window_days=quality_window),
+                use_container_width=True,
+                key="adaptive_quality_by_lead",
+            )
+            detail = quality_summary_df[
+                pd.to_numeric(quality_summary_df["window_days"], errors="coerce") == int(quality_window)
+            ].copy()
+            if not detail.empty:
+                detail["lead_bucket"] = detail["lead_bucket"].map(_adaptive_quality_lead_label)
+                detail = detail.rename(
+                    columns={
+                        "lead_bucket": "Horizonte",
+                        "n_obs": "Observacoes",
+                        "mae": "MAE",
+                        "rmse": "RMSE",
+                        "mape_pct": "MAPE (%)",
+                        "bias": "Bias",
+                        "band_coverage": "Cobertura P10-P90",
+                        "coverage_p10": "Cobertura P10",
+                        "coverage_p90": "Cobertura P90",
+                        "below_p10_rate": "Abaixo do P10",
+                        "above_p90_rate": "Acima do P90",
+                    }
+                )
+                cols = [
+                    "Horizonte",
+                    "Observacoes",
+                    "MAE",
+                    "RMSE",
+                    "MAPE (%)",
+                    "Bias",
+                    "Cobertura P10-P90",
+                    "Cobertura P10",
+                    "Cobertura P90",
+                    "Abaixo do P10",
+                    "Acima do P90",
+                ]
+                st.dataframe(detail[[col for col in cols if col in detail.columns]], use_container_width=True, height=260)
+
+    with tabs[3]:
+        export_cols = [
+            "forecast_ts",
+            "horizon_hour",
+            "expected_pld",
+            "pld_p10",
+            "pld_p50",
+            "pld_p90",
+            "scenario_abundance",
+            "scenario_base",
+            "scenario_stress",
+            "expected_pld_se",
+            "pld_se_p10",
+            "pld_se_p50",
+            "pld_se_p90",
+            "expected_pld_s",
+            "pld_s_p10",
+            "pld_s_p50",
+            "pld_s_p90",
+            "expected_pld_ne",
+            "pld_ne_p10",
+            "pld_ne_p50",
+            "pld_ne_p90",
+            "expected_pld_n",
+            "pld_n_p10",
+            "pld_n_p50",
+            "pld_n_p90",
+            "expected_spdi",
+            "spdi_p10",
+            "spdi_p50",
+            "spdi_p90",
+            "expected_custo_fisico",
+            "custo_fisico_p10",
+            "custo_fisico_p50",
+            "custo_fisico_p90",
+            "regime_prob_low",
+            "regime_prob_mid",
+            "regime_prob_high",
+            "confidence_score",
+        ]
+        view = display_forward_df[[c for c in export_cols if c in display_forward_df.columns]].copy()
+        rename_map = {
+            "forecast_ts": "timestamp",
+            "horizon_hour": "horizon_hour",
+            "expected_pld": "pld_expected",
+            "expected_pld_se": "pld_se_expected",
+            "expected_pld_s": "pld_s_expected",
+            "expected_pld_ne": "pld_ne_expected",
+            "expected_pld_n": "pld_n_expected",
+            "expected_spdi": "spdi_expected",
+            "expected_custo_fisico": "custo_fisico_expected",
+            "regime_prob_low": "prob_abundance",
+            "regime_prob_mid": "prob_normal",
+            "regime_prob_high": "prob_stress",
+            "confidence_score": "confidence",
+        }
+        view = view.rename(columns=rename_map)
+        st.download_button(
+            "Baixar tabela de PLD previsto (CSV)",
+            data=view.to_csv(index=False).encode("utf-8"),
+            file_name="adaptive_pld_forward_hourly.csv",
+            mime="text/csv",
+            key="adaptive_pld_forward_download",
+        )
+        st.dataframe(view, use_container_width=True, height=420)
+
+    with tabs[4]:
+        st.markdown("""
+| Camada | Como o motor trata |
+|---|---|
+| Custo fisico | Simulacao fisica do SIN com EAR, ENA, carga, renovaveis e termicas |
+| Curto prazo | Primeira semana guiada pelo PMO do ONS para ENA, carga, despacho termico e ancora de CMO |
+| SPDI trend | Superficie `era x regime x mes x hora` usando `SPDI_ma24` |
+| SPDI shock | Choques separados do trend, com memoria intradiaria de spikes e espelhamento do padrao horario recente do SPDI |
+| Auto-recalibracao | Feedback diario do erro `forecast vs realizado` corrigindo o SPDI por horizonte, hora, mes e regime |
+| Auditoria de performance | Ledger persistente de erro, bias e cobertura P10-P90 comparando cada snapshot contra o PLD realizado |
+| Nao-estacionariedade | `ruptures` para eras estruturais + `KMeans` para regimes fisicos |
+| Monte Carlo | 1000 trajetorias horarias para os proximos 6 meses |
+| Submercados | Forward SIN ajustado por spread historico mensal-horario de SE, S, NE e N |
+| Saida executiva | P10, P50, P90, 3 cenarios e score de confianca |
+        """)
+        st.caption(
+            "A plataforma usa o ultimo snapshot persistido em DuckDB/Neon AUTH, recalibra diariamente com o PLD realizado e permite recalc manual sob demanda."
+        )
+
+
 def render_premium_tab(df: pd.DataFrame) -> None:
     """Renderiza a tab premium. Chamar dentro de `with tabs[N]:` no app.py."""
 
@@ -1428,17 +2731,24 @@ def render_premium_tab(df: pd.DataFrame) -> None:
       <div class='epje-badge'>✦ Premium</div>
       <p class='epje-title'>Energy Price Justification Engine</p>
       <p class='epje-sub'>
-        Avalia se um preço de energia é coerente com o cenário físico do SIN.<br>
-        Modelo: <code>P(PLD ≥ preço | estado físico, sazonalidade)</code>
+        Simula o sistema fisico, projeta o SPDI e justifica o PLD em uma unica secao.<br>
+        Formula central: <code>PLD = custo_fisico x SPDI</code>
       </p>
     </div>
     """, unsafe_allow_html=True)
 
-    if not _SKLEARN_OK:
-        st.error("⚠️ Dependências ausentes.\n```\nscikit-learn\nscipy\n```")
-        return
     if df.empty:
-        st.warning("Sem dados. Selecione um período com dados disponíveis.")
+        st.warning("Sem dados. Selecione um periodo com dados disponiveis.")
+        return
+
+    _render_adaptive_forward_section(df)
+
+    st.markdown("---")
+    st.markdown("#### PJE pontual")
+    st.caption("Mantem a leitura probabilistica para um preco especifico, agora convivendo com o forward estrutural.")
+
+    if not _SKLEARN_OK:
+        st.info("Analise pontual indisponivel neste ambiente. O forward estrutural acima continua ativo.")
         return
 
     # ── Inputs ────────────────────────────────────────────────────────────────

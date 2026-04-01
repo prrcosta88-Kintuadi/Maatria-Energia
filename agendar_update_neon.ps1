@@ -1,7 +1,8 @@
 # agendar_update_neon.ps1
 # ─────────────────────────────────────────────────────────────────────────────
-# Registra uma tarefa no Agendador de Tarefas do Windows para rodar
-# update_neon.py todo dia às 00h15.
+# Registra tarefas no Agendador de Tarefas do Windows para rodar:
+#   1. update_neon.py todo dia às 00h15
+#   2. refresh do AdaptivePLDForwardEngine toda terça-feira às 22h00
 #
 # Como usar (copie e cole linha a linha no PowerShell):
 #   1. Abra o PowerShell como Administrador
@@ -12,11 +13,14 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Configurações — ajuste se necessário ─────────────────────────────────────
-$TaskName    = "KintuadiEnergia_UpdateNeon"
-$ProjectDir  = (Get-Location).Path          # pasta atual do projeto
-$PythonExe   = (Get-Command python).Source  # detecta python do PATH
-$ScriptFile  = Join-Path $ProjectDir "update_neon.py"
-$LogFile     = Join-Path $ProjectDir "logs\task_scheduler.log"
+$DailyTaskName    = "KintuadiEnergia_UpdateNeon"
+$AdaptiveTaskName = "KintuadiEnergia_AdaptivePLDForwardWeekly"
+$ProjectDir       = (Get-Location).Path          # pasta atual do projeto
+$PythonExe        = (Get-Command python).Source  # detecta python do PATH
+$ScriptFile       = Join-Path $ProjectDir "update_neon.py"
+$LogFile          = Join-Path $ProjectDir "logs\task_scheduler.log"
+$DailyArgs        = "`"$ScriptFile`" --allow-neon-failure --dir data"
+$AdaptiveArgs     = "`"$ScriptFile`" --retrain-forecast --adaptive-forward-only --force-weekly-retrain --dir data"
 # ─────────────────────────────────────────────────────────────────────────────
 
 Write-Host ""
@@ -27,7 +31,8 @@ Write-Host ""
 Write-Host "Diretório do projeto : $ProjectDir"
 Write-Host "Python detectado     : $PythonExe"
 Write-Host "Script               : $ScriptFile"
-Write-Host "Horário              : 00:15 todos os dias"
+Write-Host "Tarefa diária        : 00:15 todos os dias"
+Write-Host "Tarefa adaptive      : 22:00 toda terça-feira"
 Write-Host ""
 
 # Verificar se o script existe
@@ -36,25 +41,42 @@ if (-not (Test-Path $ScriptFile)) {
     exit 1
 }
 
-# Remover tarefa anterior se existir
-if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-    Write-Host "Removendo tarefa anterior '$TaskName'..."
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+# Remover tarefas anteriores se existirem
+if (Get-ScheduledTask -TaskName $DailyTaskName -ErrorAction SilentlyContinue) {
+    Write-Host "Removendo tarefa anterior '$DailyTaskName'..."
+    Unregister-ScheduledTask -TaskName $DailyTaskName -Confirm:$false
+}
+if (Get-ScheduledTask -TaskName $AdaptiveTaskName -ErrorAction SilentlyContinue) {
+    Write-Host "Removendo tarefa anterior '$AdaptiveTaskName'..."
+    Unregister-ScheduledTask -TaskName $AdaptiveTaskName -Confirm:$false
 }
 
-# Criar os objetos da tarefa
-$Action  = New-ScheduledTaskAction `
+# Criar os objetos das tarefas
+$DailyAction = New-ScheduledTaskAction `
     -Execute $PythonExe `
-    -Argument "$ScriptFile" `
+    -Argument $DailyArgs `
     -WorkingDirectory $ProjectDir
 
-$Trigger = New-ScheduledTaskTrigger -Daily -At "00:15"
+$AdaptiveAction = New-ScheduledTaskAction `
+    -Execute $PythonExe `
+    -Argument $AdaptiveArgs `
+    -WorkingDirectory $ProjectDir
+
+$DailyTrigger = New-ScheduledTaskTrigger -Daily -At "00:15"
+$AdaptiveTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Tuesday -At "22:00"
 
 # -StartWhenAvailable: roda assim que possível caso o PC estivesse desligado às 00h15
-$Settings = New-ScheduledTaskSettingsSet `
+$DailySettings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit (New-TimeSpan -Hours 2) `
     -RestartCount 2 `
     -RestartInterval (New-TimeSpan -Minutes 10) `
+    -StartWhenAvailable `
+    -WakeToRun:$false
+
+$AdaptiveSettings = New-ScheduledTaskSettingsSet `
+    -ExecutionTimeLimit (New-TimeSpan -Hours 6) `
+    -RestartCount 1 `
+    -RestartInterval (New-TimeSpan -Minutes 20) `
     -StartWhenAvailable `
     -WakeToRun:$false
 
@@ -63,19 +85,32 @@ $Principal = New-ScheduledTaskPrincipal `
     -LogonType Interactive `
     -RunLevel Highest
 
-# Registrar
+# Registrar tarefa diária
 Register-ScheduledTask `
-    -TaskName  $TaskName `
-    -Action    $Action `
-    -Trigger   $Trigger `
-    -Settings  $Settings `
+    -TaskName  $DailyTaskName `
+    -Action    $DailyAction `
+    -Trigger   $DailyTrigger `
+    -Settings  $DailySettings `
     -Principal $Principal `
     -Description "Atualiza tabelas Neon e triggera rebuild no Render — Kintuadi Energy" `
     | Out-Null
 
-Write-Host "✅ Tarefa '$TaskName' criada com sucesso!"
+# Registrar tarefa semanal do adaptive forward
+Register-ScheduledTask `
+    -TaskName  $AdaptiveTaskName `
+    -Action    $AdaptiveAction `
+    -Trigger   $AdaptiveTrigger `
+    -Settings  $AdaptiveSettings `
+    -Principal $Principal `
+    -Description "Recalcula semanalmente o Adaptive PLD Forward Engine e persiste o snapshot no DuckDB/Neon AUTH — Kintuadi Energy" `
+    | Out-Null
+
+Write-Host "✅ Tarefa '$DailyTaskName' criada com sucesso!"
+Write-Host "✅ Tarefa '$AdaptiveTaskName' criada com sucesso!"
 Write-Host ""
 Write-Host "Para verificar: Abra o Agendador de Tarefas (taskschd.msc)"
-Write-Host "Para testar agora: Start-ScheduledTask -TaskName '$TaskName'"
-Write-Host "Para remover: Unregister-ScheduledTask -TaskName '$TaskName' -Confirm:`$false"
+Write-Host "Para testar a diária: Start-ScheduledTask -TaskName '$DailyTaskName'"
+Write-Host "Para testar a weekly adaptive: Start-ScheduledTask -TaskName '$AdaptiveTaskName'"
+Write-Host "Para remover a diária: Unregister-ScheduledTask -TaskName '$DailyTaskName' -Confirm:`$false"
+Write-Host "Para remover a weekly adaptive: Unregister-ScheduledTask -TaskName '$AdaptiveTaskName' -Confirm:`$false"
 Write-Host ""

@@ -14,12 +14,33 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from premium_engine import render_premium_tab, render_charges_tab
+from bess_engine import render_bess_tab
 try:
     from ccee_charges import enrich_df as _enrich_df
     _CHARGES_OK = True
 except (ImportError, Exception) as _charges_err:
     _CHARGES_OK = False
+
+try:
+    from pld_forecast_engine import (
+        run_forecast, load_models, forecast_short_term,
+        PMO_XLSX, MODEL_DIR, SUBSISTEMAS, SUB_LABEL,
+    )
+    _FORECAST_OK = True
+except Exception:
+    _FORECAST_OK = False
     def _enrich_df(df): return df  # fallback sem encargos
+
+# ── Meta-Model Híbrido (Camada 3) ────────────────────────────────────────────
+try:
+    from meta_forecast_engine import (
+        run_hybrid_forecast, render_hybrid_forecast_tab,
+        load_meta_models, build_and_train_hybrid,
+        classify_regime, REGIME_LABELS,
+    )
+    _META_OK = True
+except Exception:
+    _META_OK = False
 from auth import render_login, render_sidebar, simulation_guard, get_current_user
 from profile import render_profile_page
 
@@ -31,25 +52,84 @@ except Exception:
     db_neon = None  # type: ignore
 
 def _NEON_OK() -> bool:
-    """Verifica conexão Neon em tempo de execução (não no import)."""
+    """Verifica primeiro DuckDB local, depois Neon como fallback."""
+    
+    # PRIORIDADE 1: DuckDB local
+    duckdb_path = Path("data/kintuadi.duckdb")
+    if duckdb_path.exists():
+        try:
+            import duckdb as _ddb
+            _con = _ddb.connect(str(duckdb_path), read_only=True)
+            _con.execute("SELECT 1 FROM pld_historical LIMIT 1").fetchone()
+            
+            # Verificar tabelas essenciais
+            tables = _con.execute("SHOW TABLES").df()["name"].tolist()
+            required = ["pld_historical", "cmo", "geracao_sin_termica"]
+            missing = [t for t in required if t not in tables]
+            
+            if missing:
+                st.session_state["_duckdb_missing_tables"] = missing
+                print(f"⚠️ Tabelas faltando no DuckDB: {missing}")
+            
+            _con.close()
+            st.session_state["_data_source"] = "duckdb_local"
+            st.session_state["_duckdb_tables"] = tables
+            return True
+        except Exception as e:
+            st.session_state["_duckdb_error"] = str(e)
+            print(f"⚠️ DuckDB falhou: {e}")
+    
+    # PRIORIDADE 2: Neon PostgreSQL
     import os as _os
-    import streamlit as _st
     _url = _os.getenv("DATABASE_URL", "")
     if not _url:
-        _st.session_state["_neon_error"] = "DATABASE_URL vazia"
+        st.session_state["_neon_error"] = "DATABASE_URL vazia"
         return False
     try:
         import psycopg2 as _pg
         _c = _pg.connect(_url)
         _c.close()
+        st.session_state["_data_source"] = "neon"
         return True
     except Exception as _e:
-        _st.session_state["_neon_error"] = str(_e)
+        st.session_state["_neon_error"] = str(_e)
         return False
 
+def _check_duckdb_tables():
+    """Verifica quais tabelas estão disponíveis no DuckDB"""
+    duckdb_path = Path("data/kintuadi.duckdb")
+    if not duckdb_path.exists():
+        return []
+    
+    try:
+        import duckdb as _ddb
+        con = _ddb.connect(str(duckdb_path), read_only=True)
+        tables = con.execute("SHOW TABLES").df()["name"].tolist()
+        con.close()
+        return tables
+    except Exception:
+        return []
 
 def _core_cache_token() -> str:
-    """Token de cache baseado no max(data) do PLD — muda quando novos dados chegam."""
+    """Token de cache baseado no max(data) do PLD — prioriza DuckDB local."""
+    
+    # PRIORIDADE 1: DuckDB local
+    duckdb_path = Path("data/kintuadi.duckdb")
+    if duckdb_path.exists():
+        try:
+            import duckdb as _ddb
+            _con = _ddb.connect(str(duckdb_path), read_only=True)
+            row = _con.execute("""
+                SELECT MAX(data) FROM pld_historical 
+                WHERE data IS NOT NULL
+            """).fetchone()
+            _con.close()
+            if row and row[0]:
+                return f"duckdb:{row[0]}"
+        except Exception:
+            pass
+    
+    # PRIORIDADE 2: Neon
     if not _NEON_OK():
         return "neon:offline"
     try:
@@ -62,12 +142,43 @@ def _core_cache_token() -> str:
 
 
 def _core_file_diagnostics() -> list[str]:
+    msgs = []
+    
+    # PRIORIDADE 1: DuckDB local
+    duckdb_path = Path("data/kintuadi.duckdb")
+    if duckdb_path.exists():
+        try:
+            import duckdb as _ddb
+            con = _ddb.connect(str(duckdb_path), read_only=True)
+            duckdb_tables = {
+                "geracao_usina_horaria": "Geração horária (por usina)",
+                "curva_carga": "Carga (curva_carga)",
+                "pld_historical": "PLD histórico",
+                "ear_diario_subsistema": "EAR diário",
+                "despacho_gfom": "Despacho GFOM",
+                "disponibilidade_usina": "Disponibilidade",
+                "restricao_eolica": "Restrição eólica",
+                "cvu_usina_termica": "CVU térmico",
+                "intercambio_nacional": "Intercâmbio",
+            }
+            existing = con.execute("SHOW TABLES").df()["name"].tolist()
+            for table, label in duckdb_tables.items():
+                if table in existing:
+                    row = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+                    msgs.append(f"[DuckDB] {label}: {row[0]:,} linhas")
+                else:
+                    msgs.append(f"[DuckDB] {label}: ❌ tabela ausente")
+            con.close()
+            return msgs
+        except Exception as e:
+            msgs.append(f"[DuckDB] Erro: {e}")
+    
+    # PRIORIDADE 2: Neon
     if not _NEON_OK():
         return ["DATABASE_URL não configurada ou psycopg2 não instalado."]
-    msgs = []
     for table in ["geracao_tipo_hora","curva_carga","pld_historical","ear_diario_subsistema","despacho_gfom"]:
         row = db_neon.fetchone(f"SELECT COUNT(*) FROM {table}")
-        msgs.append(f"{table}: {row[0]:,} linhas" if row else f"{table}: erro")
+        msgs.append(f"[Neon] {table}: {row[0]:,} linhas" if row else f"[Neon] {table}: erro")
     return msgs
 
 
@@ -149,16 +260,604 @@ def _get_section(section: str) -> Dict[str, Any]:
     token = f"{p}:{int(p.stat().st_mtime)}" if p else f"{section}:missing"
     return _load_section_cached(token, section)
 
+def _enrich_df_with_derived(df: pd.DataFrame) -> pd.DataFrame:
+    """Calcula colunas derivadas a partir do DuckDB local."""
+    if df.empty:
+        return df
+    
+    df = df.copy()
+    z = pd.Series(0.0, index=df.index)
+    
+    def _col(name):
+        return pd.to_numeric(df[name], errors="coerce") if name in df.columns else z
+    
+    load_s = _col("load")
+    solar_s = _col("solar")
+    wind_s = _col("wind")
+    hydro_s = _col("hydro")
+    thermal_s = _col("thermal")
+    nuclear_s = _col("nuclear")
+    
+    df["load"] = load_s
+    df["net_load"] = load_s - solar_s.fillna(0) - wind_s.fillna(0)
+    df["carga_total"] = load_s
+    df["renov_total"] = solar_s.fillna(0) + wind_s.fillna(0)
+    df["geracao_total"] = solar_s.fillna(0) + wind_s.fillna(0) + hydro_s.fillna(0) + thermal_s.fillna(0) + nuclear_s.fillna(0)
+    
+    # SIN cost ponderado (simplificado)
+    _sin_cost = load_s.fillna(0) * _col("pld").fillna(0)
+    df["sin_cost"] = _sin_cost.where(_sin_cost > 0, np.nan)
+    df["SIN_cost_R$/h"] = df["sin_cost"]
+    df["pld_ponderado"] = (df["sin_cost"] / load_s.replace(0, np.nan)).where(load_s > 0, np.nan)
+    
+    # EAR_norm e ENA_norm
+    if "ear_pct" in df.columns:
+        df["EAR_norm"] = (df["ear_pct"] / 100.0).clip(lower=0, upper=1)
+    else:
+        df["EAR_norm"] = np.nan
+    
+    if "ena_mlt" in df.columns:
+        df["ENA_norm"] = (df["ena_mlt"] / 100.0).clip(lower=0, upper=1)
+    else:
+        df["ENA_norm"] = np.nan
+    
+    return df
 
 @st.cache_data(show_spinner=False)
 def _build_hourly_df_cached(_token: str) -> pd.DataFrame:
     """
-    Constrói o DataFrame horário lendo o Neon PostgreSQL via queries leves.
-    Cada query retorna apenas as colunas necessárias — RAM < 40MB no Render.
+    Constrói o DataFrame horário com PRIORIDADE DuckDB local.
+    Neon PostgreSQL usado apenas como fallback.
     """
+    
+    # =========================================================================
+    # PRIORIDADE 1: DuckDB local (kintuadi.duckdb)
+    # =========================================================================
+    duckdb_path = Path("data/kintuadi.duckdb")
+    if duckdb_path.exists():
+        try:
+            import duckdb as _ddb
+            con = _ddb.connect(str(duckdb_path), read_only=True)
+            _configure_duckdb_low_memory(con)
+            
+            df = pd.DataFrame()
+            
+            def _join(s: pd.Series) -> None:
+                nonlocal df
+                if s.empty:
+                    return
+                df = df.join(s, how="outer") if not df.empty else s.to_frame()
+            
+            def _ts(s: pd.Series) -> pd.Series:
+                s.index = pd.to_datetime(s.index, errors="coerce")
+                if getattr(s.index, "tz", None):
+                    s.index = s.index.tz_localize(None)
+                return s.dropna()
+            
+            # ── PLD por submercado ─────────────────────────────────────────────
+            pld_df = con.execute("""
+                SELECT 
+                    date_trunc('hour', data) as instante,
+                    UPPER(TRIM(submercado)) as submercado,
+                    AVG(pld) as pld_hora
+                FROM pld_historical
+                WHERE data IS NOT NULL AND pld > 0
+                GROUP BY 1, 2
+                ORDER BY 1, 2
+            """).df()
+            
+            if not pld_df.empty:
+                pld_df["instante"] = pd.to_datetime(pld_df["instante"], errors="coerce")
+                pld_df = pld_df.dropna(subset=["instante", "submercado"])
+                pld_df["pld_hora"] = pd.to_numeric(pld_df["pld_hora"], errors="coerce")
+                
+                SUB_COL = {"SUDESTE": "pld_se", "SUDESTE/CENTRO-OESTE": "pld_se",
+                           "SE": "pld_se", "SE/CO": "pld_se",
+                           "NORDESTE": "pld_ne", "NE": "pld_ne",
+                           "SUL": "pld_s", "S": "pld_s",
+                           "NORTE": "pld_n", "N": "pld_n"}
+                
+                for sub in pld_df["submercado"].unique():
+                    col_name = SUB_COL.get(sub.upper().strip())
+                    if col_name:
+                        sub_s = pld_df[pld_df["submercado"] == sub].set_index("instante")["pld_hora"].rename(col_name)
+                        _join(_ts(sub_s))
+                
+                sin_s = pld_df.groupby("instante")["pld_hora"].mean().rename("pld")
+                _join(_ts(sin_s))
+            
+            # ── CMO por subsistema ────────────────────────────────────────────
+            cmo_df = con.execute("""
+                SELECT 
+                    date_trunc('hour', din_instante) as instante,
+                    UPPER(TRIM(id_subsistema)) as sub,
+                    AVG(val_cmo) as cmo
+                FROM cmo
+                WHERE din_instante IS NOT NULL AND val_cmo > 0
+                GROUP BY 1, 2
+                ORDER BY 1, 2
+            """).df()
+            
+            if not cmo_df.empty:
+                cmo_df["instante"] = pd.to_datetime(cmo_df["instante"], errors="coerce")
+                cmo_df = cmo_df.dropna(subset=["instante", "sub"])
+                cmo_df["cmo"] = pd.to_numeric(cmo_df["cmo"], errors="coerce")
+                
+                SUB_MAP = {"SE": "se", "SUDESTE": "se", "SECO": "se",
+                           "NE": "ne", "NORDESTE": "ne",
+                           "S": "s", "SUL": "s",
+                           "N": "n", "NORTE": "n"}
+                
+                cmo_df["sk"] = cmo_df["sub"].map(SUB_MAP)
+                cmo_df = cmo_df.dropna(subset=["sk"])
+                
+                for sk in ["se", "ne", "s", "n"]:
+                    sub_s = cmo_df[cmo_df["sk"] == sk].set_index("instante")["cmo"].rename(f"cmo_{sk}")
+                    _join(_ts(sub_s))
+                
+                se_s = cmo_df[cmo_df["sk"] == "se"].set_index("instante")["cmo"].rename("cmo_dominante")
+                _join(_ts(se_s))
+            
+            # ── Geração por fonte (geracao_usina_horaria AGREGADA por tipo) ────
+            # Usa a mesma lógica de agregação do load_neon.py:
+            # nom_tipousina → 6 tipos (solar, wind, hydro, thermal, nuclear, other)
+            try:
+                gen_df = con.execute("""
+                    SELECT
+                        date_trunc('hour', din_instante) AS instante,
+                        CASE
+                            WHEN UPPER(nom_tipousina) IN ('FOTOVOLTAICA','SOLAR','FOTOVOLT')
+                                THEN 'solar'
+                            WHEN UPPER(nom_tipousina) IN ('EOLIELÉTRICA','EÓLICA','EOLICA',
+                                 'EOLIELETRICA','EOLIELETRICO','EOLIELÉTRICO','EOL','EOLIELÉTRICA')
+                                THEN 'wind'
+                            WHEN UPPER(nom_tipousina) IN ('HIDROELÉTRICA','HIDROELETRICA',
+                                 'HIDRÁULICA','HIDRAULICA','UHE','PCH','CGH','HIDRO')
+                                THEN 'hydro'
+                            WHEN UPPER(nom_tipousina) IN ('TÉRMICA','TERMICA','UTE',
+                                 'BIOMASSA','GAS','GÁS','OLEO','ÓLEO','CARVAO','CARVÃO','DERIVADOS')
+                                THEN 'thermal'
+                            WHEN UPPER(nom_tipousina) IN ('NUCLEAR','UTN')
+                                THEN 'nuclear'
+                            ELSE 'other'
+                        END AS tipo,
+                        SUM(val_geracao) AS valor
+                    FROM geracao_usina_horaria
+                    WHERE din_instante IS NOT NULL
+                      AND val_geracao IS NOT NULL
+                      AND ano >= 2021
+                    GROUP BY 1, 2
+                    ORDER BY 1, 2
+                """).df()
+
+                if not gen_df.empty:
+                    gen_df["instante"] = pd.to_datetime(gen_df["instante"], errors="coerce")
+                    gen_df = gen_df.dropna(subset=["instante"])
+                    gen_df["valor"] = pd.to_numeric(gen_df["valor"], errors="coerce")
+                    for tipo in ("solar", "wind", "hydro", "thermal", "nuclear"):
+                        sub = gen_df[gen_df["tipo"] == tipo]
+                        if not sub.empty:
+                            s = sub.groupby("instante")["valor"].sum().rename(tipo)
+                            _join(_ts(s))
+            except Exception as e:
+                print(f"  ⚠️ Erro ao carregar geração horária: {e}")
+
+            # ── Carga SIN + por subsistema (curva_carga) ─────────────────────
+            try:
+                _SUB_MAP_SQL = {
+                    "SE": "se", "SUDESTE": "se",
+                    "NE": "ne", "NORDESTE": "ne",
+                    "S": "s", "SUL": "s",
+                    "N": "n", "NORTE": "n",
+                }
+                carga_df = con.execute("""
+                    SELECT
+                        date_trunc('hour', din_instante) AS instante,
+                        UPPER(TRIM(id_subsistema)) AS id_sub,
+                        SUM(val_cargaenergiahomwmed) AS valor
+                    FROM curva_carga
+                    WHERE din_instante IS NOT NULL
+                      AND val_cargaenergiahomwmed IS NOT NULL
+                      AND ano >= 2021
+                    GROUP BY 1, 2
+                    ORDER BY 1, 2
+                """).df()
+
+                if not carga_df.empty:
+                    carga_df["instante"] = pd.to_datetime(carga_df["instante"], errors="coerce")
+                    carga_df = carga_df.dropna(subset=["instante", "id_sub"])
+                    carga_df["valor"] = pd.to_numeric(carga_df["valor"], errors="coerce")
+                    carga_df["sk"] = carga_df["id_sub"].map(_SUB_MAP_SQL)
+                    carga_df = carga_df.dropna(subset=["sk"])
+
+                    # Série por submercado: load_se, load_ne, load_s, load_n
+                    for sk in ["se", "ne", "s", "n"]:
+                        sub = carga_df[carga_df["sk"] == sk]
+                        if not sub.empty:
+                            s = sub.groupby("instante")["valor"].sum().rename(f"load_{sk}")
+                            _join(_ts(s))
+
+                    # Série SIN total
+                    sin_s = carga_df.groupby("instante")["valor"].sum().rename("load")
+                    _join(_ts(sin_s))
+            except Exception as e:
+                print(f"  ⚠️ Erro ao carregar carga: {e}")
+
+            # ── EAR (Energia Armazenada) — compatível com caminho Neon ───────
+            try:
+                ear_df = con.execute("""
+                    SELECT
+                        date_trunc('day', ear_data) AS data,
+                        SUM(ear_verif_subsistema_mwmes) AS ear,
+                        SUM(ear_max_subsistema) AS earmaxp
+                    FROM ear_diario_subsistema
+                    WHERE ear_data IS NOT NULL
+                      AND ano >= 2021
+                    GROUP BY 1
+                    ORDER BY 1
+                """).df()
+
+                if not ear_df.empty:
+                    ear_df["data"] = pd.to_datetime(ear_df["data"], errors="coerce").dt.normalize()
+                    ear_df = ear_df.dropna(subset=["data"])
+                    ear_df["ear"] = pd.to_numeric(ear_df["ear"], errors="coerce")
+                    ear_df["earmaxp"] = pd.to_numeric(ear_df["earmaxp"], errors="coerce")
+                    ear_df["ear_pct"] = ear_df["ear"] / ear_df["earmaxp"].replace(0, np.nan) * 100
+                    ear_s = ear_df.set_index("data")["ear_pct"].rename("ear_pct")
+                    ear_s = ear_s.resample("h").ffill()
+                    _join(_ts(ear_s))
+            except Exception as e:
+                print(f"  ⚠️ Erro ao carregar EAR: {e}")
+
+            # ── ENA (Energia Natural Afluente) — com ena_bruta + ena_arm ─────
+            _ena_norm_denom_duck = np.nan
+            try:
+                ena_df = con.execute("""
+                    SELECT
+                        date_trunc('day', ena_data) AS data,
+                        SUM(ena_bruta_regiao_mwmed) AS ena_bruta,
+                        SUM(ena_armazenavel_regiao_mwmed) AS ena_arm
+                    FROM ena_diario_subsistema
+                    WHERE ena_data IS NOT NULL
+                      AND ano >= 2021
+                    GROUP BY 1
+                    ORDER BY 1
+                """).df()
+
+                if not ena_df.empty:
+                    ena_df["data"] = pd.to_datetime(ena_df["data"], errors="coerce").dt.normalize()
+                    ena_df = ena_df.dropna(subset=["data"])
+                    ena_df["ena_bruta"] = pd.to_numeric(ena_df["ena_bruta"], errors="coerce")
+                    ena_df["ena_arm"] = pd.to_numeric(ena_df["ena_arm"], errors="coerce")
+
+                    # Denominador para ENA_norm: P90 dos últimos 365 dias
+                    _ena_ref = ena_df["ena_arm"].dropna()
+                    _cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=365)
+                    _ena_ref_365 = _ena_ref[ena_df["data"] >= _cutoff]
+                    if not _ena_ref_365.empty:
+                        _ena_norm_denom_duck = float(_ena_ref_365.quantile(0.90))
+                    elif not _ena_ref.empty:
+                        _ena_norm_denom_duck = float(_ena_ref.quantile(0.90))
+
+                    ena_df = ena_df.set_index("data")
+                    for _col_name, _rename in [("ena_bruta", "ena_bruta"), ("ena_arm", "ena_arm")]:
+                        ena_s = pd.to_numeric(ena_df[_col_name].rename(_rename), errors="coerce")
+                        ena_s = ena_s.resample("h").ffill()
+                        _join(_ts(ena_s))
+            except Exception as e:
+                print(f"  ⚠️ Erro ao carregar ENA: {e}")
+
+            # ── Disponibilidade sincronizada por tipo (disponibilidade_usina) ─
+            try:
+                _TIPO_DISP_SQL = """
+                    CASE
+                        WHEN UPPER(id_tipousina) IN ('UHE','PCH','CGH') THEN 'hydro'
+                        WHEN UPPER(id_tipousina) = 'UTE' THEN 'thermal'
+                        WHEN UPPER(id_tipousina) = 'UTN' THEN 'nuclear'
+                        WHEN UPPER(id_tipousina) = 'EOL' THEN 'wind'
+                        WHEN UPPER(id_tipousina) = 'UFV' THEN 'solar'
+                        ELSE 'other'
+                    END
+                """
+                disp_df = con.execute(f"""
+                    SELECT
+                        date_trunc('hour', din_instante) AS instante,
+                        {_TIPO_DISP_SQL} AS tipo,
+                        SUM(val_dispsincronizada) AS disp_sinc
+                    FROM disponibilidade_usina
+                    WHERE din_instante IS NOT NULL
+                      AND ano >= 2021
+                    GROUP BY 1, 2
+                    ORDER BY 1
+                """).df()
+
+                if not disp_df.empty:
+                    disp_df["instante"] = pd.to_datetime(disp_df["instante"], errors="coerce")
+                    disp_df = disp_df.dropna(subset=["instante"])
+                    disp_df["disp_sinc"] = pd.to_numeric(disp_df["disp_sinc"], errors="coerce")
+                    for _tipo, _col_d in (("hydro","disp_hydro"),("thermal","disp_thermal"),
+                                          ("nuclear","disp_nuclear"),("solar","disp_solar"),("wind","disp_wind")):
+                        sub = disp_df[disp_df["tipo"] == _tipo]
+                        if not sub.empty:
+                            _join(_ts(sub.groupby("instante")["disp_sinc"].sum().rename(_col_d)))
+                    _join(_ts(disp_df.groupby("instante")["disp_sinc"].sum().rename("disp_total")))
+            except Exception as e:
+                print(f"  ⚠️ Erro ao carregar disponibilidade: {e}")
+
+            # ── Restrição renovável — curtailment solar + eólico ─────────────
+            try:
+                for _fonte, _tabela in [("wind", "restricao_eolica"), ("solar", "restricao_fotovoltaica")]:
+                    tables = con.execute("SHOW TABLES").df()["name"].tolist()
+                    if _tabela not in tables:
+                        continue
+                    restr_df = con.execute(f"""
+                        SELECT
+                            date_trunc('hour', din_instante) AS instante,
+                            SUM(val_geracao) AS gerado,
+                            SUM(val_geracaolimitada) AS limitado,
+                            SUM(val_disponibilidade) AS disponivel,
+                            SUM(val_geracaoreferencia) AS referencia
+                        FROM {_tabela}
+                        WHERE din_instante IS NOT NULL
+                          AND ano >= 2021
+                        GROUP BY 1
+                        ORDER BY 1
+                    """).df()
+
+                    if not restr_df.empty:
+                        restr_df["instante"] = pd.to_datetime(restr_df["instante"], errors="coerce")
+                        restr_df = restr_df.dropna(subset=["instante"]).set_index("instante")
+                        for c in ("gerado","limitado","disponivel","referencia"):
+                            restr_df[c] = pd.to_numeric(restr_df[c], errors="coerce")
+                        _curtail = (restr_df["limitado"] - restr_df["gerado"]).clip(lower=0).rename(f"curtail_{_fonte}")
+                        _avail = restr_df["disponivel"].rename(f"avail_{_fonte}")
+                        _join(_ts(_curtail))
+                        _join(_ts(_avail))
+
+                # Totais de curtailment e disponibilidade renovável
+                _cs = pd.to_numeric(df.get("curtail_solar", pd.Series(dtype=float)), errors="coerce").fillna(0)
+                _cw = pd.to_numeric(df.get("curtail_wind", pd.Series(dtype=float)), errors="coerce").fillna(0)
+                _ct = _cs + _cw
+                if (_ct > 0).any():
+                    _join(_ts(_ct.rename("curtail_total")))
+                _as = pd.to_numeric(df.get("avail_solar", pd.Series(dtype=float)), errors="coerce").fillna(0)
+                _aw = pd.to_numeric(df.get("avail_wind", pd.Series(dtype=float)), errors="coerce").fillna(0)
+                _ar = _as + _aw
+                if (_ar > 0).any():
+                    _join(_ts(_ar.rename("avail_ren")))
+            except Exception as e:
+                print(f"  ⚠️ Erro ao carregar restrição renovável: {e}")
+
+            # ── Despacho GFOM (agregado SIN por hora) ────────────────────────
+            try:
+                gfom_df = con.execute("""
+                    SELECT
+                        date_trunc('hour', din_instante) AS instante,
+                        SUM(val_verifgeracao) AS gfom_ger,
+                        SUM(val_verifconstrainedoff) AS constrained_off,
+                        SUM(val_verifinflexibilidade) AS thermal_inflex_gfom,
+                        SUM(val_verifordemmerito) AS thermal_merit,
+                        SUM(val_verifgfom) AS gfom
+                    FROM despacho_gfom
+                    WHERE din_instante IS NOT NULL
+                      AND ano >= 2021
+                    GROUP BY 1
+                    ORDER BY 1
+                """).df()
+
+                if not gfom_df.empty:
+                    gfom_df["instante"] = pd.to_datetime(gfom_df["instante"], errors="coerce")
+                    gfom_df = gfom_df.dropna(subset=["instante"]).set_index("instante")
+                    for _col_g in ("gfom_ger","constrained_off","thermal_inflex_gfom","thermal_merit","gfom"):
+                        if _col_g in gfom_df.columns:
+                            _join(_ts(pd.to_numeric(gfom_df[_col_g].rename(_col_g), errors="coerce")))
+            except Exception as e:
+                print(f"  ⚠️ Erro ao carregar GFOM: {e}")
+
+            # ── CVU médio semanal térmico ────────────────────────────────────
+            try:
+                cvu_df = con.execute("""
+                    SELECT
+                        dat_fimsemana AS instante,
+                        AVG(val_cvu) AS cvu_semana
+                    FROM cvu_usina_termica
+                    WHERE val_cvu > 0
+                      AND ano >= 2021
+                    GROUP BY dat_fimsemana
+                    ORDER BY dat_fimsemana
+                """).df()
+
+                if not cvu_df.empty:
+                    cvu_df["instante"] = pd.to_datetime(cvu_df["instante"], errors="coerce")
+                    cvu_df = cvu_df.dropna(subset=["instante"])
+                    _join(_ts(pd.to_numeric(cvu_df.set_index("instante")["cvu_semana"].rename("cvu_semana"), errors="coerce")))
+            except Exception as e:
+                print(f"  ⚠️ Erro ao carregar CVU: {e}")
+
+            # ── Intercâmbio ──────────────────────────────────────────────────
+            try:
+                itc_df = con.execute("""
+                    SELECT
+                        date_trunc('hour', din_instante) AS instante,
+                        UPPER(TRIM(id_subsistema_origem)) AS orig,
+                        UPPER(TRIM(id_subsistema_destino)) AS dest,
+                        SUM(val_intercambiomwmed) AS mw
+                    FROM intercambio_nacional
+                    WHERE din_instante IS NOT NULL
+                      AND ano >= 2021
+                    GROUP BY 1, 2, 3
+                    ORDER BY 1
+                """).df()
+
+                if not itc_df.empty:
+                    itc_df["instante"] = pd.to_datetime(itc_df["instante"], errors="coerce")
+                    itc_df = itc_df.dropna(subset=["instante"])
+                    itc_df["par"] = itc_df["orig"] + "_" + itc_df["dest"]
+                    for _par, _grp in itc_df.groupby("par"):
+                        _join(_ts(pd.to_numeric(_grp.set_index("instante")["mw"].rename(f"itc_{_par.lower()}"), errors="coerce")))
+                    _join(_ts(pd.to_numeric(itc_df.groupby("instante")["mw"].sum().rename("itc_total"), errors="coerce")))
+            except Exception as e:
+                print(f"  ⚠️ Erro ao carregar intercâmbio: {e}")
+            
+            con.close()
+            
+            if not df.empty:
+                # ── Colunas derivadas (mesma lógica do caminho Neon) ──────────
+                df = df.sort_index()
+                z = pd.Series(0.0, index=df.index)
+
+                def _col(name):
+                    return pd.to_numeric(df[name], errors="coerce") if name in df.columns else z
+
+                load_s    = _col("load")
+                solar_s   = _col("solar")
+                wind_s    = _col("wind")
+                hydro_s   = _col("hydro")
+                thermal_s = _col("thermal")
+                nuclear_s = _col("nuclear")
+
+                df["load"]          = load_s
+                df["net_load"]      = load_s - solar_s.fillna(0) - wind_s.fillna(0)
+                df["carga_total"]   = load_s
+                df["renov_total"]   = solar_s.fillna(0) + wind_s.fillna(0)
+                df["geracao_total"] = (solar_s.fillna(0) + wind_s.fillna(0) +
+                                       hydro_s.fillna(0) + thermal_s.fillna(0) + nuclear_s.fillna(0))
+
+                # SIN_cost ponderado por submercado
+                _sub_pairs = [("se", "se"), ("ne", "ne"), ("s", "s"), ("n", "n")]
+                _sin_cost = pd.Series(0.0, index=df.index)
+                _any_sub = False
+                for _sk, _pk in _sub_pairs:
+                    _lc, _pc = f"load_{_sk}", f"pld_{_pk}"
+                    if _lc in df.columns and _pc in df.columns:
+                        _sin_cost += _col(_lc).fillna(0) * _col(_pc).fillna(0)
+                        _any_sub = True
+                if not _any_sub:
+                    _sin_cost = _col("load").fillna(0) * _col("pld").fillna(0)
+                df["sin_cost"]      = _sin_cost.where(_sin_cost > 0, np.nan)
+                df["SIN_cost_R$/h"] = df["sin_cost"]
+                df["pld_ponderado"] = (df["sin_cost"] / load_s.replace(0, np.nan)).where(load_s > 0, np.nan)
+
+                # CVU semanal interpolado para horário
+                if "cvu_semana" in df.columns:
+                    df["cvu_semana"] = df["cvu_semana"].ffill().bfill()
+
+                # Custo real e por mérito térmico
+                _thermal_merit = _col("thermal_merit")
+                _cvu           = _col("cvu_semana")
+                df["thermal_merit_cost"] = _thermal_merit.fillna(0) * _cvu.fillna(0)
+                df["thermal_real_cost"]  = thermal_s.fillna(0) * _cvu.fillna(0)
+
+                # thermal_inflex
+                _thermal_inflex = _col("thermal_inflex_gfom") if "thermal_inflex_gfom" in df.columns else pd.Series(0.0, index=df.index)
+                df["thermal_inflex"] = _thermal_inflex
+                df["Thermal_inflex_ratio"] = (_thermal_inflex / thermal_s.replace(0, np.nan)).clip(lower=0, upper=1)
+
+                # Disponibilidade hidro sincronizada
+                _disp_hydro = _col("disp_hydro") if "disp_hydro" in df.columns else hydro_s
+                df["disp_sync_uhe"]    = _disp_hydro
+                df["Hydro_preserved"]  = (_disp_hydro - hydro_s.fillna(0)).clip(lower=0)
+                df["Water_value_R$/h"] = df["Hydro_preserved"] * _col("cmo_dominante").fillna(0)
+
+                # Curtailment total
+                _curtail_s = _col("curtail_solar").fillna(0)
+                _curtail_w = _col("curtail_wind").fillna(0)
+                _curtail   = (_curtail_s + _curtail_w)
+                df["curtail_total"]        = _curtail.where(_curtail > 0, np.nan)
+                df["curtailment_loss"]     = _curtail * _col("pld").fillna(0)
+                df["Curtailment_loss_R$/h"]= df["curtailment_loss"]
+
+                # CVaR implícito = (PLD - CMO).clip(0)
+                _pld_s = _col("pld")
+                _cmo_s = _col("cmo_dominante")
+                df["CVaR_implicit"] = (_pld_s - _cmo_s).clip(lower=0)
+                df["cvar_implicit"] = df["CVaR_implicit"]
+                _pld_teto = _pld_s.groupby(_pld_s.index.year).transform("max")
+                _pld_no_teto = _pld_s < _pld_teto * 0.95
+                df.loc[~_pld_no_teto, "cvar_implicit"] = np.nan
+
+                # Risk Gap = CVaR - CVU
+                df["risk_gap"] = (df["CVaR_implicit"] - _cvu).where(_cvu.notna(), np.nan)
+
+                # Geração necessária e hidro required
+                _mandatory = solar_s.fillna(0) + wind_s.fillna(0) + nuclear_s.fillna(0) + _thermal_inflex.fillna(0)
+                _req_hydro = (load_s - _mandatory).clip(lower=0)
+                _hydro_gap = hydro_s.fillna(0) - _req_hydro
+                _tol = 1e-6
+                df["system_state"] = np.where(
+                    _hydro_gap > _tol, "Hydro Preservation",
+                    np.where(_hydro_gap.abs() <= _tol, "Hydro Necessary", "Hydro Deficit")
+                )
+
+                # Transferências econômicas
+                df["t_prudencia"] = np.where(_cmo_s > _pld_s, df["Hydro_preserved"] * (_cmo_s - _pld_s), 0.0)
+                df["t_hidro"]     = df["Water_value_R$/h"]
+                df["t_eletric"]   = df["thermal_merit_cost"]
+                df["t_sistemica"] = ((_pld_s - _cmo_s).abs() * df["net_load"].fillna(0)).where(
+                    _pld_s.notna() & _cmo_s.notna(), np.nan)
+                df["t_total"]     = df["t_eletric"] + df["t_hidro"] + df["t_prudencia"] + df["t_sistemica"]
+                df["infra_marginal_rent"] = df["sin_cost"] - df["t_total"]
+
+                # GFOM %
+                if "gfom" in df.columns and "gfom_ger" in df.columns:
+                    df["gfom_pct"] = (_col("gfom") / _col("gfom_ger").replace(0, np.nan) * 100).clip(lower=0, upper=100)
+
+                # IPR / ISR
+                _avail_ren = _col("avail_ren") if "avail_ren" in df.columns else df["renov_total"]
+                _avail_ren = _avail_ren.fillna(df["renov_total"])
+                df["ipr"] = (_avail_ren / load_s.replace(0, np.nan)).clip(lower=0)
+                _net_load_s = df["net_load"].replace(0, np.nan)
+                df["isr"] = (_avail_ren / _net_load_s.abs().replace(0, np.nan)).clip(lower=0)
+
+                # EAR %
+                if "ear_pct" not in df.columns and "ear" in df.columns and "earmaxp" in df.columns:
+                    df["ear_pct"] = (df["ear"] / df["earmaxp"].replace(0, np.nan) * 100).clip(lower=0, upper=100)
+
+                # EAR_norm
+                if "ear_pct" in df.columns:
+                    df["EAR_norm"] = (df["ear_pct"] / 100.0).clip(lower=0, upper=1)
+                else:
+                    df["EAR_norm"] = np.nan
+
+                # ENA_norm (usando _ena_norm_denom_duck calculado acima)
+                if "ena_arm" in df.columns:
+                    _denom = _ena_norm_denom_duck if (pd.notna(_ena_norm_denom_duck) and _ena_norm_denom_duck > 0) else np.nan
+                    if pd.notna(_denom):
+                        df["ENA_norm"] = (df["ena_arm"] / _denom).clip(lower=0, upper=1)
+                    else:
+                        _fallback = df["ena_arm"].max()
+                        df["ENA_norm"] = (df["ena_arm"] / _fallback).clip(lower=0, upper=1) \
+                            if pd.notna(_fallback) and _fallback > 0 else np.nan
+                else:
+                    df["ENA_norm"] = np.nan
+
+                # Load_norm
+                _disp_total = _col("disp_total") if "disp_total" in df.columns else pd.Series(np.nan, index=df.index)
+                if _disp_total.notna().any():
+                    df["Load_norm"] = (load_s / _disp_total.replace(0, np.nan)).clip(lower=0, upper=2)
+                else:
+                    df["Load_norm"] = np.nan
+
+                # Enriquecer com encargos ESS
+                try:
+                    df = _enrich_df(df)
+                except Exception:
+                    pass
+
+                st.session_state["_data_source"] = "duckdb_local"
+                print(f"✅ DuckDB local: {len(df)} horas | {df.shape[1]} colunas")
+                return _ensure_hourly(df)
+                
+        except Exception as e:
+            st.session_state["_duckdb_error"] = str(e)
+            print(f"⚠️ DuckDB falhou: {e}, tentando Neon...")
+    
+    # =========================================================================
+    # PRIORIDADE 2: Neon PostgreSQL (fallback) - CÓDIGO ORIGINAL CONTINUA
+    # =========================================================================
     if not _NEON_OK():
         return pd.DataFrame()
-
+    
     df = pd.DataFrame()
 
     def _join(s: pd.Series) -> None:
@@ -571,6 +1270,286 @@ def _build_hourly_df_cached(_token: str) -> pd.DataFrame:
     return _ensure_hourly(df)
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 7 — PREVISÃO HÍBRIDA DE PLD (Meta-Model)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def _load_forecast_cached():
+    """Carrega previsão — tenta híbrida primeiro, fallback para base."""
+    if not _FORECAST_OK:
+        return None
+    try:
+        models = load_models(MODEL_DIR)
+        return run_forecast(all_models=models if any(models.values()) else None)
+    except Exception as e:
+        return {"erro": str(e)}
+
+
+def _render_forecast_tab(df: pd.DataFrame) -> None:
+    """
+    Tab de previsão de PLD.
+    Prioridade: Meta-Model Híbrido (3 camadas) → fallback para engine base.
+    """
+
+    # ── PRIORIDADE 1: Meta-Model Híbrido ─────────────────────────────────
+    if _META_OK:
+        try:
+            meta_models = load_meta_models()
+            base_models = load_models(MODEL_DIR) if _FORECAST_OK else {}
+            has_any = (any(meta_models.get(s) for s in ["seco","s","ne","n"]) or
+                       any(base_models.get(s) for s in ["seco","s","ne","n"]))
+
+            if has_any:
+                render_hybrid_forecast_tab(
+                    hourly_df=df,
+                    meta_models=meta_models,
+                    base_models=base_models,
+                )
+                return
+        except Exception as e:
+            st.warning(f"Meta-model indisponível ({e}), usando engine base.")
+
+    # ── PRIORIDADE 2: Engine base (pld_forecast_engine) ──────────────────
+    st.markdown("## 🔮 Previsão de PLD")
+
+    if not _FORECAST_OK:
+        st.error("Motor de previsão não disponível.")
+        if _META_OK:
+            st.info("Execute `python meta_forecast_engine.py --build` para treinar.")
+        else:
+            st.info("Execute `python pld_forecast_engine.py --build` para treinar.")
+        return
+
+    # Regime atual
+    def _safe_last(col):
+        s = pd.to_numeric(df.get(col, pd.Series(dtype=float)), errors="coerce").dropna()
+        return float(s.iloc[-1]) if not s.empty else None
+
+    def _safe_med(col):
+        s = pd.to_numeric(df.get(col, pd.Series(dtype=float)), errors="coerce").dropna()
+        return float(s.median()) if not s.empty else None
+
+    spdi_now  = _safe_last("spdi")
+    drift_now = _safe_last("structural_drift")
+    gap_now   = _safe_med("Structural_gap_R$/MWh")
+
+    regime_txt = ("Prêmio Estrutural" if spdi_now and spdi_now > 1.3 else
+                  "Déficit Sistêmico" if spdi_now and spdi_now < 0.9 else "Equilíbrio")
+
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Regime Atual",     regime_txt,
+              f"SPDI {spdi_now:.2f}×" if spdi_now else "—")
+    k2.metric("Structural Drift", f"{drift_now:.2f}×" if drift_now else "N/D")
+    k3.metric("Structural Gap",   f"R${gap_now:.0f}/MWh" if gap_now else "N/D")
+
+    st.markdown("<div class='full-bleed-line'></div>", unsafe_allow_html=True)
+
+    with st.spinner("Calculando previsão..."):
+        forecast = _load_forecast_cached()
+
+    if forecast is None:
+        st.warning("Modelos não treinados. Execute:")
+        st.code("python meta_forecast_engine.py --build", language="bash")
+        return
+    if "erro" in forecast:
+        st.error(f"Erro no motor: {forecast['erro']}")
+        return
+
+    ft1, ft2, ft3 = st.tabs([
+        "⚡ Curto Prazo (1–5 sem.)",
+        "📈 Médio/Longo Prazo",
+        "⚙️ Diagnóstico",
+    ])
+
+    # ── Curto prazo ───────────────────────────────────────────────────────
+    with ft1:
+        short = forecast.get("short_term", {})
+        semanas = short.get("semanas", [])
+        st.caption(f"CMO ONS — PMO ref.: {forecast.get('semana_pmo','?')}")
+
+        if not semanas:
+            st.info("Dados de curto prazo não disponíveis.")
+        else:
+            sub_labels = SUBSISTEMAS if _FORECAST_OK else ["seco","s","ne","n"]
+            sub_label_map = SUB_LABEL if _FORECAST_OK else {"seco":"SE/CO","s":"Sul","ne":"NE","n":"Norte"}
+
+            for sub in sub_labels:
+                lbl  = sub_label_map[sub]
+                rows = [w for w in semanas if w.get(f"pld_p50_{sub}") is not None]
+                if not rows: continue
+                sems = [w["semana"] for w in rows]
+                p10s = [w[f"pld_p10_{sub}"] for w in rows]
+                p50s = [w[f"pld_p50_{sub}"] for w in rows]
+                p90s = [w[f"pld_p90_{sub}"] for w in rows]
+
+                fig = go.Figure()
+                fig.add_trace(go.Bar(
+                    x=sems, y=[p90-p10 for p10,p90 in zip(p10s,p90s)],
+                    base=p10s, name="Banda P10–P90",
+                    marker_color="#1e3a5f", opacity=0.55,
+                ))
+                fig.add_trace(go.Scatter(
+                    x=sems, y=p50s, name="P50",
+                    mode="lines+markers",
+                    line=dict(color="#c8a44d", width=2), marker=dict(size=8),
+                ))
+                fig.update_layout(
+                    template="plotly_dark",
+                    paper_bgcolor="#0b0f14", plot_bgcolor="#111827",
+                    height=260, margin=dict(l=40,r=20,t=40,b=30),
+                    title=dict(text=f"{lbl} — PLD (R$/MWh)",
+                               font=dict(size=12, color="#e5e7eb")),
+                    xaxis=dict(gridcolor="#1f2937"),
+                    yaxis=dict(title="R$/MWh", gridcolor="#1f2937"),
+                    legend=dict(orientation="h", y=1.12), barmode="overlay",
+                )
+                st.plotly_chart(fig, use_container_width=True, key=f"fc_short_{sub}")
+
+            tbl = []
+            for w in semanas:
+                row = {"Semana": w["semana"], "Confiança": w["confianca"]}
+                for sub in sub_labels:
+                    lbl = sub_label_map[sub]
+                    p50 = w.get(f"pld_p50_{sub}")
+                    p10 = w.get(f"pld_p10_{sub}")
+                    p90 = w.get(f"pld_p90_{sub}")
+                    if p50 is not None:
+                        row[f"{lbl} P50"] = f"R${p50:.0f}"
+                        row[f"{lbl} Banda"] = f"R${p10:.0f}–{p90:.0f}"
+                tbl.append(row)
+            if tbl:
+                st.dataframe(pd.DataFrame(tbl).set_index("Semana"), use_container_width=True)
+
+    # ── Médio/longo prazo ─────────────────────────────────────────────────
+    with ft2:
+        ml = forecast.get("medium_long_term", {})
+        subs_data = ml.get("subsistemas", {})
+
+        if not subs_data or not any(subs_data.values()):
+            st.warning("Execute `python meta_forecast_engine.py --build` para treinar.")
+        else:
+            sub_labels = SUBSISTEMAS if _FORECAST_OK else ["seco","s","ne","n"]
+            sub_label_map = SUB_LABEL if _FORECAST_OK else {"seco":"SE/CO","s":"Sul","ne":"NE","n":"Norte"}
+
+            for sub in sub_labels:
+                lbl   = sub_label_map[sub]
+                hdata = subs_data.get(sub, {})
+                if not hdata: continue
+                horizons = sorted(hdata.keys())
+                hlabels  = [hdata[h]["horizonte_label"] for h in horizons]
+                p10s = [hdata[h]["pld_p10"] for h in horizons]
+                p50s = [hdata[h]["pld_p50"] for h in horizons]
+                p90s = [hdata[h]["pld_p90"] for h in horizons]
+                if not any(p50s): continue
+
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=hlabels + hlabels[::-1],
+                    y=[v or 0 for v in p90s] + [v or 0 for v in p10s[::-1]],
+                    fill="toself", fillcolor="rgba(30,58,95,0.4)",
+                    line=dict(color="rgba(0,0,0,0)"), name="Banda P10–P90",
+                ))
+                fig.add_trace(go.Scatter(
+                    x=hlabels, y=p50s, name="P50 (mediana)",
+                    mode="lines+markers",
+                    line=dict(color="#c8a44d", width=2), marker=dict(size=9),
+                ))
+                cmo_col = "cmo_med_seco" if sub == "seco" else f"cmo_med_{sub}"
+                cmo_ref = _safe_med(cmo_col) if cmo_col else None
+                if cmo_ref:
+                    fig.add_hline(y=cmo_ref, line_dash="dot",
+                                  line_color="rgba(96,165,250,0.6)",
+                                  annotation_text=f"CMO atual R${cmo_ref:.0f}")
+                fig.update_layout(
+                    template="plotly_dark",
+                    paper_bgcolor="#0b0f14", plot_bgcolor="#111827",
+                    height=300, margin=dict(l=40,r=20,t=40,b=30),
+                    title=dict(text=f"{lbl} — PLD médio/longo prazo (R$/MWh)",
+                               font=dict(size=12, color="#e5e7eb")),
+                    yaxis=dict(title="R$/MWh", gridcolor="#1f2937"),
+                    xaxis=dict(gridcolor="#1f2937"),
+                    legend=dict(orientation="h", y=1.12),
+                )
+                st.plotly_chart(fig, use_container_width=True, key=f"fc_ml_{sub}")
+
+            mrows = []
+            for sub in sub_labels:
+                for h, hd in sorted(subs_data.get(sub,{}).items()):
+                    mrows.append({
+                        "Subsistema": sub_label_map[sub],
+                        "Horizonte":  hd["horizonte_label"],
+                        "P50":        f"R${hd['pld_p50']:.0f}" if hd.get("pld_p50") else "—",
+                        "Banda":      (f"R${hd['pld_p10']:.0f}–{hd['pld_p90']:.0f}"
+                                       if hd.get("pld_p10") and hd.get("pld_p90") else "—"),
+                        "MAE":        f"±R${hd['mae_historico']:.0f}" if hd.get("mae_historico") else "—",
+                        "Confiança":  hd.get("confianca","—"),
+                    })
+            if mrows:
+                st.dataframe(pd.DataFrame(mrows).set_index("Subsistema"), use_container_width=True)
+
+    # ── Diagnóstico ───────────────────────────────────────────────────────
+    with ft3:
+        st.markdown("#### Diagnóstico do Motor Preditivo")
+        _engine_type = "Híbrido (Meta-Model)" if _META_OK else "Base (pld_forecast_engine)"
+        st.info(
+            f"**Engine ativa:** {_engine_type}  \n"
+            "**Arquitetura:** CMO ONS + GBM Quantílico (target: erro_pld) + "
+            "Meta-Model (ML × PJE ponderado por P_justification).  \n"
+            "**Features:** ENA, EAR, Térmico, CMO, Sazonalidade, "
+            "Erro ONS lag1, GFOM, Curtailment, Disponibilidade.  \n"
+            "**Anti-leakage:** todas as features usam lag ≥ 1 semana.  \n"
+            "**Validação:** walk-forward 80/20 + TimeSeriesSplit CV."
+        )
+        st.markdown("""
+| Horizonte | Fonte | Confiança |
+|---|---|---|
+| 1–5 semanas | CMO ONS + bandas calibradas | Alta |
+| 4–12 semanas | GBM quantílico (erro-based) + meta-model | Moderada |
+| 6 meses | GBM quantílico + meta-model | Baixa |
+
+**P10** = cenário favorável · **P50** = mais provável · **P90** = adverso
+
+> O meta-model pondera ML vs PJE pela P(Justificação) e SPDI.
+        """)
+
+        st.markdown("---")
+        col_btn, col_info = st.columns([1, 3])
+        with col_btn:
+            if st.button("🔄 Retreinar Modelos", key="btn_retrain"):
+                with st.spinner("Retreinando modelos..."):
+                    try:
+                        if _META_OK:
+                            build_and_train_hybrid(PMO_XLSX, MODEL_DIR)
+                            st.cache_data.clear()
+                            st.success("Modelos híbridos retreinados!")
+                        elif _FORECAST_OK:
+                            from pld_forecast_engine import build_and_train
+                            build_and_train(PMO_XLSX, MODEL_DIR)
+                            st.cache_data.clear()
+                            st.success("Modelos base retreinados!")
+                        else:
+                            st.error("Nenhum engine disponível.")
+                    except Exception as e:
+                        st.error(f"Erro: {e}")
+        with col_info:
+            import json as _json
+            meta_path = MODEL_DIR / "meta" / "meta_models_meta.json"
+            if not meta_path.exists():
+                meta_path = MODEL_DIR / "models_meta.json"
+            if meta_path.exists():
+                with open(meta_path) as _f:
+                    meta = _json.load(_f)
+                n = sum(len(v) for v in meta.values())
+                last_sub = next(iter(meta.values()), {})
+                last_h   = next(iter(last_sub.values()), {})
+                trained  = last_h.get("trained_at","?")[:10]
+                target   = last_h.get("target", "pld_real")
+                st.caption(f"{n} modelos · target: {target} · treino: {trained}")
+            else:
+                st.caption("⚠️ Execute o retreinamento acima.")
+
 def _build_hourly_df(_unused: Any = None) -> pd.DataFrame:
     return _build_hourly_df_cached(_core_cache_token())
 
@@ -837,7 +1816,7 @@ def main():
           .tabs-layer { background: linear-gradient(180deg, #0b1222 0%, #070d1a 100%); padding:0.01rem 0.01rem 0.01rem 0.01rem; }
           label { color:#ffffff !important; font-weight:700 !important; }
           .stTabs [data-baseweb="tab-list"] { gap: 0.15rem; flex-wrap: nowrap !important; overflow-x: auto !important; scrollbar-width: thin; }
-          .stTabs [data-baseweb="tab"] { color:#e5e7eb; border-radius:6px; padding:0.2rem 0.2rem; font-size:0.3rem; white-space:nowrap; }
+          .stTabs [data-baseweb="tab"] { color:#e5e7eb; border-radius:6px; padding:0.25rem 0.45rem; font-size:0.78rem; white-space:nowrap; }
           .stTabs [aria-selected="true"] { background:#152238 !important; color:#f8fafc !important; border:1px solid #c8a44d !important; }
           /* ── Botão ANALISAR (form submit) ── */
           div[data-testid="stFormSubmitButton"] > button {
@@ -939,16 +1918,23 @@ def main():
         unsafe_allow_html=True,
     )
 
-    if not _NEON_OK():
-        import os as _os
-        _db_url = _os.getenv("DATABASE_URL", "")
-        _err = st.session_state.get("_neon_error", "sem detalhes")
-        st.error("❌ Banco de dados Neon não configurado ou inacessível.")
-        st.code(f"DATABASE_URL: {'definida' if _db_url else 'NÃO DEFINIDA'} | Erro: {_err}")
+    # Verificar se há alguma fonte de dados disponível
+    duckdb_available = Path("data/kintuadi.duckdb").exists()
+    neon_available = _NEON_OK()
+    
+    if not duckdb_available and not neon_available:
+        st.error("❌ Nenhuma fonte de dados disponível.")
+        st.info("Coloque o arquivo `kintuadi.duckdb` na pasta `data/` ou configure o Neon.")
         return
+    
+    # Mostrar qual fonte está sendo usada
+    if duckdb_available:
+        st.info("📁 Usando dados locais: `kintuadi.duckdb`")
+    else:
+        st.info("☁️ Usando dados do Neon PostgreSQL")
 
     with st.spinner(
-        "⏳ Carregando dados do banco… O tempo médio de carregamento é de **2 a 3 minutos** "
+        "⏳ Carregando dados do banco… O tempo médio de carregamento é de **4 a 5 minutos** "
         "na primeira abertura. Por favor, aguarde."
     ):
         df = _build_hourly_df()
@@ -1093,11 +2079,11 @@ def main():
     tabs = st.tabs([
         "👤 Meu Perfil",
         "📸 Fotografia Operativa",
-        "🔋 Curtailment & Sim. BESS",
+        "🔋 Simulação BESS",
         "⚡ Encargos & Custo Físico",
         "✦ Price Justification Engine",
-        "🧠 Coerência Oper.",
-        "📊 Matriz Horária (SIN)",
+        "🧠 Coerência Operativa",
+        "📊 Matriz Horária do SIN",
         "📘 Metodologia & Glossário",
     ])
 
@@ -1236,7 +2222,7 @@ def main():
             render_profile_page(_profile_user)
         else:
             st.warning("Faça login para acessar seu perfil.")
-
+    
     with tabs[1]:
         _ref_dates = [d for d in (latest_operational.get("load"), latest_operational.get("generation")) if d]
         _last_date = max(_ref_dates).strftime("%d/%m/%Y") if _ref_dates else "N/D"
@@ -1377,8 +2363,9 @@ def main():
                 _tbl.index.name = "instante"
                 if not _tbl.empty:
                     st.dataframe(_tbl, width="stretch", height=260)
-
-    with tabs[2]:
+        
+        st.markdown("---")
+        
         cdf = _plot_df(dff)
         cols = [c for c in ["curtail_solar", "curtail_wind", "curtail_total"] if c in cdf.columns]
         if cols:
@@ -1397,7 +2384,6 @@ def main():
         st.caption("Distribuição por tipo de restrição disponível no painel horário do core quando fornecido pelo ONS.")
 
         st.markdown("---")
-        st.markdown("### 🔋 Simulação BESS")
 
         sim_shift = st.slider(
             "Percentual de deslocamento do curtailment solar para 19h–23h",
@@ -1503,10 +2489,15 @@ def main():
             key="bess_generation_after"
         )
 
+    with tabs[2]:
+        render_bess_tab()
+        st.markdown("---")
+    
     with tabs[3]:
         render_charges_tab(df)
 
     with tabs[4]:
+        
         can_sim, _u, sim_reason = simulation_guard()
         if can_sim:
             render_premium_tab(df)
