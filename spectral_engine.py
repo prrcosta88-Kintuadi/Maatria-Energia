@@ -91,7 +91,7 @@ PLD_LIMITS_BY_YEAR = {
     2023: (69.04, 1391.56),
     2024: (61.07, 1470.57),
     2025: (58.60, 1542.23),
-    2026: (57.31, 1217.65),
+    2026: (57.31, 1611.04),
 }
 
 
@@ -340,6 +340,23 @@ class SpectralEngine:
         try:
             cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
             df = pd.DataFrame()
+            try:
+                tables = set(con.execute("SHOW TABLES").df()["name"].astype(str).str.lower().tolist())
+            except Exception:
+                tables = set()
+
+            def _table_columns(table_name: str) -> set[str]:
+                try:
+                    info = con.execute(f"PRAGMA table_info('{table_name}')").df()
+                    return set(info["name"].astype(str).str.lower().tolist())
+                except Exception:
+                    return set()
+
+            def _first_existing(candidates: tuple[str, ...], available: set[str]) -> Optional[str]:
+                for candidate in candidates:
+                    if candidate.lower() in available:
+                        return candidate
+                return None
 
             # PLD por hora (média SE/CO)
             try:
@@ -373,23 +390,78 @@ class SpectralEngine:
                 logger.warning(f"Carga load: {e}")
 
             # Geração por tipo
-            for tipo, col_out in [
-                ("hidraulica", "hydro"), ("solar", "solar"),
-                ("eolica", "wind"),     ("termica", "thermal"),
-            ]:
-                try:
-                    gen = con.execute(f"""
-                        SELECT date_trunc('hour', din_instante) AS ts,
-                               SUM(val_geracao) AS valor
-                        FROM geracao_sin_{tipo}
-                        WHERE din_instante >= '{cutoff}'
-                        GROUP BY 1 ORDER BY 1
+            try:
+                gen_df = pd.DataFrame()
+                if "geracao_tipo_hora" in tables:
+                    gen_df = con.execute(f"""
+                        SELECT
+                            date_trunc('hour', din_instante) AS ts,
+                            LOWER(TRIM(tipo_geracao)) AS tipo,
+                            SUM(val_geracao_mw) AS valor
+                        FROM geracao_tipo_hora
+                        WHERE din_instante >= '{cutoff}' AND val_geracao_mw IS NOT NULL
+                        GROUP BY 1, 2
+                        ORDER BY 1, 2
                     """).df()
-                    if not gen.empty:
-                        gen["ts"] = pd.to_datetime(gen["ts"])
-                        df[col_out] = gen.set_index("ts")["valor"]
-                except Exception:
-                    pass
+                elif "geracao_usina_horaria" in tables:
+                    gen_df = con.execute(f"""
+                        SELECT
+                            date_trunc('hour', din_instante) AS ts,
+                            CASE
+                                WHEN UPPER(nom_tipousina) IN ('FOTOVOLTAICA', 'SOLAR', 'FOTOVOLT') THEN 'solar'
+                                WHEN UPPER(nom_tipousina) IN ('EOLIELÉTRICA', 'EÓLICA', 'EOLICA', 'EOLIELETRICA', 'EOLIELÉTRICO', 'EOL') THEN 'wind'
+                                WHEN UPPER(nom_tipousina) IN ('HIDROELÉTRICA', 'HIDROELETRICA', 'HIDRÁULICA', 'HIDRAULICA', 'UHE', 'PCH', 'CGH', 'HIDRO') THEN 'hydro'
+                                WHEN UPPER(nom_tipousina) IN ('TÉRMICA', 'TERMICA', 'UTE', 'BIOMASSA', 'GAS', 'GÁS', 'OLEO', 'ÓLEO', 'CARVAO', 'CARVÃO', 'DERIVADOS') THEN 'thermal'
+                                ELSE 'other'
+                            END AS tipo,
+                            SUM(val_geracao) AS valor
+                        FROM geracao_usina_horaria
+                        WHERE din_instante >= '{cutoff}' AND val_geracao IS NOT NULL
+                        GROUP BY 1, 2
+                        ORDER BY 1, 2
+                    """).df()
+
+                if not gen_df.empty:
+                    gen_df["ts"] = pd.to_datetime(gen_df["ts"], errors="coerce")
+                    gen_df = gen_df.dropna(subset=["ts"])
+                    gen_df["tipo"] = gen_df["tipo"].astype(str).str.lower().str.strip()
+                    gen_df["valor"] = pd.to_numeric(gen_df["valor"], errors="coerce")
+                    for generation_type, column_name in (
+                        ("hydro", "hydro"),
+                        ("solar", "solar"),
+                        ("wind", "wind"),
+                        ("thermal", "thermal"),
+                    ):
+                        sub = gen_df[gen_df["tipo"] == generation_type]
+                        if not sub.empty:
+                            df[column_name] = sub.groupby("ts")["valor"].sum()
+                else:
+                    for table_name, column_name in (
+                        ("geracao_sin_hidraulica", "hydro"),
+                        ("geracao_sin_solar", "solar"),
+                        ("geracao_sin_eolica", "wind"),
+                        ("geracao_sin_termica", "thermal"),
+                    ):
+                        if table_name not in tables:
+                            continue
+                        available = _table_columns(table_name)
+                        ts_col = _first_existing(("din_instante", "instante", "data"), available)
+                        value_col = _first_existing(("val_geracao", "val_geracao_mw", "valor"), available)
+                        if ts_col is None or value_col is None:
+                            continue
+                        gen = con.execute(f"""
+                            SELECT date_trunc('hour', {ts_col}) AS ts,
+                                   SUM({value_col}) AS valor
+                            FROM {table_name}
+                            WHERE {ts_col} >= '{cutoff}' AND {value_col} IS NOT NULL
+                            GROUP BY 1 ORDER BY 1
+                        """).df()
+                        if not gen.empty:
+                            gen["ts"] = pd.to_datetime(gen["ts"], errors="coerce")
+                            gen = gen.dropna(subset=["ts"])
+                            df[column_name] = pd.to_numeric(gen.set_index("ts")["valor"], errors="coerce")
+            except Exception as e:
+                logger.warning(f"Geração load: {e}")
 
             # CMO SE/CO
             try:
@@ -411,8 +483,13 @@ class SpectralEngine:
             con.close()
 
         # Net load = carga - solar - wind
-        if "load" in df.columns and "solar" in df.columns and "wind" in df.columns:
-            df["net_load"] = df["load"] - df["solar"].fillna(0) - df["wind"].fillna(0)
+        if "load" in df.columns and ("solar" in df.columns or "wind" in df.columns):
+            solar = pd.to_numeric(df.get("solar", pd.Series(np.nan, index=df.index)), errors="coerce")
+            wind = pd.to_numeric(df.get("wind", pd.Series(np.nan, index=df.index)), errors="coerce")
+            renewable_sum = solar.fillna(0.0) + wind.fillna(0.0)
+            renewable_available = solar.notna() | wind.notna()
+            df["net_load"] = pd.to_numeric(df["load"], errors="coerce") - renewable_sum
+            df.loc[~renewable_available, "net_load"] = np.nan
         elif "load" in df.columns:
             df["net_load"] = df["load"]
 
@@ -649,7 +726,7 @@ class SpectralEngine:
             # Vale solar: mínimo nas horas 10-15h
             solar_hours = nl[10:15]
             off_peak    = np.concatenate([nl[:8], nl[20:]])
-            duck_depth  = float(off_peak.mean() - solar_hours.min()) if len(solar_hours) > 0 else 0.0
+            duck_depth  = float(max(off_peak.mean() - solar_hours.min(), 0.0)) if len(solar_hours) > 0 else 0.0
             metrics["duck_depth"]  = duck_depth
             metrics["net_peak_h"]  = float(np.argmax(nl))
             metrics["net_valley_h"] = float(np.argmin(nl[8:18]) + 8)
@@ -675,12 +752,18 @@ class SpectralEngine:
             return {"mean": 0.5, "at_daily": 0.5, "regime": "unknown"}
 
         # Alinhar e limpar
-        idx = pld.index.intersection(net_load.index)
-        if len(idx) < 48:
+        aligned = pd.concat(
+            [
+                pd.to_numeric(pld, errors="coerce").rename("pld"),
+                pd.to_numeric(net_load, errors="coerce").rename("net_load"),
+            ],
+            axis=1,
+        ).dropna()
+        if len(aligned) < 48:
             return {"mean": 0.5, "at_daily": 0.5, "regime": "unknown"}
 
-        x = pd.to_numeric(pld[idx], errors="coerce").fillna(pld.median()).values
-        y = pd.to_numeric(net_load[idx], errors="coerce").fillna(net_load.median()).values
+        x = aligned["pld"].to_numpy(dtype=float)
+        y = aligned["net_load"].to_numpy(dtype=float)
 
         try:
             freqs, Cxy = coherence(x, y, fs=1.0, nperseg=min(168, len(x)//4))
@@ -729,6 +812,15 @@ class SpectralEngine:
             return {"fingerprint": empty, "hash_counter": Counter(), "points": [], "analysis": analysis}
 
         net_load = frame.get("net_load", frame.get("load", pd.Series(index=frame.index, dtype=float)))
+        net_load = pd.to_numeric(net_load, errors="coerce")
+        latest_ts = pd.Timestamp(frame.index.max())
+        recent_cutoff = latest_ts - pd.Timedelta(days=7)
+        recent_net = net_load[net_load.index >= recent_cutoff].dropna()
+        net_load_fresh = (
+            not recent_net.empty
+            and (latest_ts - pd.Timestamp(recent_net.index.max())) <= pd.Timedelta(hours=72)
+            and len(recent_net) >= 24 * 3
+        )
         freqs, times, mags = self.compute_stft(signal_centered)
         peaks = self.extract_peaks(freqs, mags)
         points = self.extract_constellation_points(freqs, times, mags)
@@ -737,16 +829,16 @@ class SpectralEngine:
         entropy = self.compute_spectral_entropy(mags)
 
         signal_profile = self.compute_daily_profile(signal_raw)
-        load_profile = self.compute_daily_profile(net_load) if not net_load.empty else pd.Series(dtype=float)
+        load_profile = self.compute_daily_profile(net_load) if net_load_fresh else pd.Series(dtype=float)
         duck = self.detect_duck_curve(signal_profile, load_profile)
         coh = (
             self.compute_coherence(signal_raw, net_load)
-            if not net_load.empty else
+            if net_load_fresh else
             {"mean": 0.5, "at_daily": 0.5, "regime": "unknown"}
         )
 
         spread = float(duck.get("spread", 0.0))
-        load_std = float(pd.to_numeric(net_load, errors="coerce").tail(24 * 7).std()) if not net_load.empty else 0.0
+        load_std = float(recent_net.std()) if net_load_fresh else 0.0
         spread_normalized = float(np.clip(spread / max(signal_scale, 1e-6), 0.0, 5.0))
         duck_depth_z = float(np.clip(duck.get("duck_depth", 0.0) / max(load_std, 1e-6), 0.0, 8.0))
         ramp_ratio = float(np.clip(duck.get("evening_ramp", 0.0) / max(abs(spread), 1e-6), -3.0, 3.0))
@@ -880,6 +972,44 @@ class SpectralEngine:
             )
         matches.sort(key=lambda item: item["score"], reverse=True)
         return matches[:top_k]
+
+    @staticmethod
+    def _apply_match_regime_hint(
+        fingerprint: SpectralFingerprint,
+        best_match: Optional[Dict[str, Any]],
+    ) -> SpectralFingerprint:
+        if not best_match:
+            return fingerprint
+
+        matched_fp = best_match.get("fingerprint")
+        match_score = float(best_match.get("score", 0.0))
+        hash_overlap = float(best_match.get("hash_overlap", 0.0))
+        if matched_fp is None:
+            return fingerprint
+
+        pld_shape_duck = (
+            17.0 <= float(fingerprint.peak_hour) <= 21.0
+            and 8.0 <= float(fingerprint.valley_hour) <= 13.0
+            and float(fingerprint.spread_normalized) > 0.16
+            and float(fingerprint.ramp_ratio) > 0.05
+        )
+        physical_confirmation_missing = (
+            float(fingerprint.coherence_mean) == 0.5
+            and float(fingerprint.coherence_at_daily) == 0.5
+            and float(fingerprint.duck_depth_z) == 0.0
+        )
+        if (
+            physical_confirmation_missing
+            and pld_shape_duck
+            and str(matched_fp.regime) == "duck_curve"
+            and match_score >= 0.62
+            and hash_overlap >= 0.45
+        ):
+            fingerprint.regime = "duck_curve"
+            fingerprint.regime_confidence = float(
+                max(fingerprint.regime_confidence, min(0.82, 0.42 + 0.38 * match_score))
+            )
+        return fingerprint
 
     def build_intraday_prior(
         self,
@@ -1020,6 +1150,7 @@ class SpectralEngine:
                 fp.matched_window_start = str(best["window_start"])
                 fp.matched_window_end = str(best["window_end"])
                 fp.matched_library_kind = str(best["kind"])
+                fp = self._apply_match_regime_hint(fp, best)
 
         self._fingerprint_cache = fp
         return fp
@@ -1042,9 +1173,17 @@ class SpectralEngine:
         scores = {"duck_curve": 0.0, "flat": 0.0, "stressed": 0.0, "distorted": 0.0}
 
         pld_med = float(pld.median()) if not pld.empty else 0.5
+        pld_shape_duck = (
+            17.0 <= float(duck.get("peak_hour", -1.0)) <= 21.0
+            and 8.0 <= float(duck.get("valley_hour", -1.0)) <= 13.0
+            and spread_normalized > 0.16
+            and ramp_ratio > 0.05
+        )
 
         if spread_normalized > 0.18 and duck_depth_z > 0.55:
             scores["duck_curve"] += 0.45
+        elif pld_shape_duck:
+            scores["duck_curve"] += 0.30
         if ramp_ratio > 0.12:
             scores["duck_curve"] += 0.25
         if coh["at_daily"] > 0.7:
@@ -1234,6 +1373,7 @@ class SpectralEngine:
                         fp.matched_window_start = str(best["window_start"])
                         fp.matched_window_end = str(best["window_end"])
                         fp.matched_library_kind = str(best["kind"])
+                        fp = self._apply_match_regime_hint(fp, best)
                 feat = self.extract_features(window, fp)
 
                 if prev_regime != fp.regime:
@@ -1451,12 +1591,19 @@ if __name__ == "__main__":
         if "fp" not in dir():
             df = engine.load_hourly_data()
             fp = engine.generate_fingerprint(df)
+        if fp.signal_basis in {"spdi", "spdi_from_cost"}:
+            spread_label = f"{fp.peak_valley_spread:.2f}x"
+        elif fp.signal_basis == "pld_reg_norm":
+            spread_label = f"{fp.peak_valley_spread * 100:.1f}% da faixa regulatória"
+        else:
+            spread_label = f"R${fp.peak_valley_spread:.0f}/MWh"
         print(f"\n=== Regime atual ===")
+        print(f"  Base sinal: {fp.signal_basis}")
         print(f"  Regime:     {fp.regime} (confiança: {fp.regime_confidence:.0%})")
         print(f"  Coerência:  {fp.coherence_at_daily:.2f} (PLD × net_load na freq. diária)")
         print(f"  Entropia:   {fp.spectral_entropy:.2f} ({'previsível' if fp.spectral_entropy < 0.5 else 'complexo'})")
         print(f"  Pico:       {fp.peak_hour:.0f}h | Vale: {fp.valley_hour:.0f}h")
-        print(f"  Spread:     R${fp.peak_valley_spread:.0f}/MWh")
+        print(f"  Spread:     {spread_label}")
         if fp.regime == "duck_curve":
             print("  → Curva de pato ativa: pico solar reduzindo preço nas 10-15h")
             print("    Estratégia BESS: carregar 10-14h, descarregar 18-21h")

@@ -92,6 +92,71 @@ class KintuadiIntegratedCollectorV2:
             year = int(match_year.group(1))
         return year, month
 
+    def _read_source_file(self, file_path: str) -> pd.DataFrame:
+        """
+        Lê arquivos ONS com suporte a:
+        - XLSX de aba única
+        - XLSX com múltiplas abas (ex.: Geracao_Usina_Horaria_2021.xlsx)
+        - CSV com detecção simples de encoding
+        """
+        path_lower = str(file_path).lower()
+        try:
+            if path_lower.endswith(".xlsx"):
+                import openpyxl
+
+                wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+                sheet_names = list(wb.sheetnames)
+                wb.close()
+
+                if len(sheet_names) <= 1:
+                    return pd.read_excel(file_path, engine="openpyxl", sheet_name=0)
+
+                logger.info(
+                    "XLSX com múltiplas abas detectado: %s abas em %s",
+                    len(sheet_names),
+                    os.path.basename(file_path),
+                )
+                frames = []
+                for sheet_name in sheet_names:
+                    try:
+                        df_sheet = pd.read_excel(
+                            file_path,
+                            engine="openpyxl",
+                            sheet_name=sheet_name,
+                        )
+                        if not df_sheet.empty:
+                            frames.append(df_sheet)
+                            logger.info(
+                                "  Aba '%s': %s linhas",
+                                sheet_name,
+                                f"{len(df_sheet):,}",
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            "Falha ao ler aba '%s' de %s: %s",
+                            sheet_name,
+                            os.path.basename(file_path),
+                            exc,
+                        )
+                if not frames:
+                    return pd.DataFrame()
+                return pd.concat(frames, ignore_index=True)
+
+            for encoding in ("utf-8-sig", "latin-1", "cp1252"):
+                try:
+                    return pd.read_csv(
+                        file_path,
+                        sep=None,
+                        engine="python",
+                        on_bad_lines="skip",
+                        encoding=encoding,
+                    )
+                except UnicodeDecodeError:
+                    continue
+        except Exception as exc:
+            logger.error("Erro ao ler arquivo fonte %s: %s", file_path, exc)
+        return pd.DataFrame()
+
     def _should_persist_dataset(self, dataset_name: str, persist_mode: str) -> bool:
         """
         Regras de persistência:
@@ -140,9 +205,7 @@ class KintuadiIntegratedCollectorV2:
         year, month = self._extract_year_month(dataset_name)
         try:
             is_xlsx = str(file_path).lower().endswith(".xlsx")
-            df_src = (pd.read_excel(file_path, engine="openpyxl") if is_xlsx
-                      else pd.read_csv(file_path, sep=None, engine="python",
-                                       on_bad_lines="skip", encoding="utf-8-sig"))
+            df_src = self._read_source_file(file_path)
             if df_src.empty:
                 return
 
@@ -259,7 +322,7 @@ class KintuadiIntegratedCollectorV2:
 
             if is_xlsx:
                 # XLSX (ex.: Curva_Carga): usar pandas para inferência e insert robusto
-                df_src = pd.read_excel(file_path)
+                df_src = self._read_source_file(file_path)
                 if df_src.empty:
                     return
                 con.register("df_src_tmp", df_src)
