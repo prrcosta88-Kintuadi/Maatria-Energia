@@ -1,5 +1,5 @@
 from __future__ import annotations
- 
+
 import json
 import logging
 import os
@@ -9,13 +9,13 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
- 
+
 import numpy as np
 import pandas as pd
- 
+
 warnings.filterwarnings("ignore")
 logger = logging.getLogger(__name__)
- 
+
 PLOT_BG = "#0b0f14"
 CARD_BG = "#111827"
 GRID = "#1f2937"
@@ -24,12 +24,12 @@ ACCENT = "#c8a44d"
 GREEN = "#34d399"
 RED = "#f87171"
 BLUE = "#60a5fa"
- 
- 
+
+
 @dataclass
 class BESSProject:
     """Validated BESS project definition."""
- 
+
     project_id: str = "BESS-001"
     cliente: str = ""
     submercado: str = "SE/CO"
@@ -38,7 +38,7 @@ class BESSProject:
     taxa_desconto: float = 10.0
     inflacao: float = 4.5
     tipo_projeto: str = "industrial"
- 
+
     potencia_mw: float = 10.0
     energia_mwh: float = 40.0
     duracao_h: float = 4.0
@@ -49,13 +49,13 @@ class BESSProject:
     soc_min: float = 10.0
     soc_max: float = 90.0
     c_rate_max: float = 0.5
- 
+
     usar_pld_modelado: bool = True
     cenario_pld: str = "Base"
     pld_fixo: float = 200.0
     spread_tarifario: float = 1.3
     pld_submercado: str = ""  # Submercado de referência para PLD (override do campo submercado)
- 
+
     modo: str = "arbitragem"
     carga_inicio: int = 1
     carga_fim: int = 6
@@ -64,31 +64,45 @@ class BESSProject:
     limite_demanda_kw: float = 7000.0
     prioridade: str = "receita"
     usar_otimizacao_lp: bool = True  # Usa LP para despacho ótimo
- 
+
     capex_bess_kwh: float = 1200.0
     capex_pcs_kw: float = 250.0
     capex_bop_kw: float = 120.0
     capex_engenharia: float = 500000.0
     capex_instalacao: float = 800000.0
- 
+
     opex_fixo: float = 150000.0
     opex_variavel: float = 5.0
     seguro_pct: float = 0.5
     opex_om: float = 50000.0
- 
+
     demanda_contratada: float = 10000.0
     custo_energia_base: float = 320.0
     custo_demanda_base: float = 85.0
- 
+
+    # ── Exposição à liquidação do mercado pelo PLD ───────────────────────────
+    # O projeto pode optar por consumir ACIMA do contratado no PLD baixo (para
+    # carregar a BESS) e ABAIXO no PLD alto (descarregando). A diferença é
+    # liquidada no CCEE ao PLD do instante.
+    # carga_media_mw         : carga média consumida da rede (MW)
+    # contrato_mw            : contrato de energia firmado (MW flat)
+    # flexibilidade_mw       : banda de exposição disponível ao mercado (MW)
+    #                          Positivo = pode comprar mais / vender menos
+    # encargo_tusd_rs_mwh    : custo adicional sobre energia ciclada (TUSD, ESS, etc.)
+    carga_media_mw: float = 0.0          # 0 = não considera liquidação de mercado
+    contrato_mw: float = 0.0
+    flexibilidade_mw: float = 0.0
+    encargo_tusd_rs_mwh: float = 0.0
+
     n_simulacoes: int = 1000
     horizonte_horas: int = 8760
     usar_montecarlo: bool = True
     seed: int = 42
     vol_pld: float = 0.25
     vol_carga: float = 0.10
- 
+
     load_profile: pd.DataFrame = field(default_factory=pd.DataFrame)
- 
+
     @property
     def capex_total(self) -> float:
         return (
@@ -98,20 +112,20 @@ class BESSProject:
             + self.capex_engenharia
             + self.capex_instalacao
         )
- 
+
     @property
     def opex_anual(self) -> float:
         return self.opex_fixo + self.opex_om + (self.seguro_pct / 100.0) * self.capex_total
- 
+
     @property
     def energia_util_mwh(self) -> float:
         return self.energia_mwh * (self.soc_max - self.soc_min) / 100.0
- 
- 
+
+
 @dataclass
 class FinanceInputs:
     """Indicative lender-style assumptions used for the BESS dashboard."""
- 
+
     gearing_max_pct: float = 70.0
     debt_cost_pct: float = 12.0
     debt_tenor_years: int = 10
@@ -119,8 +133,8 @@ class FinanceInputs:
     target_dscr: float = 1.35
     mmra_months: int = 6
     augmentation_factor_pct: float = 50.0
- 
- 
+
+
 def _as_bool(value: Any, default: bool) -> bool:
     if value is None or (isinstance(value, float) and np.isnan(value)):
         return default
@@ -134,8 +148,8 @@ def _as_bool(value: Any, default: bool) -> bool:
     if text in {"0", "false", "f", "no", "n", "nao", "não"}:
         return False
     return default
- 
- 
+
+
 def _as_float(value: Any, default: float) -> float:
     if value is None:
         return float(default)
@@ -158,42 +172,42 @@ def _as_float(value: Any, default: float) -> float:
         return float(text)
     except ValueError:
         return float(default)
- 
- 
+
+
 def _as_int(value: Any, default: int) -> int:
     return int(round(_as_float(value, float(default))))
- 
- 
+
+
 def _safe_datetime(value: Any, default: str) -> str:
     ts = pd.to_datetime(value, errors="coerce")
     if pd.isna(ts):
         ts = pd.to_datetime(default)
     return ts.strftime("%Y-%m-%d")
- 
- 
+
+
 def _fmt_currency(value: Optional[float], scale: float = 1.0, suffix: str = "") -> str:
     if value is None or pd.isna(value):
         return "-"
     return f"R${value / scale:,.2f}{suffix}"
- 
- 
+
+
 def _fmt_pct(value: Optional[float]) -> str:
     if value is None or pd.isna(value):
         return "-"
     return f"{value:,.2f}%"
- 
- 
+
+
 def _load_workbook_sheets(file_path: str) -> Dict[str, pd.DataFrame]:
     xl = pd.ExcelFile(file_path)
     return {sheet: xl.parse(sheet, header=None) for sheet in xl.sheet_names}
- 
- 
+
+
 def parse_excel(file_path: str) -> BESSProject:
     """Read the BESS template and return a validated project object."""
- 
+
     sheets = _load_workbook_sheets(file_path)
     proj = BESSProject()
- 
+
     def _val(sheet: str, row: int, col: int = 2, default: Any = None) -> Any:
         df = sheets.get(sheet)
         if df is None:
@@ -205,7 +219,7 @@ def parse_excel(file_path: str) -> BESSProject:
         if pd.isna(value):
             return default
         return value
- 
+
     proj.project_id = str(_val("PROJECT", 3, default=proj.project_id) or proj.project_id)
     proj.cliente = str(_val("PROJECT", 4, default="") or "")
     proj.submercado = str(_val("PROJECT", 5, default=proj.submercado) or proj.submercado)
@@ -214,7 +228,7 @@ def parse_excel(file_path: str) -> BESSProject:
     proj.taxa_desconto = _as_float(_val("PROJECT", 8, default=proj.taxa_desconto), proj.taxa_desconto)
     proj.inflacao = _as_float(_val("PROJECT", 9, default=proj.inflacao), proj.inflacao)
     proj.tipo_projeto = str(_val("PROJECT", 10, default=proj.tipo_projeto) or proj.tipo_projeto)
- 
+
     proj.potencia_mw = _as_float(_val("BESS_TECH", 3, default=proj.potencia_mw), proj.potencia_mw)
     proj.energia_mwh = _as_float(_val("BESS_TECH", 4, default=proj.energia_mwh), proj.energia_mwh)
     proj.duracao_h = _as_float(_val("BESS_TECH", 5, default=proj.duracao_h), proj.duracao_h)
@@ -225,7 +239,7 @@ def parse_excel(file_path: str) -> BESSProject:
     proj.soc_min = _as_float(_val("BESS_TECH", 10, default=proj.soc_min), proj.soc_min)
     proj.soc_max = _as_float(_val("BESS_TECH", 11, default=proj.soc_max), proj.soc_max)
     proj.c_rate_max = _as_float(_val("BESS_TECH", 12, default=proj.c_rate_max), proj.c_rate_max)
- 
+
     proj.usar_pld_modelado = _as_bool(_val("MARKET", 3, default=proj.usar_pld_modelado), proj.usar_pld_modelado)
     proj.cenario_pld = str(_val("MARKET", 4, default=proj.cenario_pld) or proj.cenario_pld)
     proj.pld_fixo = _as_float(_val("MARKET", 5, default=proj.pld_fixo), proj.pld_fixo)
@@ -233,7 +247,7 @@ def parse_excel(file_path: str) -> BESSProject:
     # Submercado de referência para PLD (linha 7 da aba MARKET – "Submercado PLD")
     _pld_sub = _val("MARKET", 7, default="")
     proj.pld_submercado = str(_pld_sub).strip() if _pld_sub and str(_pld_sub).strip() not in ("", "nan", "None") else ""
- 
+
     proj.modo = str(_val("STRATEGY", 3, default=proj.modo) or proj.modo)
     proj.carga_inicio = _as_int(_val("STRATEGY", 5, default=proj.carga_inicio), proj.carga_inicio)
     proj.carga_fim = _as_int(_val("STRATEGY", 6, default=proj.carga_fim), proj.carga_fim)
@@ -242,32 +256,37 @@ def parse_excel(file_path: str) -> BESSProject:
     proj.limite_demanda_kw = _as_float(_val("STRATEGY", 10, default=proj.limite_demanda_kw), proj.limite_demanda_kw)
     proj.prioridade = str(_val("STRATEGY", 11, default=proj.prioridade) or proj.prioridade)
     proj.usar_otimizacao_lp = _as_bool(_val("STRATEGY", 12, default=proj.usar_otimizacao_lp), proj.usar_otimizacao_lp)
- 
+
     proj.capex_bess_kwh = _as_float(_val("CAPEX", 3, default=proj.capex_bess_kwh), proj.capex_bess_kwh)
     proj.capex_pcs_kw = _as_float(_val("CAPEX", 4, default=proj.capex_pcs_kw), proj.capex_pcs_kw)
     proj.capex_bop_kw = _as_float(_val("CAPEX", 5, default=proj.capex_bop_kw), proj.capex_bop_kw)
     proj.capex_engenharia = _as_float(_val("CAPEX", 6, default=proj.capex_engenharia), proj.capex_engenharia)
     proj.capex_instalacao = _as_float(_val("CAPEX", 7, default=proj.capex_instalacao), proj.capex_instalacao)
- 
+
     proj.opex_fixo = _as_float(_val("OPEX", 3, default=proj.opex_fixo), proj.opex_fixo)
     proj.opex_variavel = _as_float(_val("OPEX", 4, default=proj.opex_variavel), proj.opex_variavel)
     proj.seguro_pct = _as_float(_val("OPEX", 5, default=proj.seguro_pct), proj.seguro_pct)
     proj.opex_om = _as_float(_val("OPEX", 6, default=proj.opex_om), proj.opex_om)
- 
+
     proj.demanda_contratada = _as_float(_val("ALTERNATIVE", 4, default=proj.demanda_contratada), proj.demanda_contratada)
     proj.custo_energia_base = _as_float(_val("ALTERNATIVE", 5, default=proj.custo_energia_base), proj.custo_energia_base)
     proj.custo_demanda_base = _as_float(_val("ALTERNATIVE", 6, default=proj.custo_demanda_base), proj.custo_demanda_base)
- 
+    # Campos de exposição à liquidação de mercado (linhas 8-11 da aba ALTERNATIVE)
+    proj.carga_media_mw      = _as_float(_val("ALTERNATIVE", 8, default=proj.carga_media_mw), proj.carga_media_mw)
+    proj.contrato_mw         = _as_float(_val("ALTERNATIVE", 9, default=proj.contrato_mw), proj.contrato_mw)
+    proj.flexibilidade_mw    = _as_float(_val("ALTERNATIVE", 10, default=proj.flexibilidade_mw), proj.flexibilidade_mw)
+    proj.encargo_tusd_rs_mwh = _as_float(_val("ALTERNATIVE", 11, default=proj.encargo_tusd_rs_mwh), proj.encargo_tusd_rs_mwh)
+
     proj.n_simulacoes = _as_int(_val("SIMULATION", 3, default=proj.n_simulacoes), proj.n_simulacoes)
     proj.horizonte_horas = _as_int(_val("SIMULATION", 4, default=proj.horizonte_horas), proj.horizonte_horas)
     proj.usar_montecarlo = _as_bool(_val("SIMULATION", 5, default=proj.usar_montecarlo), proj.usar_montecarlo)
     proj.seed = _as_int(_val("SIMULATION", 6, default=proj.seed), proj.seed)
     proj.vol_pld = _as_float(_val("SIMULATION", 7, default=proj.vol_pld), proj.vol_pld)
     proj.vol_carga = _as_float(_val("SIMULATION", 8, default=proj.vol_carga), proj.vol_carga)
- 
+
     if proj.potencia_mw > 0 and proj.energia_mwh > 0 and proj.duracao_h <= 0:
         proj.duracao_h = proj.energia_mwh / proj.potencia_mw
- 
+
     if "LOAD_PROFILE" in sheets:
         try:
             lp_raw = sheets["LOAD_PROFILE"].copy()
@@ -288,13 +307,13 @@ def parse_excel(file_path: str) -> BESSProject:
                 proj.load_profile = lp.reset_index(drop=True)
         except Exception as exc:
             logger.warning("LOAD_PROFILE parse falhou: %s", exc)
- 
+
     return proj
- 
- 
+
+
 def validate_project(proj: BESSProject) -> List[str]:
     """Validate the project and return warnings/issues."""
- 
+
     issues: List[str] = []
     if not (0.5 <= proj.eficiencia_rt <= 1.0):
         issues.append(f"Eficiencia RT={proj.eficiencia_rt} fora do intervalo [0.5, 1.0].")
@@ -320,28 +339,148 @@ def validate_project(proj: BESSProject) -> List[str]:
             f"Horizonte financeiro ({proj.horizonte_anos}a) sera limitado pela vida util do ativo ({proj.vida_util}a)."
         )
     return issues
- 
- 
+
+
 def _submercado_key(submercado: str) -> str:
-    sub = str(submercado).strip().lower()
+    """Normalisa qualquer alias de submercado para a chave interna usada pelo engine.
+
+    Aliases aceitos (case-insensitive):
+    - SE/CO, SE, SECO, SUDESTE, SUDESTE/CENTRO-OESTE → "seco"   (coluna pld_se no app)
+    - Sul, S, SUL                                     → "s"      (coluna pld_s  no app)
+    - NE, Nordeste, NORDESTE                          → "ne"     (coluna pld_ne no app)
+    - N, Norte, NORTE                                 → "n"      (coluna pld_n  no app)
+
+    Esta função é o ponto único de normalização entre os submercados do DuckDB/Neon
+    (que usam pld_se, pld_s, pld_ne, pld_n) e as chaves internas do motor de PLD.
+    """
+    sub = str(submercado).strip().lower().replace(" ", "")
     mapping = {
-        "se/co": "seco",
-        "se": "seco",
-        "seco": "seco",
-        "sul": "s",
-        "s": "s",
-        "ne": "ne",
-        "nordeste": "ne",
-        "n": "n",
-        "norte": "n",
+        # SE/CO e variantes
+        "se/co": "seco", "se": "seco", "seco": "seco",
+        "sudeste": "seco", "sudeste/centro-oeste": "seco",
+        # Sul
+        "sul": "s", "s": "s",
+        # Nordeste
+        "ne": "ne", "nordeste": "ne",
+        # Norte
+        "n": "n", "norte": "n",
     }
     return mapping.get(sub, "seco")
- 
- 
+
+
+def _pld_col_from_submercado(submercado: str) -> str:
+    """Retorna o nome da coluna pld_* usada pelo app_premium (DuckDB/Neon).
+
+    app_premium.py usa SUB_COL = {
+        "SE/CO": "pld_se", "NE": "pld_ne", "S": "pld_s", "N": "pld_n"
+    }
+    Esta função permite que o engine aponte para a coluna correta do DataFrame
+    horário quando recebe um submercado de referência.
+    """
+    key = _submercado_key(submercado)
+    return {"seco": "pld_se", "s": "pld_s", "ne": "pld_ne", "n": "pld_n"}.get(key, "pld_se")
+
+
+def get_pld_official_day(
+    target_date: str,
+    submercado: str,
+    pld_fixo_fallback: float = 200.0,
+) -> np.ndarray:
+    """Retorna o vetor de PLD oficial (24h) para ``target_date`` a partir do DuckDB/Neon.
+
+    Regras:
+    - O PLD é PURO, sem spread e sem sazonalidade artificial — exatamente como
+      publicado pelo CCEE para a data de operação.
+    - A data no banco É a data de operação: o PLD do dia D é registrado com data D
+      (mesmo que publicado em D-1). Basta filtrar pelo dia-alvo.
+    - Se o banco não tiver dados (ex.: data futura não publicada ainda), retorna
+      pld_fixo_fallback plano — o LP encontrará o ótimo de qualquer forma.
+
+    Retorna
+    -------
+    np.ndarray shape (24,), R$/MWh, clampado em [57.31, 1611.04].
+    """
+    from pathlib import Path as _Path
+
+    target_ts = pd.to_datetime(target_date).normalize()
+    date_str = target_ts.strftime("%Y-%m-%d")
+    sub_key = _submercado_key(submercado)
+
+    # Aliases que o banco pode usar para cada submercado
+    _ALIASES: Dict[str, List[str]] = {
+        "seco": ["SE/CO", "SE", "SUDESTE", "SECO", "SUDESTE/CENTRO-OESTE"],
+        "s":    ["SUL", "S"],
+        "ne":   ["NORDESTE", "NE"],
+        "n":    ["NORTE", "N"],
+    }
+    aliases = _ALIASES.get(sub_key, ["SE/CO"])
+    alias_sql = ", ".join(f"'{a}'" for a in aliases)
+
+    def _parse_df(df_pld: pd.DataFrame) -> Optional[np.ndarray]:
+        """Converte DataFrame {hora, pld_hora} em array de 24h."""
+        if df_pld.empty or len(df_pld) < 20:
+            return None
+        df_pld = df_pld.copy()
+        df_pld["hora"] = pd.to_datetime(df_pld["hora"], errors="coerce")
+        df_pld = df_pld.dropna(subset=["hora"]).sort_values("hora")
+        df_pld["hod"] = df_pld["hora"].dt.hour
+        pld_24 = np.full(24, pld_fixo_fallback, dtype=float)
+        for _, row in df_pld.iterrows():
+            h = int(row["hod"])
+            if 0 <= h <= 23:
+                pld_24[h] = float(row["pld_hora"])
+        return np.clip(pld_24, 57.31, 1611.04)
+
+    query = f"""
+        SELECT
+            date_trunc('hour', data) AS hora,
+            AVG(pld) AS pld_hora
+        FROM pld_historical
+        WHERE CAST(data AS DATE) = '{date_str}'
+          AND UPPER(TRIM(submercado)) IN ({alias_sql})
+          AND pld > 0
+        GROUP BY 1
+        ORDER BY 1
+    """
+
+    # ── Tentativa 1: DuckDB local ────────────────────────────────────────────
+    duckdb_path = _Path("data/kintuadi.duckdb")
+    if duckdb_path.exists():
+        try:
+            import duckdb as _ddb
+            con = _ddb.connect(str(duckdb_path), read_only=True)
+            df_pld = con.execute(query).df()
+            con.close()
+            result = _parse_df(df_pld)
+            if result is not None:
+                logger.info("PLD D+1 obtido do DuckDB para %s/%s", date_str, submercado)
+                return result
+        except Exception as _e:
+            logger.debug("DuckDB PLD falhou para %s: %s", date_str, _e)
+
+    # ── Tentativa 2: Neon PostgreSQL ─────────────────────────────────────────
+    try:
+        import db_neon  # type: ignore
+        df_pld = db_neon.fetchdf(query)
+        result = _parse_df(df_pld)
+        if result is not None:
+            logger.info("PLD D+1 obtido do Neon para %s/%s", date_str, submercado)
+            return result
+    except Exception as _e:
+        logger.debug("Neon PLD falhou para %s: %s", date_str, _e)
+
+    # ── Fallback plano (sem spread — LP otimiza sobre preço uniforme) ─────────
+    logger.warning(
+        "PLD oficial não disponível para %s/%s — usando fallback plano R$%.0f/MWh",
+        date_str, submercado, pld_fixo_fallback,
+    )
+    return np.full(24, pld_fixo_fallback, dtype=float)
+
+
 def _get_spectral_peak_hour() -> Optional[int]:
     try:
         from spectral_engine import get_current_fingerprint
- 
+
         fp = get_current_fingerprint()
         if fp and getattr(fp, "regime", "unknown") != "unknown":
             peak_hour = int(round(float(getattr(fp, "peak_hour", 18))))
@@ -349,26 +488,26 @@ def _get_spectral_peak_hour() -> Optional[int]:
     except Exception:
         return None
     return None
- 
- 
+
+
 def get_pld_path(proj: BESSProject, rng: Optional[np.random.Generator] = None) -> np.ndarray:
     """Generate an hourly PLD path for the BESS simulation.
- 
+
     O submercado de referência é determinado por ``proj.pld_submercado`` quando
     informado no template (aba MARKET → "Submercado PLD"). Se não informado,
     usa ``proj.submercado`` (aba PROJECT).  Isso permite modelar, por exemplo, um
     projeto instalado no SE/CO que negocia no submercado Sul.
     """
- 
+
     n = proj.horizonte_horas
     # Resolve qual submercado usar para referência de PLD
     ref_sub = proj.pld_submercado if proj.pld_submercado else proj.submercado
     base_prices: List[float] = []
- 
+
     if proj.usar_pld_modelado:
         try:
             from pld_forecast_engine import forecast_short_term, get_latest_pmo_state
- 
+
             pmo = get_latest_pmo_state()
             short = forecast_short_term(pmo)
             semanas = short.get("semanas", [])
@@ -379,10 +518,10 @@ def get_pld_path(proj: BESSProject, rng: Optional[np.random.Generator] = None) -
                     base_prices.append(float(p50))
         except Exception:
             base_prices = []
- 
+
     if not base_prices:
         base_prices = [proj.pld_fixo]
- 
+
     hourly = np.zeros(n, dtype=float)
     weekly_len = max(1, int(np.ceil(n / max(len(base_prices), 1))))
     spread = max(proj.spread_tarifario, 1.01)
@@ -397,19 +536,19 @@ def get_pld_path(proj: BESSProject, rng: Optional[np.random.Generator] = None) -
         else:
             seasonality = 1.0
         hourly[hour] = base * seasonality
- 
+
     if rng is not None:
         sigma = max(float(proj.vol_pld), 0.0)
         if sigma > 0:
             noise = rng.lognormal(mean=-0.5 * sigma * sigma, sigma=sigma, size=n)
             hourly = hourly * noise
- 
+
     return np.clip(hourly, 57.31, 1611.04)
- 
- 
+
+
 def get_tariff_path(proj: BESSProject) -> np.ndarray:
     """Return the hourly tariff series used for savings/shaving logic."""
- 
+
     n = proj.horizonte_horas
     if not proj.load_profile.empty:
         col = next(
@@ -424,7 +563,7 @@ def get_tariff_path(proj: BESSProject) -> np.ndarray:
             base = pd.to_numeric(proj.load_profile[col], errors="coerce").fillna(proj.pld_fixo).to_numpy()
             reps = (n // len(base)) + 1
             return np.tile(base, reps)[:n]
- 
+
     tariff = np.full(n, proj.pld_fixo, dtype=float)
     spread = max(proj.spread_tarifario, 1.01)
     for hour in range(n):
@@ -434,11 +573,11 @@ def get_tariff_path(proj: BESSProject) -> np.ndarray:
         elif 0 <= hod <= 5:
             tariff[hour] = proj.pld_fixo / spread
     return tariff
- 
- 
+
+
 def get_load_path(proj: BESSProject, rng: Optional[np.random.Generator] = None) -> np.ndarray:
     """Generate or reuse an hourly load profile."""
- 
+
     n = proj.horizonte_horas
     if not proj.load_profile.empty:
         col = next((c for c in proj.load_profile.columns if "carga" in c.lower() or "load" in c.lower()), None)
@@ -462,16 +601,16 @@ def get_load_path(proj: BESSProject, rng: Optional[np.random.Generator] = None) 
                     load[hour] = 2.0
             else:
                 load[hour] = 2.5 if 8 <= hod <= 16 else 1.5
- 
+
     if rng is not None:
         sigma = max(float(proj.vol_carga), 0.0)
         if sigma > 0:
             noise = rng.normal(1.0, sigma, n)
             load = load * np.clip(noise, 0.6, 1.4)
- 
+
     return np.clip(load, 0.0, proj.potencia_mw * 5.0)
- 
- 
+
+
 def optimize_dispatch_lp(
     proj: BESSProject,
     pld: np.ndarray,
@@ -479,10 +618,10 @@ def optimize_dispatch_lp(
     year: int = 1,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Compute optimal hourly charge/discharge schedule via Linear Programming.
- 
+
     Maximiza a receita de arbitragem líquida:
         max  Σ_t  PLD_t · discharge_t  −  PLD_t · charge_t
- 
+
     sujeito a:
         SOC_t = SOC_{t-1} + charge_t · η  −  discharge_t       (dinâmica)
         soc_min ≤ SOC_t ≤ soc_max                               (limites de SOC)
@@ -490,7 +629,7 @@ def optimize_dispatch_lp(
         0 ≤ discharge_t ≤ min(potencia_max, load_t)             (potência de descarga)
         discharge_t + charge_t ≤ potencia_max                   (não opera simultâneo)
         Σ_{t in dia d} discharge_t ≤ ciclos_dia_max · energia_util  (ciclos/dia)
- 
+
     Retorna arrays numpy ``(charge, discharge)`` de tamanho ``len(pld)``.
     Faz fallback silencioso para arrays zeros se PuLP não estiver disponível.
     """
@@ -500,43 +639,43 @@ def optimize_dispatch_lp(
         logger.warning("PuLP não instalado – retornando despacho zero. Instale com: pip install pulp")
         n = min(len(pld), len(load), proj.horizonte_horas)
         return np.zeros(n, dtype=float), np.zeros(n, dtype=float)
- 
+
     import pulp
- 
+
     n = min(len(pld), len(load), proj.horizonte_horas)
     pld_arr = np.asarray(pld, dtype=float)[:n]
     load_arr = np.asarray(load, dtype=float)[:n]
- 
+
     degradation_factor = (1.0 - proj.degradacao_anual / 100.0) ** max(year - 1, 0)
     energia_util = proj.energia_util_mwh * degradation_factor
     soc_min_mwh = proj.soc_min / 100.0 * proj.energia_mwh * degradation_factor
     soc_max_mwh = proj.soc_max / 100.0 * proj.energia_mwh * degradation_factor
     potencia_max = float(min(proj.potencia_mw, proj.c_rate_max * max(proj.energia_mwh, 0.001)))
     eta = max(proj.eficiencia_rt, 0.01)
- 
+
     prob = pulp.LpProblem("BESS_Dispatch", pulp.LpMaximize)
- 
+
     charge = [pulp.LpVariable(f"c_{t}", lowBound=0, upBound=potencia_max) for t in range(n)]
     discharge = [pulp.LpVariable(f"d_{t}", lowBound=0, upBound=potencia_max) for t in range(n)]
     soc = [pulp.LpVariable(f"s_{t}", lowBound=soc_min_mwh, upBound=soc_max_mwh) for t in range(n)]
- 
+
     # Objetivo
     prob += pulp.lpSum(pld_arr[t] * discharge[t] - pld_arr[t] * charge[t] for t in range(n))
- 
+
     # SOC inicial (meio do intervalo útil)
     soc_init = soc_min_mwh + 0.5 * energia_util
     prob += soc[0] == soc_init + charge[0] * eta - discharge[0]
- 
+
     for t in range(1, n):
         prob += soc[t] == soc[t - 1] + charge[t] * eta - discharge[t]
- 
+
     # Não opera carga e descarga simultaneamente
     for t in range(n):
         prob += charge[t] + discharge[t] <= potencia_max
         # Descarga limitada pela carga local (se modo não for arbitragem pura, respeita a demanda)
         if proj.modo != "arbitragem":
             prob += discharge[t] <= float(load_arr[t]) + potencia_max * 0.0  # sem restrição de carga local no LP geral
- 
+
     # Limite de ciclos por dia
     daily_budget = float(max(energia_util * proj.ciclos_dia_max, 0.0))
     n_days = (n + 23) // 24
@@ -544,59 +683,50 @@ def optimize_dispatch_lp(
         h_start = d * 24
         h_end = min(h_start + 24, n)
         prob += pulp.lpSum(discharge[t] for t in range(h_start, h_end)) <= daily_budget
- 
+
     solver = pulp.PULP_CBC_CMD(msg=0, timeLimit=60)
     prob.solve(solver)
- 
+
     charge_arr = np.array([max(pulp.value(charge[t]) or 0.0, 0.0) for t in range(n)], dtype=float)
     discharge_arr = np.array([max(pulp.value(discharge[t]) or 0.0, 0.0) for t in range(n)], dtype=float)
- 
+
     return charge_arr, discharge_arr
- 
- 
+
+
 def get_next_day_guidance(
     proj: BESSProject,
     target_date: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Gera o guia de operação ótima para o DIA SEGUINTE baseado no PLD publicado.
- 
-    O PLD do dia D é publicado no dia D-1. Esta função:
-    1. Resolve qual submercado usar (``proj.pld_submercado`` ou ``proj.submercado``).
-    2. Gera o vetor de PLD para as 24h do dia-alvo (D+1 a partir de hoje).
-    3. Roda o despacho LP para as 24 horas.
-    4. Retorna um plano hora-a-hora com ação recomendada e valor esperado.
- 
-    Parâmetros
-    ----------
-    proj : BESSProject
-        Objeto de projeto já carregado.
-    target_date : str, opcional
-        Data-alvo no formato "AAAA-MM-DD". Padrão: amanhã.
- 
-    Retorna
-    -------
-    dict com chaves:
-        - submercado_referencia: str
-        - data_operacao: str
-        - data_publicacao_pld: str
-        - plano_horario: list[dict]  (hora, acao, carga_mw, descarga_mw, soc_mwh, pld_r$_mwh, receita_esperada_r$)
-        - receita_total_esperada_rs: float
-        - energia_carregada_mwh: float
-        - energia_descarregada_mwh: float
-        - resumo_texto: str
+    """Guia de operação ótima para o DIA SEGUINTE com PLD oficial do banco.
+
+    Fluxo:
+    1. Determina data de operação (amanhã por padrão) e submercado de referência.
+    2. Busca o PLD oficial do DuckDB/Neon para a data-alvo.
+       - PLD PURO, sem spread, sem sazonalidade artificial.
+       - A data no banco é a data de operação (registrado como D, publicado em D-1).
+    3. Roda LP sobre as 24h do dia.
+    4. Calcula receita de arbitragem + economia por liquidação de mercado (se configurado):
+       - Comprar acima do contrato no PLD baixo (carregar BESS) → custo
+       - Vender abaixo do contrato no PLD alto (descarregar BESS) → receita
+       - Encargos TUSD/ESS sobre energia ciclada
+    5. Retorna plano hora-a-hora e métricas financeiras do dia.
     """
     from datetime import date, timedelta
- 
+
     today = date.today()
-    if target_date:
-        op_date = pd.to_datetime(target_date).date()
-    else:
-        op_date = today + timedelta(days=1)
- 
+    op_date = pd.to_datetime(target_date).date() if target_date else today + timedelta(days=1)
     pub_date = op_date - timedelta(days=1)
     ref_sub = proj.pld_submercado if proj.pld_submercado else proj.submercado
- 
-    # Gera PLD para 24h usando o motor existente (proj configurado para 24h)
+
+    # ── PLD oficial do banco (puro, sem spread) ───────────────────────────────
+    pld_24 = get_pld_official_day(
+        target_date=str(op_date),
+        submercado=ref_sub,
+        pld_fixo_fallback=proj.pld_fixo,
+    )
+    fonte_pld = "DuckDB/Neon (oficial)" if pld_24.std() > 1.0 else f"Fallback plano R${proj.pld_fixo:.0f}/MWh"
+
+    # ── Perfil de carga para o dia ────────────────────────────────────────────
     _proj24 = BESSProject(
         project_id=proj.project_id,
         submercado=proj.submercado,
@@ -609,164 +739,260 @@ def get_next_day_guidance(
         soc_min=proj.soc_min,
         soc_max=proj.soc_max,
         c_rate_max=proj.c_rate_max,
-        usar_pld_modelado=proj.usar_pld_modelado,
-        cenario_pld=proj.cenario_pld,
-        pld_fixo=proj.pld_fixo,
-        spread_tarifario=proj.spread_tarifario,
         modo=proj.modo,
         opex_variavel=proj.opex_variavel,
+        carga_media_mw=proj.carga_media_mw,
+        contrato_mw=proj.contrato_mw,
+        flexibilidade_mw=proj.flexibilidade_mw,
+        encargo_tusd_rs_mwh=proj.encargo_tusd_rs_mwh,
         horizonte_horas=24,
         data_inicio=str(op_date),
+        # Mantém pld_fixo como fallback mas não usa spread — PLD já vem puro
+        pld_fixo=proj.pld_fixo,
+        spread_tarifario=1.0,
+        usar_pld_modelado=False,
     )
- 
-    pld_24 = get_pld_path(_proj24)
     load_24 = get_load_path(_proj24)
- 
+
+    # ── Despacho LP sobre PLD oficial ─────────────────────────────────────────
     charge_arr, discharge_arr = optimize_dispatch_lp(_proj24, pld_24, load_24, year=1)
- 
-    # Reconstrói SOC para o plano
-    degradation_factor = 1.0
-    energia_util = _proj24.energia_util_mwh
+
+    # ── Reconstrução hora a hora com liquidação de mercado ────────────────────
+    eta = _proj24.eficiencia_rt
     soc_min_mwh = _proj24.soc_min / 100.0 * _proj24.energia_mwh
     soc_max_mwh = _proj24.soc_max / 100.0 * _proj24.energia_mwh
+    energia_util = _proj24.energia_util_mwh
     soc_cur = soc_min_mwh + 0.5 * energia_util
-    eta = _proj24.eficiencia_rt
- 
-    plano = []
-    total_receita = 0.0
+
+    usar_liquidacao = (proj.carga_media_mw > 0 and proj.contrato_mw > 0)
+    carga_media = proj.carga_media_mw
+    contrato = proj.contrato_mw
+    flex = max(proj.flexibilidade_mw, 0.0)
+    tusd = proj.encargo_tusd_rs_mwh
+
+    plano: List[Dict[str, Any]] = []
+    total_arbitragem = 0.0
+    total_liquidacao = 0.0
+    total_tusd = 0.0
+
     for h in range(24):
         c = float(charge_arr[h])
         d = float(discharge_arr[h])
-        soc_cur = float(np.clip(soc_cur + c * eta - d, soc_min_mwh, soc_max_mwh))
         price = float(pld_24[h])
-        receita_h = d * price - c * price
-        total_receita += receita_h
+
+        soc_cur = float(np.clip(soc_cur + c * eta - d, soc_min_mwh, soc_max_mwh))
+
+        # Receita de arbitragem pura (descarga vende ao PLD; carga compra ao PLD)
+        receita_arb = d * price - c * price
+        total_arbitragem += receita_arb
+
+        # ── Liquidação de mercado ──────────────────────────────────────────────
+        # Carga real na hora = carga_media ± ajuste BESS
+        # Ao carregar: consome carga_media + c MW da rede → exposição = +c acima do contrato
+        # Ao descarregar: consome carga_media - d MW da rede → exposição = -d abaixo do contrato
+        # A diferença em relação ao contrato é liquidada pelo CCEE ao PLD da hora.
+        liquidacao_h = 0.0
+        carga_rede_h = 0.0
+        if usar_liquidacao:
+            # Consumo real da rede nesta hora
+            carga_rede_h = max(0.0, carga_media + c - d)
+            # Diferença em relação ao contrato (positivo = comprou mais; negativo = vendeu sobra)
+            delta_contrato = carga_rede_h - contrato
+            # Limita pela flexibilidade disponível
+            delta_efetivo = float(np.clip(delta_contrato, -flex, flex))
+            # Custo da liquidação: paga PLD quando comprou mais; recebe PLD quando vendeu menos
+            liquidacao_h = -delta_efetivo * price  # negativo = custo; positivo = receita
+            total_liquidacao += liquidacao_h
+
+        # Encargo TUSD/ESS sobre energia ciclada (independe da liquidação)
+        tusd_h = (c + d) * tusd
+        total_tusd += tusd_h
+
+        receita_total_h = receita_arb + liquidacao_h - tusd_h
+
         if c > 1e-4:
             acao = "CARREGAR"
         elif d > 1e-4:
             acao = "DESCARREGAR"
         else:
             acao = "OCIOSO"
-        plano.append(
-            {
-                "hora": h,
-                "acao": acao,
-                "carga_mw": round(c, 4),
-                "descarga_mw": round(d, 4),
-                "soc_mwh": round(soc_cur, 4),
-                "pld_rs_mwh": round(price, 2),
-                "receita_esperada_rs": round(receita_h, 2),
-            }
-        )
- 
-    # Texto resumo
-    horas_carga = [p["hora"] for p in plano if p["acao"] == "CARREGAR"]
-    horas_desc = [p["hora"] for p in plano if p["acao"] == "DESCARREGAR"]
- 
-    def _fmt_horas(lst):
-        if not lst:
-            return "–"
-        return ", ".join(f"{h:02d}h" for h in lst)
- 
+
+        plano.append({
+            "hora": h,
+            "acao": acao,
+            "carga_mw": round(c, 4),
+            "descarga_mw": round(d, 4),
+            "soc_mwh": round(soc_cur, 4),
+            "pld_rs_mwh": round(price, 2),
+            "receita_arbitragem_rs": round(receita_arb, 2),
+            "liquidacao_mercado_rs": round(liquidacao_h, 2),
+            "encargo_tusd_rs": round(tusd_h, 2),
+            "receita_total_rs": round(receita_total_h, 2),
+            "carga_rede_mw": round(carga_rede_h, 4) if usar_liquidacao else None,
+        })
+
+    receita_liquida_dia = total_arbitragem + total_liquidacao - total_tusd
+
+    # ── Texto resumo ──────────────────────────────────────────────────────────
+    horas_c = [p["hora"] for p in plano if p["acao"] == "CARREGAR"]
+    horas_d = [p["hora"] for p in plano if p["acao"] == "DESCARREGAR"]
+    _fh = lambda lst: ", ".join(f"{h:02d}h" for h in lst) if lst else "–"
+
     resumo = (
-        f"Submercado de referência: {ref_sub}. "
-        f"PLD publicado em {pub_date.strftime('%d/%m/%Y')} para operação de {op_date.strftime('%d/%m/%Y')}. "
-        f"Horas de carga: {_fmt_horas(horas_carga)}. "
-        f"Horas de descarga: {_fmt_horas(horas_desc)}. "
-        f"Receita esperada: R${total_receita:,.2f}."
+        f"Submercado: {ref_sub} | Fonte PLD: {fonte_pld}. "
+        f"Data operação: {op_date.strftime('%d/%m/%Y')} (PLD publicado: {pub_date.strftime('%d/%m/%Y')}). "
+        f"Horas de carga: {_fh(horas_c)} | Horas de descarga: {_fh(horas_d)}. "
+        f"Receita arbitragem: R${total_arbitragem:,.2f} | "
+        f"Liquidação mercado: R${total_liquidacao:,.2f} | "
+        f"Encargos TUSD: R${total_tusd:,.2f} | "
+        f"Resultado líquido do dia: R${receita_liquida_dia:,.2f}."
     )
- 
+
     return {
         "submercado_referencia": ref_sub,
+        "fonte_pld": fonte_pld,
         "data_operacao": str(op_date),
         "data_publicacao_pld": str(pub_date),
         "plano_horario": plano,
-        "receita_total_esperada_rs": round(total_receita, 2),
+        "receita_arbitragem_rs": round(total_arbitragem, 2),
+        "liquidacao_mercado_rs": round(total_liquidacao, 2),
+        "encargos_tusd_rs": round(total_tusd, 2),
+        "receita_liquida_dia_rs": round(receita_liquida_dia, 2),
+        # Mantido por compatibilidade com código legado
+        "receita_total_esperada_rs": round(receita_liquida_dia, 2),
         "energia_carregada_mwh": round(float(charge_arr.sum()), 4),
         "energia_descarregada_mwh": round(float(discharge_arr.sum()), 4),
         "resumo_texto": resumo,
     }
- 
- 
+
+
 def optimize_for_irr(
     proj: BESSProject,
     pld: np.ndarray,
     load: np.ndarray,
-    utilization_steps: Optional[List[float]] = None,
+    next_day_guidance: Optional[Dict[str, Any]] = None,
+    finance_overrides: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Outer-loop: itera sobre fatores de utilização para maximizar a TIR do equity.
- 
-    Para cada fator ``u`` em ``utilization_steps``:
-      - Escala potencia_mw e energia_mwh por u
-      - Roda despacho LP
-      - Simula o ano e calcula a receita
-      - Computa TIR do equity
- 
-    Retorna o melhor fator e o resultado completo da configuração ótima.
+    """Projeta a TIR do equity em 3 cenários extrapolando o Guia D+1 para toda a vida do projeto.
+
+    Lógica:
+    - O Guia D+1 fornece a receita líquida de UM dia típico (arbitragem + liquidação - TUSD).
+    - Extrapolamos esse dia para 365 dias × horizonte do projeto, com degradação anual.
+    - Três cenários:
+        Pessimista : receita_dia × 0,6  (60% do guia D+1)
+        Base       : receita_dia × 1,0  (guia D+1 idêntico todos os dias)
+        Otimista   : receita_dia × 1,1  (110% do guia D+1)
+    - Calcula TIR do equity, VPL e DSCR mínimo para cada cenário.
+    - Fallback: se next_day_guidance não disponível, usa receita do Monte Carlo P50.
+
+    Corrige o bug 'unsupported format string passed to NoneType' tratando IRR None.
     """
-    if utilization_steps is None:
-        utilization_steps = [round(u, 2) for u in np.arange(0.4, 1.01, 0.1)]
- 
-    tariff = get_tariff_path(proj)
-    finance = FinanceInputs()
-    best: Dict[str, Any] = {"equity_irr_pct": None, "utilizacao": None}
-    all_results: List[Dict[str, Any]] = []
- 
-    for u in utilization_steps:
-        # Clone com capacidade escalada
-        _p = BESSProject(**{
-            k: v for k, v in proj.__dict__.items() if k != "load_profile"
-        })
-        _p.load_profile = proj.load_profile
-        _p.potencia_mw = proj.potencia_mw * u
-        _p.energia_mwh = proj.energia_mwh * u
- 
+    finance = FinanceInputs(**(finance_overrides or {}))
+    life = max(1, min(int(proj.horizonte_anos), int(proj.vida_util)))
+
+    # ── Receita diária de referência ──────────────────────────────────────────
+    receita_dia_ref: float = 0.0
+    fonte_referencia = "Monte Carlo P50"
+
+    if next_day_guidance and "receita_liquida_dia_rs" in next_day_guidance:
+        receita_dia_ref = float(next_day_guidance.get("receita_liquida_dia_rs") or 0.0)
+        fonte_referencia = f"Guia D+1 ({next_day_guidance.get('data_operacao', '?')})"
+    elif next_day_guidance and "receita_total_esperada_rs" in next_day_guidance:
+        receita_dia_ref = float(next_day_guidance.get("receita_total_esperada_rs") or 0.0)
+        fonte_referencia = f"Guia D+1 ({next_day_guidance.get('data_operacao', '?')})"
+    else:
+        # Fallback: usa receita anual da simulação Monte Carlo (sem next_day_guidance)
         try:
-            charge_u, discharge_u = optimize_dispatch_lp(_p, pld, load, year=1)
-            _, summary_u = simulate_year(_p, pld, load, year=1, tariff_hourly=tariff, charge=charge_u, discharge=discharge_u)
-            receita_u = float(summary_u["receita_liquida_rs"])
- 
-            # TIR simplificada (usa apenas receita do ano 1 replicada)
-            operating_df = _build_operating_case(_p, receita_u, finance)
-            annual_df, _ = _build_financing_schedule(operating_df, _p.capex_total, finance)
-            equity_outflow = _p.capex_total * (1.0 - finance.gearing_max_pct / 100.0)
+            tariff = get_tariff_path(proj)
+            mc_fallback = run_monte_carlo(proj, n_sims=max(50, min(proj.n_simulacoes, 200)))
+            receita_anual = float(mc_fallback.get("receita_p50") or 0.0)
+            receita_dia_ref = receita_anual / 365.0
+            fonte_referencia = "Monte Carlo P50 (fallback)"
+        except Exception as _e:
+            logger.warning("optimize_for_irr fallback falhou: %s", _e)
+            receita_dia_ref = 0.0
+
+    # ── Três cenários ─────────────────────────────────────────────────────────
+    cenarios = [
+        ("pessimista", 0.6),
+        ("base",       1.0),
+        ("otimista",   1.1),
+    ]
+
+    resultados = {}
+    for nome, fator in cenarios:
+        receita_dia = receita_dia_ref * fator
+        receita_ano1 = receita_dia * 365.0
+
+        try:
+            op_df = _build_operating_case(proj, receita_ano1, finance)
+            annual_df, financing_s = _build_financing_schedule(op_df, proj.capex_total, finance)
+
+            equity_outflow = financing_s["equity_amount_rs"] + financing_s["initial_mmra_rs"]
+            project_cf = [-proj.capex_total] + op_df["project_fcf_rs"].tolist()
             equity_cf = [-equity_outflow] + annual_df["equity_cashflow_rs"].tolist()
-            irr = _irr(equity_cf)
-        except Exception as exc:
-            logger.warning("optimize_for_irr: erro em u=%.2f – %s", u, exc)
-            irr = None
-            receita_u = 0.0
-            summary_u = {}
-            charge_u = np.zeros(proj.horizonte_horas)
-            discharge_u = np.zeros(proj.horizonte_horas)
- 
-        record = {
-            "utilizacao": u,
-            "potencia_mw": round(_p.potencia_mw, 3),
-            "energia_mwh": round(_p.energia_mwh, 3),
-            "receita_rs": round(receita_u, 2),
-            "equity_irr_pct": irr,
-        }
-        all_results.append(record)
- 
-        if irr is not None and (best["equity_irr_pct"] is None or irr > best["equity_irr_pct"]):
-            best = {
-                **record,
-                "charge": charge_u,
-                "discharge": discharge_u,
-                "summary": summary_u,
+
+            project_irr = _irr(project_cf)
+            equity_irr  = _irr(equity_cf)
+            discount    = proj.taxa_desconto / 100.0
+            project_npv = round(_npv(discount, project_cf), 2)
+            equity_npv  = round(_npv(discount, equity_cf), 2)
+
+            resultados[nome] = {
+                "fator": fator,
+                "receita_dia_rs": round(receita_dia, 2),
+                "receita_ano1_rs": round(receita_ano1, 2),
+                "project_irr_pct": project_irr,
+                "equity_irr_pct": equity_irr,
+                "project_npv_rs": project_npv,
+                "equity_npv_rs": equity_npv,
+                "min_dscr": financing_s.get("min_dscr"),
+                "llcr": financing_s.get("llcr"),
+                "debt_amount_rs": financing_s.get("debt_amount_rs"),
             }
- 
+        except Exception as exc:
+            logger.warning("optimize_for_irr cenário %s falhou: %s", nome, exc)
+            resultados[nome] = {
+                "fator": fator,
+                "receita_dia_rs": round(receita_dia, 2),
+                "receita_ano1_rs": round(receita_ano1, 2),
+                "project_irr_pct": None,
+                "equity_irr_pct": None,
+                "project_npv_rs": None,
+                "equity_npv_rs": None,
+                "min_dscr": None,
+                "llcr": None,
+                "debt_amount_rs": None,
+            }
+
+    base = resultados.get("base", {})
+
     return {
-        "best": best,
-        "all_utilization_results": all_results,
-        "optimal_utilizacao": best.get("utilizacao"),
-        "optimal_irr_pct": best.get("equity_irr_pct"),
-        "optimal_potencia_mw": best.get("potencia_mw"),
-        "optimal_energia_mwh": best.get("energia_mwh"),
+        "fonte_referencia": fonte_referencia,
+        "receita_dia_referencia_rs": round(receita_dia_ref, 2),
+        "cenarios": resultados,
+        # Atalhos para o dashboard
+        "optimal_irr_pct": base.get("equity_irr_pct"),
+        "optimal_utilizacao": 1.0,
+        "optimal_potencia_mw": proj.potencia_mw,
+        "optimal_energia_mwh": proj.energia_mwh,
+        # Para compatibilidade com código de tabela anterior
+        "all_utilization_results": [
+            {
+                "cenario": nome,
+                "fator": r["fator"],
+                "receita_dia_rs": r["receita_dia_rs"],
+                "receita_ano1_rs": r["receita_ano1_rs"],
+                "equity_irr_pct": r["equity_irr_pct"],
+                "project_irr_pct": r["project_irr_pct"],
+                "equity_npv_rs": r["equity_npv_rs"],
+                "min_dscr": r["min_dscr"],
+            }
+            for nome, r in resultados.items()
+        ],
     }
- 
- 
+
+
 def simulate_year(
     proj: BESSProject,
     pld_hourly: np.ndarray,
@@ -777,24 +1003,24 @@ def simulate_year(
     discharge: Optional[np.ndarray] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, float]]:
     """Simulate hourly BESS operation for one operating year.
- 
+
     Se ``charge`` e ``discharge`` forem fornecidos (e.g. pelo LP), eles são usados
     diretamente e a lógica heurística interna é ignorada. O SOC ainda é rastreado
     para validação e log.
     """
- 
+
     n_hours = min(len(pld_hourly), len(load_hourly), proj.horizonte_horas)
     pld_hourly = np.asarray(pld_hourly, dtype=float)[:n_hours]
     load_hourly = np.asarray(load_hourly, dtype=float)[:n_hours]
     tariff_hourly = get_tariff_path(proj) if tariff_hourly is None else np.asarray(tariff_hourly, dtype=float)
     tariff_hourly = np.tile(tariff_hourly, (n_hours // len(tariff_hourly)) + 1)[:n_hours]
- 
+
     degradation_factor = (1.0 - proj.degradacao_anual / 100.0) ** max(year - 1, 0)
     energia_util = proj.energia_util_mwh * degradation_factor
     soc_min = proj.soc_min / 100.0 * proj.energia_mwh * degradation_factor
     soc_max = proj.soc_max / 100.0 * proj.energia_mwh * degradation_factor
     potencia_max = min(proj.potencia_mw, proj.c_rate_max * max(proj.energia_mwh, 0.1))
- 
+
     soc = np.zeros(n_hours, dtype=float)
     charged = np.zeros(n_hours, dtype=float)
     discharged = np.zeros(n_hours, dtype=float)
@@ -803,7 +1029,7 @@ def simulate_year(
     charge_cost = np.zeros(n_hours, dtype=float)
     opex_var = np.zeros(n_hours, dtype=float)
     actions: List[str] = ["idle"] * n_hours
- 
+
     # ── CAMINHO OTIMIZADO (LP) ─────────────────────────────────────────────────
     # Se vetores pré-computados forem fornecidos, usa-os diretamente e rastreia o SOC.
     if charge is not None and discharge is not None:
@@ -835,20 +1061,20 @@ def simulate_year(
         discharged_today = 0.0
         last_day = -1
         spectral_peak = _get_spectral_peak_hour()
- 
+
         for hour in range(n_hours):
             hod = hour % 24
             day = hour // 24
             price = float(pld_hourly[hour])
             load = float(load_hourly[hour])
- 
+
             if day != last_day:
                 discharged_today = 0.0
                 last_day = day
- 
+
             daily_headroom = max(daily_discharge_budget - discharged_today, 0.0)
             action = "idle"
- 
+
             if proj.modo == "arbitragem":
                 can_charge = proj.carga_inicio <= hod <= proj.carga_fim
                 can_discharge = proj.descarga_inicio <= hod <= proj.descarga_fim
@@ -916,18 +1142,18 @@ def simulate_year(
                     discharged_today += excess_mw
                     cost_avoided[hour] = excess_mw * tariff_hourly[hour]
                     action = "shave"
- 
+
             current_soc = float(np.clip(current_soc, soc_min, soc_max))
             soc[hour] = current_soc
             opex_var[hour] = (charged[hour] + discharged[hour]) * proj.opex_variavel
             actions[hour] = action
- 
+
     start_ts = pd.to_datetime(proj.data_inicio, errors="coerce")
     if pd.isna(start_ts):
         start_ts = pd.Timestamp(datetime.now().date())
     timestamp = pd.date_range(start=start_ts, periods=n_hours, freq="h")
     net_margin = revenue + cost_avoided - charge_cost - opex_var
- 
+
     df = pd.DataFrame(
         {
             "timestamp": timestamp,
@@ -946,12 +1172,12 @@ def simulate_year(
             "action": actions,
         }
     )
- 
+
     total_revenue = float(revenue.sum() + cost_avoided.sum())
     total_cost = float(charge_cost.sum() + opex_var.sum())
     hours_active = int((charged > 0).sum() + (discharged > 0).sum())
     cycles_equiv = float(discharged.sum() / max(energia_util, 0.1))
- 
+
     summary = {
         "year": year,
         "energia_descarregada_mwh": round(float(discharged.sum()), 1),
@@ -966,22 +1192,22 @@ def simulate_year(
         "utilizacao_media_soc_pct": round(float(df["soc_mwh"].mean() / max(soc_max, 0.1) * 100.0), 1),
     }
     return df, summary
- 
- 
+
+
 def run_monte_carlo(proj: BESSProject, n_sims: Optional[int] = None) -> Dict[str, Any]:
     """Run the full Monte Carlo merchant simulation."""
- 
+
     n = int(n_sims or proj.n_simulacoes)
     rng = np.random.default_rng(proj.seed)
     tariff = get_tariff_path(proj)
     results: List[Dict[str, float]] = []
- 
+
     for _ in range(n):
         pld = get_pld_path(proj, rng)
         load = get_load_path(proj, rng)
         _, summary = simulate_year(proj, pld, load, year=1, tariff_hourly=tariff)
         results.append(summary)
- 
+
     df = pd.DataFrame(results)
     receita = df["receita_liquida_rs"] if "receita_liquida_rs" in df else pd.Series(dtype=float)
     return {
@@ -995,17 +1221,17 @@ def run_monte_carlo(proj: BESSProject, n_sims: Optional[int] = None) -> Dict[str
         "ciclos_medio": round(float(df["ciclos_equivalentes"].mean()), 1) if not df.empty else 0.0,
         "resultados": df,
     }
- 
- 
+
+
 def _irr(cashflows: List[float]) -> Optional[float]:
     try:
         import numpy_financial as npf
- 
+
         value = npf.irr(cashflows)
         return round(float(value) * 100.0, 2) if np.isfinite(value) else None
     except Exception:
         pass
- 
+
     cfs = np.array(cashflows, dtype=float)
     periods = np.arange(len(cfs), dtype=float)
     rate = 0.10
@@ -1021,23 +1247,23 @@ def _irr(cashflows: List[float]) -> Optional[float]:
             break
         rate = float(np.clip(new_rate, -0.99, 100.0))
     return round(rate * 100.0, 2) if -0.99 < rate < 100.0 else None
- 
- 
+
+
 def _npv(rate: float, cashflows: List[float]) -> float:
     return float(sum(cf / (1.0 + rate) ** idx for idx, cf in enumerate(cashflows)))
- 
- 
+
+
 def _project_life_years(proj: BESSProject) -> int:
     return max(1, min(int(proj.horizonte_anos), int(proj.vida_util)))
- 
- 
+
+
 def _build_operating_case(
     proj: BESSProject,
     receita_ano1: float,
     finance: FinanceInputs,
 ) -> pd.DataFrame:
     """Build an annual operating case used by the finance dashboard."""
- 
+
     life_years = _project_life_years(proj)
     inflation = proj.inflacao / 100.0
     opex_base = proj.opex_anual
@@ -1045,7 +1271,7 @@ def _build_operating_case(
     pack_capex = proj.capex_bess_kwh * proj.energia_mwh * 1000.0
     augmentation_year = max(4, min(life_years, int(np.ceil(proj.vida_util * 0.5))))
     augmentation_cost = pack_capex * finance.augmentation_factor_pct / 100.0 if life_years >= 8 else 0.0
- 
+
     rows: List[Dict[str, float]] = []
     for year in range(1, life_years + 1):
         degradation_factor = (1.0 - proj.degradacao_anual / 100.0) ** (year - 1)
@@ -1066,17 +1292,17 @@ def _build_operating_case(
                 "degradation_pct": (1.0 - degradation_factor) * 100.0,
             }
         )
- 
+
     return pd.DataFrame(rows)
- 
- 
+
+
 def _build_financing_schedule(
     operating_df: pd.DataFrame,
     capex_total: float,
     finance: FinanceInputs,
 ) -> Tuple[pd.DataFrame, Dict[str, Optional[float]]]:
     """Build an indicative sculpted debt schedule and lender metrics."""
- 
+
     df = operating_df.copy()
     debt_rate = finance.debt_cost_pct / 100.0
     tenor = max(1, min(finance.debt_tenor_years, len(df)))
@@ -1084,32 +1310,32 @@ def _build_financing_schedule(
     target_dscr = max(finance.target_dscr, 1.01)
     service_years = list(range(grace + 1, tenor + 1))
     cfads_service = df.loc[df["year"].isin(service_years), "cfads_rs"].astype(float).to_numpy()
- 
+
     raw_capacity = 0.0
     for idx, cfads in enumerate(cfads_service, start=1):
         scheduled_service = max(cfads / target_dscr, 0.0)
         raw_capacity += scheduled_service / ((1.0 + debt_rate) ** idx)
- 
+
     debt_cap_limit = capex_total * finance.gearing_max_pct / 100.0
     debt_amount = min(raw_capacity, debt_cap_limit)
     equity_amount = max(capex_total - debt_amount, 0.0)
- 
+
     service_profile = np.array([max(cfads / target_dscr, 0.0) for cfads in cfads_service], dtype=float)
     if raw_capacity > 0:
         service_profile *= debt_amount / raw_capacity
- 
+
     df["interest_rs"] = 0.0
     df["principal_rs"] = 0.0
     df["debt_service_rs"] = 0.0
     df["outstanding_open_rs"] = 0.0
     df["outstanding_close_rs"] = 0.0
- 
+
     outstanding = debt_amount
     for year in range(1, tenor + 1):
         row_idx = df.index[df["year"] == year][0]
         df.at[row_idx, "outstanding_open_rs"] = outstanding
         interest = outstanding * debt_rate
- 
+
         if year <= grace:
             principal = 0.0
             debt_service = interest
@@ -1122,16 +1348,16 @@ def _build_financing_schedule(
             if year == tenor and outstanding - principal > 1e-9:
                 principal = outstanding
                 debt_service = interest + principal
- 
+
         outstanding = max(outstanding - principal, 0.0)
         df.at[row_idx, "interest_rs"] = interest
         df.at[row_idx, "principal_rs"] = principal
         df.at[row_idx, "debt_service_rs"] = debt_service
         df.at[row_idx, "outstanding_close_rs"] = outstanding
- 
+
     df["mmra_required_rs"] = df["debt_service_rs"] * finance.mmra_months / 12.0
     df["dscr"] = np.where(df["debt_service_rs"] > 0, df["cfads_rs"] / df["debt_service_rs"], np.nan)
- 
+
     initial_mmra = (
         float(df.loc[df["debt_service_rs"] > 0, "mmra_required_rs"].iloc[0])
         if (df["debt_service_rs"] > 0).any()
@@ -1142,23 +1368,23 @@ def _build_financing_schedule(
         if (df["debt_service_rs"] > 0).any()
         else None
     )
- 
+
     df["equity_cashflow_rs"] = df["project_fcf_rs"] - df["debt_service_rs"]
     if mmra_release_year is not None:
         release_idx = df.index[df["year"] == mmra_release_year][0]
         df.at[release_idx, "equity_cashflow_rs"] += initial_mmra
- 
+
     active = df.loc[df["debt_service_rs"] > 0].copy()
     min_dscr = float(active["dscr"].min()) if not active.empty else None
     avg_dscr = float(active["dscr"].mean()) if not active.empty else None
- 
+
     llcr = None
     if debt_amount > 0 and not active.empty:
         pv_cfads = 0.0
         for idx, cfads in enumerate(active["cfads_rs"].tolist(), start=1):
             pv_cfads += cfads / ((1.0 + debt_rate) ** idx)
         llcr = pv_cfads / debt_amount if debt_amount > 0 else None
- 
+
     financing_summary = {
         "debt_amount_rs": round(float(debt_amount), 2),
         "equity_amount_rs": round(float(equity_amount), 2),
@@ -1174,8 +1400,8 @@ def _build_financing_schedule(
         "mmra_months": finance.mmra_months,
     }
     return df, financing_summary
- 
- 
+
+
 def _scenario_financials(
     proj: BESSProject,
     receita_ano1: float,
@@ -1183,24 +1409,24 @@ def _scenario_financials(
 ) -> Tuple[Dict[str, Any], pd.DataFrame]:
     operating_df = _build_operating_case(proj, receita_ano1, finance)
     annual_df, financing_summary = _build_financing_schedule(operating_df, proj.capex_total, finance)
- 
+
     project_cashflows = [-proj.capex_total] + annual_df["project_fcf_rs"].tolist()
     equity_outflow = financing_summary["equity_amount_rs"] + financing_summary["initial_mmra_rs"]
     equity_cashflows = [-equity_outflow] + annual_df["equity_cashflow_rs"].tolist()
- 
+
     discount_rate = proj.taxa_desconto / 100.0
     project_irr = _irr(project_cashflows)
     equity_irr = _irr(equity_cashflows)
     project_npv = round(_npv(discount_rate, project_cashflows), 2)
     equity_npv = round(_npv(discount_rate, equity_cashflows), 2)
- 
+
     cumulative = -proj.capex_total
     payback_year = None
     for year, cf in zip(annual_df["year"].tolist(), annual_df["project_fcf_rs"].tolist()):
         cumulative += cf / ((1.0 + discount_rate) ** year)
         if payback_year is None and cumulative >= 0:
             payback_year = int(year)
- 
+
     scenario = {
         "receita_ano1": round(float(receita_ano1), 2),
         "capex_total": round(float(proj.capex_total), 2),
@@ -1223,25 +1449,25 @@ def _scenario_financials(
         "financing_summary": financing_summary,
     }
     return scenario, annual_df
- 
- 
+
+
 def compute_financials(
     proj: BESSProject,
     mc_result: Dict[str, Any],
     finance_inputs: Optional[FinanceInputs] = None,
 ) -> Dict[str, Any]:
     """Compute project-finance style metrics for BESS scenarios."""
- 
+
     finance = finance_inputs or FinanceInputs()
     labels = [("pessimista", "receita_p10"), ("base", "receita_p50"), ("otimista", "receita_p90")]
- 
+
     scenarios: Dict[str, Dict[str, Any]] = {}
     annual_tables: Dict[str, pd.DataFrame] = {}
     for label, revenue_key in labels:
         scenario, annual_df = _scenario_financials(proj, float(mc_result.get(revenue_key, 0.0)), finance)
         scenarios[label] = scenario
         annual_tables[label] = annual_df
- 
+
     project_irrs: List[float] = []
     equity_irrs: List[float] = []
     min_dscrs: List[float] = []
@@ -1254,16 +1480,16 @@ def compute_financials(
                 equity_irrs.append(float(scenario["equity_irr_pct"]))
             if scenario["min_dscr"] is not None:
                 min_dscrs.append(float(scenario["min_dscr"]))
- 
+
     project_arr = np.array(project_irrs, dtype=float) if project_irrs else np.array([], dtype=float)
     equity_arr = np.array(equity_irrs, dtype=float) if equity_irrs else np.array([], dtype=float)
     dscr_arr = np.array(min_dscrs, dtype=float) if min_dscrs else np.array([], dtype=float)
- 
+
     def _quantile(arr: np.ndarray, q: float) -> Optional[float]:
         if arr.size == 0:
             return None
         return round(float(np.percentile(arr, q)), 2)
- 
+
     distribution = {
         "project_irr_p10": _quantile(project_arr, 10),
         "project_irr_p50": _quantile(project_arr, 50),
@@ -1282,7 +1508,7 @@ def compute_financials(
         if dscr_arr.size
         else None,
     }
- 
+
     base_financing = scenarios["base"]["financing_summary"]
     scenario_rows = []
     for label in ["pessimista", "base", "otimista"]:
@@ -1301,7 +1527,7 @@ def compute_financials(
                 "debt_amount_rs": s["debt_amount_rs"],
             }
         )
- 
+
     return {
         "scenarios": scenarios,
         "distribution": distribution,
@@ -1320,8 +1546,8 @@ def compute_financials(
         "opex_anual": round(float(proj.opex_anual), 2),
         "economia_anual_base": round(float(mc_result.get("receita_p50", 0.0)), 2),
     }
- 
- 
+
+
 def _serialize_df(df: pd.DataFrame, max_rows: Optional[int] = None) -> List[Dict[str, Any]]:
     out = df.copy()
     if max_rows is not None:
@@ -1329,12 +1555,14 @@ def _serialize_df(df: pd.DataFrame, max_rows: Optional[int] = None) -> List[Dict
     if "timestamp" in out.columns:
         out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce").astype(str)
     return out.to_dict(orient="records")
- 
- 
+
+
 def _serialize_result(result: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "project": result["project"],
         "validation": result["validation"],
+        "dispatch_mode": result.get("dispatch_mode", "heuristico"),
+        "pld_submercado_referencia": result.get("pld_submercado_referencia", ""),
         "deterministic": {
             "summary": result["deterministic"]["summary"],
             "hourly_preview": _serialize_df(result["deterministic"]["hourly"], max_rows=336),
@@ -1348,41 +1576,47 @@ def _serialize_result(result: Dict[str, Any]) -> Dict[str, Any]:
             "scenario_table": _serialize_df(result["financials"]["scenario_table"]),
             "annual_base_case": _serialize_df(result["financials"]["annual_base_case"]),
         },
+        "next_day_guidance": {
+            k: v for k, v in result.get("next_day_guidance", {}).items()
+            if k != "plano_horario"  # omit large list from preview; available via CSV download
+        },
+        "next_day_plan": result.get("next_day_guidance", {}).get("plano_horario", []),
+        "irr_optimization": result.get("irr_optimization", {}),
         "timestamp": result["timestamp"],
     }
- 
- 
+
+
 def run_bess_simulation(
     file_path: str,
     n_sims: Optional[int] = None,
     finance_overrides: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """End-to-end BESS pipeline."""
- 
+
     print(f"\n{'=' * 68}")
     print("  Kintuadi Energy · BESS Simulation Engine")
     print(f"{'=' * 68}")
- 
+
     proj = parse_excel(file_path)
     issues = validate_project(proj)
- 
+
     print("\n[1/5] Projeto")
     print(f"  {proj.project_id} | {proj.potencia_mw:.1f} MW / {proj.energia_mwh:.1f} MWh")
     print(f"  Modo: {proj.modo} | Submercado: {proj.submercado}")
     print(f"  CAPEX: R${proj.capex_total:,.0f} | OPEX: R${proj.opex_anual:,.0f}/ano")
- 
+
     print("\n[2/5] Validacao")
     if issues:
         for issue in issues:
             print(f"  - {issue}")
     else:
         print("  Sem avisos criticos.")
- 
+
     print("\n[3/5] Simulacao deterministica")
     pld = get_pld_path(proj)
     load = get_load_path(proj)
     tariff = get_tariff_path(proj)
- 
+
     # Despacho ótimo via LP (se habilitado) ou heurístico (fallback)
     ref_sub = proj.pld_submercado if proj.pld_submercado else proj.submercado
     if proj.usar_otimizacao_lp:
@@ -1401,18 +1635,18 @@ def run_bess_simulation(
     else:
         det_hourly, det_summary = simulate_year(proj, pld, load, year=1, tariff_hourly=tariff)
         det_summary["dispatch_mode"] = "heuristico"
- 
+
     print(f"  Receita liquida ano 1: R${det_summary['receita_liquida_rs']:,.0f}")
     print(f"  Energia descarregada: {det_summary['energia_descarregada_mwh']:,.1f} MWh")
     print(f"  Modo despacho: {det_summary['dispatch_mode']}")
- 
+
     n = int(n_sims or proj.n_simulacoes)
     print(f"\n[4/5] Monte Carlo ({n} simulacoes)")
     mc = run_monte_carlo(proj, n)
     print(f"  Receita P10: R${mc['receita_p10']:,.0f}")
     print(f"  Receita P50: R${mc['receita_p50']:,.0f}")
     print(f"  Receita P90: R${mc['receita_p90']:,.0f}")
- 
+
     print("\n[5/5] Finance")
     finance_inputs = FinanceInputs(**(finance_overrides or {}))
     financials = compute_financials(proj, mc, finance_inputs)
@@ -1421,7 +1655,7 @@ def run_bess_simulation(
     print(f"  Equity NPV base: R${base['equity_npv_rs']:,.0f}")
     print(f"  Min DSCR base: {base['min_dscr']}")
     print(f"  LLCR base: {base['llcr']}")
- 
+
     # Guia de operação para o dia seguinte (baseado no PLD publicado hoje)
     print("\n[+] Guia de operação — dia seguinte")
     try:
@@ -1430,20 +1664,26 @@ def run_bess_simulation(
     except Exception as exc:
         logger.warning("next_day_guidance falhou: %s", exc)
         next_day = {"erro": str(exc)}
- 
+
     # Otimização de TIR (se LP habilitado)
     irr_opt: Dict[str, Any] = {}
     if proj.usar_otimizacao_lp:
-        print("\n[+] Otimizacao de TIR por fator de utilizacao")
+        print("\n[+] Projecao de TIR — 3 cenarios D+1")
         try:
-            irr_opt = optimize_for_irr(proj, pld, load)
-            print(f"  Melhor utilizacao: {irr_opt['optimal_utilizacao']:.0%} | TIR equity: {irr_opt['optimal_irr_pct']}%")
+            irr_opt = optimize_for_irr(
+                proj, pld, load,
+                next_day_guidance=next_day,
+                finance_overrides=finance_overrides,
+            )
+            base_irr = irr_opt.get("optimal_irr_pct")
+            irr_str = f"{base_irr:.2f}%" if base_irr is not None else "N/D"
+            print(f"  Fonte: {irr_opt.get('fonte_referencia')} | TIR equity base: {irr_str}")
         except Exception as exc:
             logger.warning("optimize_for_irr falhou: %s", exc)
             irr_opt = {"erro": str(exc)}
- 
+
     print(f"\n{'=' * 68}\n")
- 
+
     return {
         "project": {k: v for k, v in proj.__dict__.items() if k != "load_profile"},
         "validation": issues,
@@ -1459,8 +1699,8 @@ def run_bess_simulation(
         "pld_submercado_referencia": proj.pld_submercado if proj.pld_submercado else proj.submercado,
         "timestamp": datetime.now().isoformat(),
     }
- 
- 
+
+
 def _chart_layout(title: str, height: int = 360) -> Dict[str, Any]:
     return {
         "title": title,
@@ -1471,11 +1711,11 @@ def _chart_layout(title: str, height: int = 360) -> Dict[str, Any]:
         "height": height,
         "margin": {"l": 30, "r": 20, "t": 60, "b": 30},
     }
- 
- 
+
+
 def _plot_scenario_bars(financials: Dict[str, Any]):
     import plotly.graph_objects as go
- 
+
     df = financials["scenario_table"].copy()
     fig = go.Figure()
     fig.add_bar(
@@ -1489,11 +1729,11 @@ def _plot_scenario_bars(financials: Dict[str, Any]):
     fig.update_layout(**_chart_layout("Cenários de retorno", 330))
     fig.update_yaxes(title="TIR do equity (%)", gridcolor=GRID)
     return fig
- 
- 
+
+
 def _plot_capital_stack(financials: Dict[str, Any]):
     import plotly.graph_objects as go
- 
+
     financing = financials["financing"]
     labels = ["Dívida", "Equity do patrocinador", "MMRA inicial"]
     values = [
@@ -1514,11 +1754,11 @@ def _plot_capital_stack(financials: Dict[str, Any]):
     )
     fig.update_layout(**_chart_layout("Estrutura de capital", 330))
     return fig
- 
- 
+
+
 def _plot_dscr(financials: Dict[str, Any]):
     import plotly.graph_objects as go
- 
+
     annual = financials["annual_base_case"].copy()
     target = financials["financing"]["target_dscr"]
     fig = go.Figure()
@@ -1536,11 +1776,11 @@ def _plot_dscr(financials: Dict[str, Any]):
     fig.update_yaxes(title="x", gridcolor=GRID)
     fig.update_xaxes(title="Ano")
     return fig
- 
- 
+
+
 def _plot_cashflow_bridge(financials: Dict[str, Any]):
     import plotly.graph_objects as go
- 
+
     annual = financials["annual_base_case"].copy()
     fig = go.Figure()
     fig.add_bar(x=annual["year"], y=annual["cfads_rs"], name="CFADS", marker_color=GREEN)
@@ -1563,11 +1803,11 @@ def _plot_cashflow_bridge(financials: Dict[str, Any]):
     fig.update_yaxes(title="R$")
     fig.update_xaxes(title="Ano")
     return fig
- 
- 
+
+
 def _plot_degradation(financials: Dict[str, Any]):
     import plotly.graph_objects as go
- 
+
     annual = financials["annual_base_case"].copy()
     fig = go.Figure()
     fig.add_trace(
@@ -1595,12 +1835,12 @@ def _plot_degradation(financials: Dict[str, Any]):
         bargap=0.30,
     )
     return fig
- 
- 
+
+
 def _plot_hourly_operations(det_hourly: pd.DataFrame, hours_to_show: int):
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
- 
+
     df = det_hourly.head(hours_to_show).copy()
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     fig.add_trace(
@@ -1645,11 +1885,11 @@ def _plot_hourly_operations(det_hourly: pd.DataFrame, hours_to_show: int):
     fig.update_yaxes(title_text="PLD (R$/MWh)", secondary_y=False, gridcolor=GRID)
     fig.update_yaxes(title_text="SOC / MWh", secondary_y=True)
     return fig
- 
- 
+
+
 def _plot_distribution(financials: Dict[str, Any]):
     import plotly.graph_objects as go
- 
+
     values = financials["samples"]["equity_irr_pct"]
     fig = go.Figure()
     fig.add_trace(
@@ -1665,18 +1905,18 @@ def _plot_distribution(financials: Dict[str, Any]):
     fig.update_xaxes(title="TIR do equity (%)")
     fig.update_yaxes(title="Frequência", gridcolor=GRID)
     return fig
- 
- 
+
+
 def _render_intro(st, template_path: Path):
     st.markdown("## Dashboard Financeiro para Projetos BESS")
     st.caption("Análises merchant e behind-the-meter com visão de bancabilidade e retorno.")
- 
+
     hero_col, kpi_col = st.columns([1.6, 1.0])
     with hero_col:
         st.markdown(
             """
             O armazenamento em baterias é uma das teses mais relevantes em energia e infraestrutura no momento.
- 
+
             Este módulo amplia a plataforma de um simulador operacional para uma leitura mais próxima de
             project finance: lógica de operação, bandas de receita via Monte Carlo, dimensionamento de
             dívida, DSCR, LLCR, estrutura de capital e tabelas exportáveis.
@@ -1685,7 +1925,7 @@ def _render_intro(st, template_path: Path):
         st.markdown(
             """
             **O que esta versão já entrega**
- 
+
             - Simula o despacho horário do BESS para arbitragem, peak shaving e modo híbrido.
             - Constrói faixas de receita merchant com Monte Carlo.
             - Converte o caso operacional em uma visão anual de fluxo de caixa com lógica de credor.
@@ -1709,7 +1949,7 @@ def _render_intro(st, template_path: Path):
             """,
             unsafe_allow_html=True,
         )
- 
+
     if template_path.exists():
         st.download_button(
             "Baixar template BESS",
@@ -1718,55 +1958,72 @@ def _render_intro(st, template_path: Path):
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="bess_template_download",
         )
- 
- 
+
+
 def render_bess_tab():
     """Render the BESS tab inside the premium Streamlit app."""
-    
+
     import plotly.graph_objects as go
     import streamlit as st
-    from datetime import datetime, timedelta
-    
-    template_path = Path(__file__).with_name("bess_project_input_template_v1.xlsx")
+
+    # Aceita v2 (com LP e submercado PLD) e v1 como fallback
+    _base = Path(__file__).parent
+    template_path = next(
+        (p for p in [
+            _base / "bess_project_input_template_v2.xlsx",
+            _base / "bess_project_input_template_v1.xlsx",
+        ] if p.exists()),
+        _base / "bess_project_input_template_v2.xlsx",
+    )
     _render_intro(st, template_path)
-    
-    uploaded = st.file_uploader("Carregar template de entrada BESS", type=["xlsx"], key="bess_upload")
-    
+
+    uploaded = st.file_uploader(
+        "Carregar template de entrada BESS (v1 ou v2)",
+        type=["xlsx"],
+        key="bess_upload",
+        help="Use o template v2 para habilitar despacho LP e seleção de submercado PLD.",
+    )
+
     upload_sig = None if uploaded is None else f"{uploaded.name}:{uploaded.size}"
     if st.session_state.get("bess_upload_sig") != upload_sig:
         st.session_state["bess_upload_sig"] = upload_sig
         st.session_state.pop("bess_result", None)
         st.session_state.pop("bess_project_preview", None)
-    
+
     if uploaded is None:
-        st.info("Carregue o arquivo `bess_project_input_template_v1.xlsx` para montar o dashboard da simulação.")
+        st.info("Carregue o template BESS (v2 recomendado) para montar o dashboard da simulação.")
         return
-    
+
     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
         tmp.write(uploaded.getvalue())
         tmp_path = tmp.name
-    
+
     try:
         proj = parse_excel(tmp_path)
         issues = validate_project(proj)
         st.session_state["bess_project_preview"] = proj
-        
+
         k1, k2, k3, k4, k5 = st.columns(5)
         k1.metric("Potência", f"{proj.potencia_mw:.1f} MW")
         k2.metric("Energia", f"{proj.energia_mwh:.1f} MWh")
         k3.metric("Duração", f"{proj.duracao_h:.1f} h")
         k4.metric("CAPEX", _fmt_currency(proj.capex_total, scale=1e6, suffix=" MM"))
         k5.metric("Estratégia", proj.modo.title())
-        
-        # Exibir submercado de referência do PLD
-        ref_sub = proj.pld_submercado if proj.pld_submercado else proj.submercado
-        st.caption(f"Submercado de referência para PLD: **{ref_sub}**")
-        
+
+        # Linha de configuração: submercado PLD e modo de despacho
+        _ref_sub_disp = proj.pld_submercado if proj.pld_submercado else proj.submercado
+        _lp_badge = "✅ LP ativo" if proj.usar_otimizacao_lp else "⚙️ Heurístico"
+        st.caption(
+            f"**Submercado PLD de referência:** {_ref_sub_disp} &nbsp;·&nbsp; "
+            f"**Despacho:** {_lp_badge} &nbsp;·&nbsp; "
+            f"**Submercado do projeto:** {proj.submercado}"
+        )
+
         if issues:
             with st.expander("Notas de validação do projeto", expanded=False):
                 for issue in issues:
                     st.warning(issue)
-        
+
         ctrl1, ctrl2 = st.columns([1.0, 1.3])
         with ctrl1:
             n_sims = st.slider(
@@ -1783,7 +2040,7 @@ def render_bess_tab():
                 value=168,
                 key="bess_hour_window",
             )
-        
+
         with ctrl2:
             with st.expander("Premissas de financiamento", expanded=True):
                 fc1, fc2, fc3 = st.columns(3)
@@ -1804,7 +2061,7 @@ def render_bess_tab():
                     5,
                     key="bess_augmentation_factor",
                 )
-        
+
         finance_overrides = {
             "gearing_max_pct": float(gearing),
             "debt_cost_pct": float(debt_cost),
@@ -1814,8 +2071,7 @@ def render_bess_tab():
             "mmra_months": int(mmra),
             "augmentation_factor_pct": float(augmentation_factor),
         }
-        
-        # Botão principal da simulação
+
         if st.button("Rodar simulação BESS", key="bess_run"):
             with st.spinner(f"Executando {n_sims} simulações e montando o dashboard financeiro..."):
                 st.session_state["bess_result"] = run_bess_simulation(
@@ -1823,12 +2079,12 @@ def render_bess_tab():
                     n_sims=n_sims,
                     finance_overrides=finance_overrides,
                 )
-        
+
         result = st.session_state.get("bess_result")
         if not result:
             st.info("Ajuste as premissas acima e clique em `Rodar simulação BESS` para gerar o dashboard.")
             return
-        
+
         financials = result["financials"]
         base = financials["scenarios"]["base"]
         financing = financials["financing"]
@@ -1836,152 +2092,13 @@ def render_bess_tab():
         det_summary = result["deterministic"]["summary"]
         det_hourly = result["deterministic"]["hourly"]
         annual_base = financials["annual_base_case"].copy()
-        
-        # =========================================================================
-        # NOVA SEÇÃO: Indicadores do modo de despacho e otimização
-        # =========================================================================
-        st.markdown("---")
-        st.markdown("### ⚙️ Configuração da Simulação")
-        
-        col_d1, col_d2, col_d3 = st.columns(3)
-        with col_d1:
-            dispatch_mode = result.get("dispatch_mode", "heuristico")
-            mode_labels = {
-                "lp_otimizado": "✅ Otimização Linear (LP)",
-                "heuristico": "⚙️ Heurístico",
-                "heuristico_fallback": "⚠️ Heurístico (fallback)"
-            }
-            st.metric(
-                "Modo de Despacho",
-                mode_labels.get(dispatch_mode, dispatch_mode),
-                help="LP otimizado maximiza receita via programação linear. Heurístico segue regras pré-definidas."
-            )
-        
-        with col_d2:
-            pld_ref = result.get("pld_submercado_referencia", proj.submercado)
-            st.metric("Submercado PLD", pld_ref, help="Submercado usado como referência para formação do PLD")
-        
-        with col_d3:
-            # Exibir se LP foi usado
-            if proj.usar_otimizacao_lp:
-                st.success("Otimização LP habilitada no template")
-            else:
-                st.info("Otimização LP desabilitada (usar_otimizacao_lp = FALSE)")
-        
-        # =========================================================================
-        # NOVA SEÇÃO: Guia de Operação para o Dia Seguinte
-        # =========================================================================
-        next_day = result.get("next_day_guidance", {})
-        if next_day and "erro" not in next_day:
-            st.markdown("---")
-            st.markdown("### 📅 Guia de Operação para o Dia Seguinte")
-            st.info(next_day.get("resumo_texto", ""))
-            
-            # Expandir para ver o plano horário
-            with st.expander("Ver plano horário detalhado", expanded=False):
-                plano = next_day.get("plano_horario", [])
-                if plano:
-                    plano_df = pd.DataFrame(plano)
-                    plano_df["hora_str"] = plano_df["hora"].apply(lambda x: f"{x:02d}:00")
-                    plano_df = plano_df[["hora_str", "acao", "carga_mw", "descarga_mw", "soc_mwh", "pld_rs_mwh", "receita_esperada_rs"]]
-                    plano_df.columns = ["Hora", "Ação", "Carga (MW)", "Descarga (MW)", "SOC (MWh)", "PLD (R$/MWh)", "Receita Esperada (R$)"]
-                    st.dataframe(plano_df, use_container_width=True)
-                    
-                    # Gráfico do guia
-                    fig_guide = go.Figure()
-                    fig_guide.add_trace(go.Bar(
-                        x=plano_df["Hora"],
-                        y=plano_df["Descarga (MW)"],
-                        name="Descarga",
-                        marker_color=GREEN,
-                    ))
-                    fig_guide.add_trace(go.Bar(
-                        x=plano_df["Hora"],
-                        y=-plano_df["Carga (MW)"],
-                        name="Carga",
-                        marker_color=RED,
-                    ))
-                    fig_guide.add_trace(go.Scatter(
-                        x=plano_df["Hora"],
-                        y=plano_df["PLD (R$/MWh)"],
-                        name="PLD",
-                        yaxis="y2",
-                        line=dict(color=ACCENT, width=2),
-                    ))
-                    fig_guide.update_layout(
-                        title="Recomendação de Operação para Amanhã",
-                        template="plotly_dark",
-                        paper_bgcolor=PLOT_BG,
-                        plot_bgcolor=CARD_BG,
-                        height=400,
-                        yaxis=dict(title="Potência (MW)", gridcolor=GRID),
-                        yaxis2=dict(title="PLD (R$/MWh)", overlaying="y", side="right"),
-                        barmode="relative",
-                    )
-                    st.plotly_chart(fig_guide, use_container_width=True, key="bess_next_day_chart")
-                    
-                    st.caption(
-                        f"📊 PLD publicado em {next_day.get('data_publicacao_pld', '—')} | "
-                        f"Operação prevista para {next_day.get('data_operacao', '—')} | "
-                        f"Receita esperada total: R${next_day.get('receita_total_esperada_rs', 0):,.2f}"
-                    )
-        
-        # =========================================================================
-        # NOVA SEÇÃO: Otimização de TIR por Fator de Utilização
-        # =========================================================================
+
+        # Novos campos do pipeline v2
+        next_day_guidance = result.get("next_day_guidance", {})
         irr_opt = result.get("irr_optimization", {})
-        if irr_opt and "erro" not in irr_opt:
-            st.markdown("---")
-            st.markdown("### 📈 Otimização de TIR por Fator de Utilização")
-            st.info(
-                f"**Melhor fator de utilização:** {irr_opt.get('optimal_utilizacao', 0)*100:.0f}%  \n"
-                f"**TIR do equity otimizada:** {irr_opt.get('optimal_irr_pct', 0)}%  \n"
-                f"**Potência ótima:** {irr_opt.get('optimal_potencia_mw', 0):.1f} MW  \n"
-                f"**Energia ótima:** {irr_opt.get('optimal_energia_mwh', 0):.1f} MWh"
-            )
-            
-            # Gráfico da curva de otimização
-            all_results = irr_opt.get("all_utilization_results", [])
-            if all_results:
-                opt_df = pd.DataFrame(all_results)
-                fig_opt = go.Figure()
-                fig_opt.add_trace(go.Scatter(
-                    x=opt_df["utilizacao"] * 100,
-                    y=opt_df["equity_irr_pct"],
-                    mode="lines+markers",
-                    line=dict(color=ACCENT, width=2),
-                    marker=dict(size=8),
-                    name="TIR do equity",
-                ))
-                # Marcar ponto ótimo
-                best_u = irr_opt.get("optimal_utilizacao", 0) * 100
-                best_irr = irr_opt.get("optimal_irr_pct", 0)
-                fig_opt.add_trace(go.Scatter(
-                    x=[best_u],
-                    y=[best_irr],
-                    mode="markers",
-                    marker=dict(size=12, color=GREEN, symbol="star"),
-                    name=f"Ótimo: {best_u:.0f}%",
-                ))
-                fig_opt.update_layout(
-                    title="TIR do equity × Fator de Utilização",
-                    template="plotly_dark",
-                    paper_bgcolor=PLOT_BG,
-                    plot_bgcolor=CARD_BG,
-                    height=350,
-                    xaxis=dict(title="Fator de Utilização (%)", gridcolor=GRID),
-                    yaxis=dict(title="TIR do equity (%)", gridcolor=GRID),
-                )
-                st.plotly_chart(fig_opt, use_container_width=True, key="bess_irr_optimization")
-                
-                st.caption(
-                    "O gráfico mostra como a TIR do equity varia com a redução da capacidade instalada. "
-                    "Em projetos com receita marginal limitada, reduzir o CAPEX pode aumentar o retorno."
-                )
-        
-        # =========================================================================
-        # Dashboard principal (existente)
-        # =========================================================================
+        dispatch_mode = result.get("dispatch_mode", "heuristico")
+        pld_ref_sub = result.get("pld_submercado_referencia", proj.submercado)
+
         st.markdown("---")
         m1, m2, m3, m4, m5, m6 = st.columns(6)
         m1.metric("TIR do equity (base)", _fmt_pct(base["equity_irr_pct"]))
@@ -1993,18 +2110,29 @@ def render_bess_tab():
             "Prob. de TIR positiva do equity",
             f"{dist['prob_positive_irr']}%" if dist["prob_positive_irr"] is not None else "-",
         )
-        
-        tab_overview, tab_bank, tab_ops, tab_export = st.tabs(
-            ["Tese de investimento", "Bancabilidade", "Operação", "Exportações"]
+
+        # Badge do modo de despacho
+        _mode_color = {"lp_otimizado": GREEN, "heuristico_fallback": ACCENT, "heuristico": BLUE}.get(dispatch_mode, BLUE)
+        st.markdown(
+            f"<span style='background:{_mode_color}22;border:1px solid {_mode_color};"
+            f"border-radius:6px;padding:3px 10px;font-size:12px;color:{_mode_color};font-weight:600'>"
+            f"Despacho: {dispatch_mode.replace('_',' ').title()}"
+            f"</span>&nbsp;&nbsp;"
+            f"<span style='color:#9ca3af;font-size:12px'>Submercado PLD de referência: <b>{pld_ref_sub}</b></span>",
+            unsafe_allow_html=True,
         )
-        
+
+        tab_overview, tab_bank, tab_ops, tab_next_day, tab_irr_opt, tab_export = st.tabs(
+            ["Tese de investimento", "Bancabilidade", "Operação", "🗓 Guia D+1", "📈 TIR Otimizada", "Exportações"]
+        )
+
         with tab_overview:
             o1, o2 = st.columns(2)
             with o1:
                 st.plotly_chart(_plot_scenario_bars(financials), use_container_width=True, key="bess_scenario_bars")
             with o2:
                 st.plotly_chart(_plot_capital_stack(financials), use_container_width=True, key="bess_capital_stack")
-            
+
             d1, d2 = st.columns(2)
             with d1:
                 st.plotly_chart(_plot_distribution(financials), use_container_width=True, key="bess_irr_hist")
@@ -2032,7 +2160,7 @@ def render_bess_tab():
                 fig.update_layout(**_chart_layout("Faixa de receita", 330))
                 fig.update_yaxes(title="R$", gridcolor=GRID)
                 st.plotly_chart(fig, use_container_width=True, key="bess_revenue_range")
-            
+
             st.markdown("### Resumo de cenários")
             scenario_table = financials["scenario_table"].copy()
             display = scenario_table.rename(
@@ -2050,14 +2178,14 @@ def render_bess_tab():
                 }
             )
             st.dataframe(display, use_container_width=True)
-        
+
         with tab_bank:
             b1, b2 = st.columns(2)
             with b1:
                 st.plotly_chart(_plot_dscr(financials), use_container_width=True, key="bess_dscr")
             with b2:
                 st.plotly_chart(_plot_cashflow_bridge(financials), use_container_width=True, key="bess_cash_bridge")
-            
+
             bank_metrics = pd.DataFrame(
                 [
                     {"Metric": "Valor da dívida", "Value": _fmt_currency(financing["debt_amount_rs"], scale=1e6, suffix=" MM")},
@@ -2093,7 +2221,7 @@ def render_bess_tab():
                 ],
                 use_container_width=True,
             )
-        
+
         with tab_ops:
             st.plotly_chart(
                 _plot_hourly_operations(det_hourly, hours_window),
@@ -2101,27 +2229,236 @@ def render_bess_tab():
                 key="bess_hourly_ops",
             )
             st.plotly_chart(_plot_degradation(financials), use_container_width=True, key="bess_degradation")
-            
+
             op1, op2, op3, op4 = st.columns(4)
             op1.metric("Receita líquida determinística", _fmt_currency(det_summary["receita_liquida_rs"], scale=1e6, suffix=" MM"))
             op2.metric("Energia descarregada", f"{det_summary['energia_descarregada_mwh']:,.1f} MWh")
             op3.metric("Ciclos equivalentes", f"{det_summary['ciclos_equivalentes']:,.1f}")
             op4.metric("Fator de capacidade", f"{det_summary['fator_capacidade_pct']:,.1f}%")
-            
+
             st.markdown(
                 """
                 **Escopo atual do modelo**
-                
+
                 Este dashboard já converte os resultados operacionais em uma visão financeira com degradação,
-                reserva para augmentation, MMRA, sizing de dívida e retorno do equity. 
-                
-                **Novidades nesta versão:**
-                - **Otimização Linear (LP):** despacho ótimo que maximiza a receita de arbitragem
-                - **Guia de Operação para o Dia Seguinte:** plano horário baseado no PLD publicado
-                - **Otimização de TIR:** identifica o fator de utilização ideal para maximizar retorno do equity
+                reserva para augmentation, MMRA, sizing de dívida e retorno do equity. Como próximos saltos,
+                vale considerar uma camada explícita de receita contratada via CTA e uma lógica de carregamento
+                associada a curtailment renovável, para aproximar o módulo de uma modelagem completa de project finance.
                 """
             )
-        
+
+        # ── Tab: Guia de Operação D+1 ──────────────────────────────────────────
+        with tab_next_day:
+            if next_day_guidance and "erro" not in next_day_guidance:
+                nd = next_day_guidance
+                st.markdown(f"### Plano de operação — {nd.get('data_operacao', 'N/D')}")
+                st.caption(
+                    f"PLD **oficial** do banco ({nd.get('fonte_pld', 'DuckDB/Neon')}) — puro, sem spread. "
+                    f"Publicado em **{nd.get('data_publicacao_pld', 'N/D')}** para operação do dia seguinte. "
+                    f"Submercado de referência: **{nd.get('submercado_referencia', pld_ref_sub)}**."
+                )
+
+                nd_c1, nd_c2, nd_c3, nd_c4 = st.columns(4)
+                nd_c1.metric("Resultado líquido do dia", _fmt_currency(nd.get("receita_liquida_dia_rs") or nd.get("receita_total_esperada_rs", 0)))
+                nd_c2.metric("Receita de arbitragem", _fmt_currency(nd.get("receita_arbitragem_rs", 0)))
+                nd_c3.metric("Liquidação de mercado", _fmt_currency(nd.get("liquidacao_mercado_rs", 0)))
+                nd_c4.metric("Encargos TUSD/ESS", _fmt_currency(-(nd.get("encargos_tusd_rs", 0))))
+
+                nd_e1, nd_e2 = st.columns(2)
+                nd_e1.metric("Energia carregada", f"{nd.get('energia_carregada_mwh', 0):.3f} MWh")
+                nd_e2.metric("Energia descarregada", f"{nd.get('energia_descarregada_mwh', 0):.3f} MWh")
+
+                plano = nd.get("plano_horario", [])
+                if plano:
+                    df_plan = pd.DataFrame(plano)
+
+                    # Gráfico despacho hora a hora
+                    _ACTION_COLOR = {"CARREGAR": RED, "DESCARREGAR": GREEN, "OCIOSO": "#374151"}
+                    fig_nd = go.Figure()
+                    for acao, color in _ACTION_COLOR.items():
+                        mask = df_plan["acao"] == acao
+                        if mask.any():
+                            y_val = df_plan.loc[mask, "descarga_mw"] - df_plan.loc[mask, "carga_mw"]
+                            fig_nd.add_bar(x=df_plan.loc[mask, "hora"], y=y_val, name=acao, marker_color=color)
+                    fig_nd.add_scatter(
+                        x=df_plan["hora"], y=df_plan["pld_rs_mwh"],
+                        name="PLD oficial (R$/MWh)", mode="lines+markers",
+                        line={"color": ACCENT, "width": 2.5}, yaxis="y2",
+                    )
+                    fig_nd.update_layout(
+                        **_chart_layout(f"Despacho ótimo D+1 — {nd.get('data_operacao', '')} | PLD oficial", 360),
+                        barmode="relative",
+                        yaxis={"title": "Potência (MW, + descarga / – carga)", "gridcolor": GRID},
+                        yaxis2={"overlaying": "y", "side": "right", "title": "PLD (R$/MWh)"},
+                    )
+                    st.plotly_chart(fig_nd, use_container_width=True, key="bess_next_day_chart")
+
+                    # SOC
+                    fig_soc = go.Figure()
+                    fig_soc.add_scatter(
+                        x=df_plan["hora"], y=df_plan["soc_mwh"],
+                        mode="lines+markers", name="SOC (MWh)",
+                        line={"color": BLUE, "width": 2.5},
+                    )
+                    fig_soc.update_layout(**_chart_layout("Estado de Carga (SOC) — D+1", 260))
+                    fig_soc.update_yaxes(title="MWh", gridcolor=GRID)
+                    st.plotly_chart(fig_soc, use_container_width=True, key="bess_soc_nextday")
+
+                    # Gráfico de receita hora a hora
+                    _receita_col = "receita_total_rs" if "receita_total_rs" in df_plan.columns else "receita_esperada_rs"
+                    if _receita_col in df_plan.columns:
+                        fig_rec = go.Figure()
+                        fig_rec.add_bar(
+                            x=df_plan["hora"],
+                            y=df_plan[_receita_col],
+                            marker_color=[GREEN if v >= 0 else RED for v in df_plan[_receita_col]],
+                            name="Receita líquida (R$)",
+                        )
+                        fig_rec.update_layout(**_chart_layout("Receita líquida por hora (R$)", 240))
+                        fig_rec.update_yaxes(title="R$", gridcolor=GRID)
+                        st.plotly_chart(fig_rec, use_container_width=True, key="bess_receita_hora_chart")
+
+                    with st.expander("Plano hora a hora (detalhado)"):
+                        rename_map = {
+                            "hora": "Hora", "acao": "Ação", "carga_mw": "Carga (MW)",
+                            "descarga_mw": "Descarga (MW)", "soc_mwh": "SOC (MWh)",
+                            "pld_rs_mwh": "PLD (R$/MWh)",
+                            "receita_arbitragem_rs": "Arbitragem (R$)",
+                            "liquidacao_mercado_rs": "Liquidação Mercado (R$)",
+                            "encargo_tusd_rs": "Encargo TUSD (R$)",
+                            "receita_total_rs": "Receita Total (R$)",
+                            "receita_esperada_rs": "Receita (R$)",
+                            "carga_rede_mw": "Carga Rede (MW)",
+                        }
+                        st.dataframe(
+                            df_plan.rename(columns={k: v for k, v in rename_map.items() if k in df_plan.columns}),
+                            use_container_width=True,
+                        )
+
+                    # Nota sobre liquidação de mercado
+                    if proj.carga_media_mw > 0 and proj.contrato_mw > 0:
+                        st.info(
+                            f"**Exposição à liquidação de mercado ativa.** "
+                            f"Carga média: {proj.carga_media_mw:.1f} MW | Contrato: {proj.contrato_mw:.1f} MW | "
+                            f"Flexibilidade: ±{proj.flexibilidade_mw:.1f} MW | "
+                            f"Encargo TUSD: R${proj.encargo_tusd_rs_mwh:.0f}/MWh.  \n"
+                            "O projeto compra energia acima do contrato no PLD baixo (carregar BESS) e "
+                            "injeta/reduz consumo no PLD alto (descarregar BESS), liquidando a diferença no CCEE."
+                        )
+                    else:
+                        st.caption(
+                            "💡 Configure 'Carga Média (MW)' e 'Contrato (MW)' na aba ALTERNATIVE do template "
+                            "para modelar a exposição à liquidação de mercado pelo PLD."
+                        )
+
+                st.info(nd.get("resumo_texto", ""))
+
+            elif next_day_guidance and "erro" in next_day_guidance:
+                st.warning(f"Guia D+1 não disponível: {next_day_guidance['erro']}")
+            else:
+                st.info("Rode a simulação para gerar o guia de operação do dia seguinte.")
+
+        # ── Tab: Projeção de TIR — 3 cenários D+1 ────────────────────────────
+        with tab_irr_opt:
+            if irr_opt and "erro" not in irr_opt and irr_opt.get("cenarios"):
+                cenarios = irr_opt["cenarios"]
+                fonte = irr_opt.get("fonte_referencia", "–")
+                rec_dia = irr_opt.get("receita_dia_referencia_rs", 0.0)
+
+                st.markdown("### Projeção de TIR — extrapolação do Guia D+1")
+                st.caption(
+                    f"**Fonte de referência:** {fonte}  ·  "
+                    f"**Receita líquida diária de referência:** {_fmt_currency(rec_dia)}  \n"
+                    "Cada cenário replica o resultado do Guia D+1 para todos os dias da vida do projeto, "
+                    "com degradação anual aplicada. **Pessimista:** 60% · **Base:** 100% · **Otimista:** 110%."
+                )
+
+                # KPIs dos 3 cenários lado a lado
+                sc_cols = st.columns(3)
+                _SC_COLORS = {"pessimista": RED, "base": ACCENT, "otimista": GREEN}
+                _SC_LABELS = {"pessimista": "⬇ Pessimista (×0,6)", "base": "◆ Base (×1,0)", "otimista": "⬆ Otimista (×1,1)"}
+                for col_ui, (nome, r) in zip(sc_cols, cenarios.items()):
+                    irr_v = r.get("equity_irr_pct")
+                    npv_v = r.get("equity_npv_rs")
+                    dscr_v = r.get("min_dscr")
+                    with col_ui:
+                        st.markdown(
+                            f"<div style='background:#111827;border:1px solid #1f2937;"
+                            f"border-top:3px solid {_SC_COLORS[nome]};border-radius:10px;"
+                            f"padding:14px 12px;'>"
+                            f"<div style='font-size:11px;color:#9ca3af;text-transform:uppercase;"
+                            f"letter-spacing:.06em'>{_SC_LABELS[nome]}</div>"
+                            f"<div style='font-size:22px;font-weight:700;color:{_SC_COLORS[nome]};margin-top:6px'>"
+                            f"{_fmt_pct(irr_v) if irr_v is not None else '—'}</div>"
+                            f"<div style='font-size:11px;color:#9ca3af;margin-top:4px'>TIR equity</div>"
+                            f"<div style='font-size:14px;color:#e5e7eb;margin-top:8px'>"
+                            f"VPL: {_fmt_currency(npv_v, scale=1e6, suffix=' MM') if npv_v else '—'}</div>"
+                            f"<div style='font-size:12px;color:#9ca3af'>"
+                            f"DSCR mín: {f'{dscr_v:.2f}x' if dscr_v else '—'}</div>"
+                            f"<div style='font-size:12px;color:#9ca3af'>"
+                            f"Receita/dia: {_fmt_currency(r.get('receita_dia_rs', 0))}</div>"
+                            f"</div>",
+                            unsafe_allow_html=True,
+                        )
+
+                st.markdown("---")
+
+                # Gráfico de barras TIR por cenário
+                nomes_label = [_SC_LABELS[n] for n in cenarios]
+                irrs = [cenarios[n].get("equity_irr_pct") for n in cenarios]
+                cores = [_SC_COLORS[n] for n in cenarios]
+
+                if any(v is not None for v in irrs):
+                    fig_irr = go.Figure()
+                    fig_irr.add_bar(
+                        x=nomes_label,
+                        y=[v if v is not None else 0 for v in irrs],
+                        marker_color=cores,
+                        text=[_fmt_pct(v) if v is not None else "N/D" for v in irrs],
+                        textposition="outside",
+                    )
+                    fig_irr.update_layout(**_chart_layout("TIR do equity — 3 cenários D+1", 340))
+                    fig_irr.update_yaxes(title="TIR do equity (%)", gridcolor=GRID)
+                    st.plotly_chart(fig_irr, use_container_width=True, key="bess_irr_cenarios_chart")
+
+                # Gráfico de VPL
+                npvs = [cenarios[n].get("equity_npv_rs") for n in cenarios]
+                if any(v is not None for v in npvs):
+                    fig_npv = go.Figure()
+                    fig_npv.add_bar(
+                        x=nomes_label,
+                        y=[v / 1e6 if v is not None else 0 for v in npvs],
+                        marker_color=cores,
+                        text=[_fmt_currency(v, scale=1e6, suffix=" MM") if v is not None else "N/D" for v in npvs],
+                        textposition="outside",
+                    )
+                    fig_npv.update_layout(**_chart_layout("VPL do equity (R$ MM) — 3 cenários D+1", 300))
+                    fig_npv.update_yaxes(title="VPL (R$ MM)", gridcolor=GRID)
+                    st.plotly_chart(fig_npv, use_container_width=True, key="bess_npv_cenarios_chart")
+
+                # Tabela consolidada
+                with st.expander("Tabela consolidada dos cenários"):
+                    rows_tbl = []
+                    for nome, r in cenarios.items():
+                        rows_tbl.append({
+                            "Cenário": _SC_LABELS[nome],
+                            "Fator": f"×{r['fator']:.1f}",
+                            "Receita/dia (R$)": _fmt_currency(r.get("receita_dia_rs")),
+                            "Receita Ano 1 (R$)": _fmt_currency(r.get("receita_ano1_rs"), scale=1e6, suffix=" MM"),
+                            "TIR Projeto (%)": _fmt_pct(r.get("project_irr_pct")),
+                            "TIR Equity (%)": _fmt_pct(r.get("equity_irr_pct")),
+                            "VPL Equity (R$ MM)": _fmt_currency(r.get("equity_npv_rs"), scale=1e6, suffix=" MM"),
+                            "DSCR Mín.": f"{r['min_dscr']:.2f}x" if r.get("min_dscr") else "—",
+                        })
+                    st.dataframe(pd.DataFrame(rows_tbl).set_index("Cenário"), use_container_width=True)
+
+            elif irr_opt and "erro" in irr_opt:
+                st.warning(f"Projeção de TIR não disponível: {irr_opt['erro']}")
+            elif not proj.usar_otimizacao_lp:
+                st.info("Habilite 'Usar Otimização LP' no template (aba STRATEGY) para ativar esta análise.")
+            else:
+                st.info("Rode a simulação para ver a projeção de TIR em 3 cenários.")
+
         with tab_export:
             export_payload = _serialize_result(result)
             st.download_button(
@@ -2152,21 +2489,28 @@ def render_bess_tab():
                 mime="text/csv",
                 key="bess_download_scenarios_csv",
             )
-            
-            # Download do guia do dia seguinte
-            if next_day and "erro" not in next_day:
-                next_day_df = pd.DataFrame(next_day.get("plano_horario", []))
-                if not next_day_df.empty:
-                    st.download_button(
-                        "Baixar guia do dia seguinte (CSV)",
-                        next_day_df.to_csv(index=False).encode("utf-8"),
-                        file_name=f"bess_next_day_guide_{proj.project_id}.csv",
-                        mime="text/csv",
-                        key="bess_download_next_day_csv",
-                    )
-            
+            # Plano D+1 (CSV)
+            _nd_plan = next_day_guidance.get("plano_horario", []) if next_day_guidance else []
+            if _nd_plan:
+                st.download_button(
+                    "Baixar plano D+1 (CSV)",
+                    pd.DataFrame(_nd_plan).to_csv(index=False).encode("utf-8"),
+                    file_name=f"bess_plano_d1_{proj.project_id}.csv",
+                    mime="text/csv",
+                    key="bess_download_nextday_csv",
+                )
+            # Otimização de TIR (CSV)
+            _irr_rows = irr_opt.get("all_utilization_results", []) if irr_opt else []
+            if _irr_rows:
+                st.download_button(
+                    "Baixar otimização TIR (CSV)",
+                    pd.DataFrame(_irr_rows).to_csv(index=False).encode("utf-8"),
+                    file_name=f"bess_irr_opt_{proj.project_id}.csv",
+                    mime="text/csv",
+                    key="bess_download_irr_opt_csv",
+                )
             st.dataframe(det_hourly.head(min(hours_window, 96)), use_container_width=True)
-    
+
     except Exception as exc:
         st.error(f"Erro ao processar o modelo BESS: {exc}")
     finally:
@@ -2174,17 +2518,17 @@ def render_bess_tab():
             os.unlink(tmp_path)
         except OSError:
             pass
- 
- 
+
+
 if __name__ == "__main__":
     import argparse
- 
+
     parser = argparse.ArgumentParser(description="Kintuadi Energy · BESS Simulation Engine")
     parser.add_argument("--file", required=True, help="Excel input template")
     parser.add_argument("--output", default=None, help="Optional JSON output file")
     parser.add_argument("--sims", type=int, default=None, help="Monte Carlo path count")
     args = parser.parse_args()
- 
+
     result = run_bess_simulation(args.file, args.sims)
     if args.output:
         with open(args.output, "w", encoding="utf-8") as fh:
