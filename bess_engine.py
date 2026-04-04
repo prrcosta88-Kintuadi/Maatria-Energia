@@ -342,30 +342,42 @@ def validate_project(proj: BESSProject) -> List[str]:
 
 
 def _submercado_key(submercado: str) -> str:
-    """Normalisa qualquer alias de submercado para a chave interna usada pelo engine.
+    """Normaliza qualquer alias de submercado para chave interna do engine.
 
-    Aliases aceitos (case-insensitive):
-    - SE/CO, SE, SECO, SUDESTE, SUDESTE/CENTRO-OESTE → "seco"   (coluna pld_se no app)
-    - Sul, S, SUL                                     → "s"      (coluna pld_s  no app)
-    - NE, Nordeste, NORDESTE                          → "ne"     (coluna pld_ne no app)
-    - N, Norte, NORTE                                 → "n"      (coluna pld_n  no app)
+    Espelha exatamente ``_normalize_submercado_name`` de core_analysis.py e o
+    mapeamento ``SUB_COL`` de app_premium.py.
 
-    Esta função é o ponto único de normalização entre os submercados do DuckDB/Neon
-    (que usam pld_se, pld_s, pld_ne, pld_n) e as chaves internas do motor de PLD.
+    Entradas aceitas (case-insensitive, ignora espaços e barras):
+        SE/CO, SE, SECO, SUDESTE, SUDESTECENTROOESTE → "seco"  (→ pld_se no app)
+        SUL, S                                        → "s"     (→ pld_s  no app)
+        NE, NORDESTE                                  → "ne"    (→ pld_ne no app)
+        N, NORTE                                      → "n"     (→ pld_n  no app)
+        "1"                                           → "seco"  (código CCEE)
+        "2"                                           → "s"
+        "3"                                           → "ne"
+        "4"                                           → "n"
     """
-    sub = str(submercado).strip().lower().replace(" ", "")
-    mapping = {
+    sub = str(submercado).strip().upper()
+    # Remove separadores (core_analysis faz .replace("/","").replace("-","").replace(" ",""))
+    sub_clean = sub.replace("/", "").replace("-", "").replace(" ", "")
+
+    mapping: Dict[str, str] = {
+        # Códigos numéricos CCEE
+        "1": "seco", "2": "s", "3": "ne", "4": "n",
         # SE/CO e variantes
-        "se/co": "seco", "se": "seco", "seco": "seco",
-        "sudeste": "seco", "sudeste/centro-oeste": "seco",
+        "SE":   "seco", "SECO": "seco",
+        "SECO": "seco",
+        "SUDESTECENTROOESTE": "seco",
+        "SUDESTE": "seco",
+        "SECO": "seco",
         # Sul
-        "sul": "s", "s": "s",
+        "SUL": "s", "S": "s",
         # Nordeste
-        "ne": "ne", "nordeste": "ne",
+        "NE": "ne", "NORDESTE": "ne",
         # Norte
-        "n": "n", "norte": "n",
+        "N": "n", "NORTE": "n",
     }
-    return mapping.get(sub, "seco")
+    return mapping.get(sub_clean, mapping.get(sub, "seco"))
 
 
 def _pld_col_from_submercado(submercado: str) -> str:
@@ -386,19 +398,36 @@ def get_pld_official_day(
     submercado: str,
     pld_fixo_fallback: float = 200.0,
 ) -> np.ndarray:
-    """Retorna o vetor de PLD oficial (24h) para ``target_date`` a partir do DuckDB/Neon.
+    """Retorna o vetor de PLD oficial (24h) para ``target_date`` do DuckDB/Neon.
 
-    Regras:
-    - O PLD é PURO, sem spread e sem sazonalidade artificial — exatamente como
-      publicado pelo CCEE para a data de operação.
-    - A data no banco É a data de operação: o PLD do dia D é registrado com data D
-      (mesmo que publicado em D-1). Basta filtrar pelo dia-alvo.
-    - Se o banco não tiver dados (ex.: data futura não publicada ainda), retorna
-      pld_fixo_fallback plano — o LP encontrará o ótimo de qualquer forma.
+    Schema da tabela ``pld_historical`` (definido em integrated_collector_v2.py):
+        data              TIMESTAMP   -- ex.: 2026-04-02 17:00:00
+        submercado        VARCHAR     -- ex.: 'SE', 'SE/CO', 'SUDESTE', 'SUL', 'NE', 'N'
+        pld               DOUBLE      -- valor em R$/MWh  ← coluna canônica
+        ano               INTEGER
+        mes               INTEGER
+        hora              INTEGER     -- 0..23  ← granularidade horária preservada
+        dia               INTEGER
+        mes_referencia    INTEGER     -- YYYYMM
+        periodo_comercializacao INTEGER
 
-    Retorna
-    -------
-    np.ndarray shape (24,), R$/MWh, clampado em [57.31, 1611.04].
+    Chaves de submercado (coluna ``submercado`` no banco):
+        SE/CO  → aliases: SE, SUDESTE, SECO, SUDESTECENTROOESTE  → chave curta "se"
+        SUL    → aliases: SUL, S                                  → chave curta "s"
+        NE     → aliases: NE, NORDESTE                            → chave curta "ne"
+        N      → aliases: N, NORTE                                → chave curta "n"
+
+    Estratégia de query (espelha core_analysis.py _duckdb_fetchdf):
+        SELECT hora, AVG(pld) FROM pld_historical
+        WHERE CAST(data AS DATE) = '<date>'
+          AND UPPER(TRIM(submercado)) IN ('<alias1>', '<alias2>', ...)
+          AND pld > 0
+        GROUP BY hora ORDER BY hora
+
+    O campo ``hora`` (0-23) já existe na tabela — sem necessidade de date_trunc.
+    O PLD é puro, sem spread, sem sazonalidade artificial.
+
+    Retorna np.ndarray shape (24,), R$/MWh, clampado em [57.31, 1611.04].
     """
     from pathlib import Path as _Path
 
@@ -406,72 +435,162 @@ def get_pld_official_day(
     date_str = target_ts.strftime("%Y-%m-%d")
     sub_key = _submercado_key(submercado)
 
-    # Aliases que o banco pode usar para cada submercado
+    # Aliases exatos que o integrated_collector_v2 grava na coluna submercado
+    # (dfx["submercado"] = dfx["submercado"].astype(str).str.upper().str.strip())
     _ALIASES: Dict[str, List[str]] = {
-        "seco": ["SE/CO", "SE", "SUDESTE", "SECO", "SUDESTE/CENTRO-OESTE"],
+        "seco": ["SE/CO", "SE", "SUDESTE", "SECO", "SUDESTECENTROOESTE", "SUDESTE/CENTRO-OESTE"],
         "s":    ["SUL", "S"],
-        "ne":   ["NORDESTE", "NE"],
-        "n":    ["NORTE", "N"],
+        "ne":   ["NE", "NORDESTE"],
+        "n":    ["N", "NORTE"],
     }
-    aliases = _ALIASES.get(sub_key, ["SE/CO"])
+    aliases = _ALIASES.get(sub_key, ["SE/CO", "SE", "SUDESTE", "SECO"])
     alias_sql = ", ".join(f"'{a}'" for a in aliases)
 
-    def _parse_df(df_pld: pd.DataFrame) -> Optional[np.ndarray]:
-        """Converte DataFrame {hora, pld_hora} em array de 24h."""
-        if df_pld.empty or len(df_pld) < 20:
-            return None
-        df_pld = df_pld.copy()
-        df_pld["hora"] = pd.to_datetime(df_pld["hora"], errors="coerce")
-        df_pld = df_pld.dropna(subset=["hora"]).sort_values("hora")
-        df_pld["hod"] = df_pld["hora"].dt.hour
-        pld_24 = np.full(24, pld_fixo_fallback, dtype=float)
-        for _, row in df_pld.iterrows():
-            h = int(row["hod"])
-            if 0 <= h <= 23:
-                pld_24[h] = float(row["pld_hora"])
-        return np.clip(pld_24, 57.31, 1611.04)
-
-    query = f"""
+    # Query idêntica ao padrão de core_analysis.py:
+    # filtra por CAST(data AS DATE), usa coluna `pld` (não pld_hora),
+    # e agrupa por `hora` (coluna inteira 0-23) para evitar date_trunc.
+    query_duck = f"""
         SELECT
-            date_trunc('hour', data) AS hora,
-            AVG(pld) AS pld_hora
+            hora,
+            AVG(pld) AS pld_media
         FROM pld_historical
         WHERE CAST(data AS DATE) = '{date_str}'
           AND UPPER(TRIM(submercado)) IN ({alias_sql})
+          AND pld IS NOT NULL
           AND pld > 0
-        GROUP BY 1
-        ORDER BY 1
+        GROUP BY hora
+        ORDER BY hora
     """
 
-    # ── Tentativa 1: DuckDB local ────────────────────────────────────────────
+    # Query Neon idêntica (usa mesma tabela/colunas)
+    query_neon = f"""
+        SELECT
+            hora,
+            AVG(pld) AS pld_media
+        FROM pld_historical
+        WHERE CAST(data AS DATE) = '{date_str}'::date
+          AND UPPER(TRIM(submercado)) IN ({alias_sql})
+          AND pld IS NOT NULL
+          AND pld > 0
+        GROUP BY hora
+        ORDER BY hora
+    """
+
+    def _build_array(df_q: pd.DataFrame) -> Optional[np.ndarray]:
+        """Converte DataFrame {hora INT, pld_media FLOAT} → array 24h."""
+        if df_q.empty:
+            return None
+        df_q = df_q.copy()
+        df_q["hora"] = pd.to_numeric(df_q["hora"], errors="coerce")
+        df_q["pld_media"] = pd.to_numeric(df_q["pld_media"], errors="coerce")
+        df_q = df_q.dropna(subset=["hora", "pld_media"])
+        df_q = df_q[(df_q["hora"] >= 0) & (df_q["hora"] <= 23)]
+        if df_q.empty or len(df_q) < 20:
+            return None
+        arr = np.full(24, pld_fixo_fallback, dtype=float)
+        for _, row in df_q.iterrows():
+            arr[int(row["hora"])] = float(row["pld_media"])
+        return np.clip(arr, 57.31, 1611.04)
+
+    # ── Tentativa 1: DuckDB local (data/kintuadi.duckdb) ─────────────────────
     duckdb_path = _Path("data/kintuadi.duckdb")
     if duckdb_path.exists():
         try:
             import duckdb as _ddb
             con = _ddb.connect(str(duckdb_path), read_only=True)
-            df_pld = con.execute(query).df()
-            con.close()
-            result = _parse_df(df_pld)
+            try:
+                df_q = con.execute(query_duck).df()
+            finally:
+                con.close()
+            result = _build_array(df_q)
             if result is not None:
-                logger.info("PLD D+1 obtido do DuckDB para %s/%s", date_str, submercado)
+                logger.info("PLD D+1 (%s, %s): lido do DuckDB (%d registros)",
+                            date_str, submercado, len(df_q))
                 return result
+            # Se tiver poucos registros, tenta também sem filtro de data
+            # para pegar o dia mais recente disponível (caso o PLD de amanhã
+            # já esteja no banco sob outra data)
+            logger.debug("DuckDB: PLD para %s/%s: apenas %d h — tentando dia mais recente",
+                         date_str, submercado, len(df_q))
         except Exception as _e:
-            logger.debug("DuckDB PLD falhou para %s: %s", date_str, _e)
+            logger.debug("DuckDB PLD falhou (%s/%s): %s", date_str, submercado, _e)
 
-    # ── Tentativa 2: Neon PostgreSQL ─────────────────────────────────────────
+    # ── Tentativa 2: Neon PostgreSQL ──────────────────────────────────────────
     try:
         import db_neon  # type: ignore
-        df_pld = db_neon.fetchdf(query)
-        result = _parse_df(df_pld)
+        df_q = db_neon.fetchdf(query_neon)
+        result = _build_array(df_q)
         if result is not None:
-            logger.info("PLD D+1 obtido do Neon para %s/%s", date_str, submercado)
+            logger.info("PLD D+1 (%s, %s): lido do Neon (%d registros)",
+                        date_str, submercado, len(df_q))
             return result
+        logger.debug("Neon: PLD para %s/%s: apenas %d h", date_str, submercado, len(df_q))
     except Exception as _e:
-        logger.debug("Neon PLD falhou para %s: %s", date_str, _e)
+        logger.debug("Neon PLD falhou (%s/%s): %s", date_str, submercado, _e)
 
-    # ── Fallback plano (sem spread — LP otimiza sobre preço uniforme) ─────────
+    # ── Tentativa 3: Dia mais recente disponível no banco ─────────────────────
+    # O PLD de amanhã pode ainda não ter sido publicado. Usa o último dia
+    # disponível como proxy (melhor que spread artificial).
+    query_latest_duck = f"""
+        SELECT
+            hora,
+            AVG(pld) AS pld_media
+        FROM pld_historical
+        WHERE CAST(data AS DATE) = (
+            SELECT MAX(CAST(data AS DATE))
+            FROM pld_historical
+            WHERE UPPER(TRIM(submercado)) IN ({alias_sql})
+              AND pld > 0
+        )
+        AND UPPER(TRIM(submercado)) IN ({alias_sql})
+        AND pld > 0
+        GROUP BY hora
+        ORDER BY hora
+    """
+    query_latest_neon = f"""
+        SELECT
+            hora,
+            AVG(pld) AS pld_media
+        FROM pld_historical
+        WHERE CAST(data AS DATE) = (
+            SELECT MAX(CAST(data AS DATE))
+            FROM pld_historical
+            WHERE UPPER(TRIM(submercado)) IN ({alias_sql})
+              AND pld > 0
+        )
+        AND UPPER(TRIM(submercado)) IN ({alias_sql})
+        AND pld > 0
+        GROUP BY hora
+        ORDER BY hora
+    """
+    if duckdb_path.exists():
+        try:
+            import duckdb as _ddb
+            con = _ddb.connect(str(duckdb_path), read_only=True)
+            try:
+                df_q = con.execute(query_latest_duck).df()
+            finally:
+                con.close()
+            result = _build_array(df_q)
+            if result is not None:
+                logger.warning("PLD D+1 (%s/%s): data não encontrada — usando último dia disponível",
+                               date_str, submercado)
+                return result
+        except Exception:
+            pass
+    try:
+        import db_neon  # type: ignore
+        df_q = db_neon.fetchdf(query_latest_neon)
+        result = _build_array(df_q)
+        if result is not None:
+            logger.warning("PLD D+1 (%s/%s): Neon — usando último dia disponível", date_str, submercado)
+            return result
+    except Exception:
+        pass
+
+    # ── Fallback final: PLD plano sem spread ─────────────────────────────────
     logger.warning(
-        "PLD oficial não disponível para %s/%s — usando fallback plano R$%.0f/MWh",
+        "PLD oficial não encontrado para %s/%s — fallback plano R$%.0f/MWh (sem spread)",
         date_str, submercado, pld_fixo_fallback,
     )
     return np.full(24, pld_fixo_fallback, dtype=float)
