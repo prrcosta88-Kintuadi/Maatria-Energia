@@ -54,7 +54,6 @@ class BESSProject:
     cenario_pld: str = "Base"
     pld_fixo: float = 200.0
     spread_tarifario: float = 1.3
-    pld_submercado: str = ""  # Submercado de referência para PLD (override do campo submercado)
 
     modo: str = "arbitragem"
     carga_inicio: int = 1
@@ -63,7 +62,6 @@ class BESSProject:
     descarga_fim: int = 21
     limite_demanda_kw: float = 7000.0
     prioridade: str = "receita"
-    usar_otimizacao_lp: bool = True  # Usa LP para despacho ótimo
 
     capex_bess_kwh: float = 1200.0
     capex_pcs_kw: float = 250.0
@@ -230,9 +228,6 @@ def parse_excel(file_path: str) -> BESSProject:
     proj.cenario_pld = str(_val("MARKET", 4, default=proj.cenario_pld) or proj.cenario_pld)
     proj.pld_fixo = _as_float(_val("MARKET", 5, default=proj.pld_fixo), proj.pld_fixo)
     proj.spread_tarifario = _as_float(_val("MARKET", 6, default=proj.spread_tarifario), proj.spread_tarifario)
-    # Submercado de referência para PLD (linha 7 da aba MARKET – "Submercado PLD")
-    _pld_sub = _val("MARKET", 7, default="")
-    proj.pld_submercado = str(_pld_sub).strip() if _pld_sub and str(_pld_sub).strip() not in ("", "nan", "None") else ""
 
     proj.modo = str(_val("STRATEGY", 3, default=proj.modo) or proj.modo)
     proj.carga_inicio = _as_int(_val("STRATEGY", 5, default=proj.carga_inicio), proj.carga_inicio)
@@ -241,7 +236,6 @@ def parse_excel(file_path: str) -> BESSProject:
     proj.descarga_fim = _as_int(_val("STRATEGY", 8, default=proj.descarga_fim), proj.descarga_fim)
     proj.limite_demanda_kw = _as_float(_val("STRATEGY", 10, default=proj.limite_demanda_kw), proj.limite_demanda_kw)
     proj.prioridade = str(_val("STRATEGY", 11, default=proj.prioridade) or proj.prioridade)
-    proj.usar_otimizacao_lp = _as_bool(_val("STRATEGY", 12, default=proj.usar_otimizacao_lp), proj.usar_otimizacao_lp)
 
     proj.capex_bess_kwh = _as_float(_val("CAPEX", 3, default=proj.capex_bess_kwh), proj.capex_bess_kwh)
     proj.capex_pcs_kw = _as_float(_val("CAPEX", 4, default=proj.capex_pcs_kw), proj.capex_pcs_kw)
@@ -352,17 +346,9 @@ def _get_spectral_peak_hour() -> Optional[int]:
 
 
 def get_pld_path(proj: BESSProject, rng: Optional[np.random.Generator] = None) -> np.ndarray:
-    """Generate an hourly PLD path for the BESS simulation.
-
-    O submercado de referência é determinado por ``proj.pld_submercado`` quando
-    informado no template (aba MARKET → "Submercado PLD"). Se não informado,
-    usa ``proj.submercado`` (aba PROJECT).  Isso permite modelar, por exemplo, um
-    projeto instalado no SE/CO que negocia no submercado Sul.
-    """
+    """Generate an hourly PLD path for the BESS simulation."""
 
     n = proj.horizonte_horas
-    # Resolve qual submercado usar para referência de PLD
-    ref_sub = proj.pld_submercado if proj.pld_submercado else proj.submercado
     base_prices: List[float] = []
 
     if proj.usar_pld_modelado:
@@ -372,7 +358,7 @@ def get_pld_path(proj: BESSProject, rng: Optional[np.random.Generator] = None) -
             pmo = get_latest_pmo_state()
             short = forecast_short_term(pmo)
             semanas = short.get("semanas", [])
-            sub_key = _submercado_key(ref_sub)
+            sub_key = _submercado_key(proj.submercado)
             for semana in semanas:
                 p50 = semana.get(f"pld_p50_{sub_key}")
                 if p50 is not None:
@@ -472,316 +458,14 @@ def get_load_path(proj: BESSProject, rng: Optional[np.random.Generator] = None) 
     return np.clip(load, 0.0, proj.potencia_mw * 5.0)
 
 
-def optimize_dispatch_lp(
-    proj: BESSProject,
-    pld: np.ndarray,
-    load: np.ndarray,
-    year: int = 1,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Compute optimal hourly charge/discharge schedule via Linear Programming.
-
-    Maximiza a receita de arbitragem líquida:
-        max  Σ_t  PLD_t · discharge_t  −  PLD_t · charge_t
-
-    sujeito a:
-        SOC_t = SOC_{t-1} + charge_t · η  −  discharge_t       (dinâmica)
-        soc_min ≤ SOC_t ≤ soc_max                               (limites de SOC)
-        0 ≤ charge_t   ≤ potencia_max                           (potência de carga)
-        0 ≤ discharge_t ≤ min(potencia_max, load_t)             (potência de descarga)
-        discharge_t + charge_t ≤ potencia_max                   (não opera simultâneo)
-        Σ_{t in dia d} discharge_t ≤ ciclos_dia_max · energia_util  (ciclos/dia)
-
-    Retorna arrays numpy ``(charge, discharge)`` de tamanho ``len(pld)``.
-    Faz fallback silencioso para arrays zeros se PuLP não estiver disponível.
-    """
-    try:
-        import pulp  # noqa: F401
-    except ImportError:
-        logger.warning("PuLP não instalado – retornando despacho zero. Instale com: pip install pulp")
-        n = min(len(pld), len(load), proj.horizonte_horas)
-        return np.zeros(n, dtype=float), np.zeros(n, dtype=float)
-
-    import pulp
-
-    n = min(len(pld), len(load), proj.horizonte_horas)
-    pld_arr = np.asarray(pld, dtype=float)[:n]
-    load_arr = np.asarray(load, dtype=float)[:n]
-
-    degradation_factor = (1.0 - proj.degradacao_anual / 100.0) ** max(year - 1, 0)
-    energia_util = proj.energia_util_mwh * degradation_factor
-    soc_min_mwh = proj.soc_min / 100.0 * proj.energia_mwh * degradation_factor
-    soc_max_mwh = proj.soc_max / 100.0 * proj.energia_mwh * degradation_factor
-    potencia_max = float(min(proj.potencia_mw, proj.c_rate_max * max(proj.energia_mwh, 0.001)))
-    eta = max(proj.eficiencia_rt, 0.01)
-
-    prob = pulp.LpProblem("BESS_Dispatch", pulp.LpMaximize)
-
-    charge = [pulp.LpVariable(f"c_{t}", lowBound=0, upBound=potencia_max) for t in range(n)]
-    discharge = [pulp.LpVariable(f"d_{t}", lowBound=0, upBound=potencia_max) for t in range(n)]
-    soc = [pulp.LpVariable(f"s_{t}", lowBound=soc_min_mwh, upBound=soc_max_mwh) for t in range(n)]
-
-    # Objetivo
-    prob += pulp.lpSum(pld_arr[t] * discharge[t] - pld_arr[t] * charge[t] for t in range(n))
-
-    # SOC inicial (meio do intervalo útil)
-    soc_init = soc_min_mwh + 0.5 * energia_util
-    prob += soc[0] == soc_init + charge[0] * eta - discharge[0]
-
-    for t in range(1, n):
-        prob += soc[t] == soc[t - 1] + charge[t] * eta - discharge[t]
-
-    # Não opera carga e descarga simultaneamente
-    for t in range(n):
-        prob += charge[t] + discharge[t] <= potencia_max
-        # Descarga limitada pela carga local (se modo não for arbitragem pura, respeita a demanda)
-        if proj.modo != "arbitragem":
-            prob += discharge[t] <= float(load_arr[t]) + potencia_max * 0.0  # sem restrição de carga local no LP geral
-
-    # Limite de ciclos por dia
-    daily_budget = float(max(energia_util * proj.ciclos_dia_max, 0.0))
-    n_days = (n + 23) // 24
-    for d in range(n_days):
-        h_start = d * 24
-        h_end = min(h_start + 24, n)
-        prob += pulp.lpSum(discharge[t] for t in range(h_start, h_end)) <= daily_budget
-
-    solver = pulp.PULP_CBC_CMD(msg=0, timeLimit=60)
-    prob.solve(solver)
-
-    charge_arr = np.array([max(pulp.value(charge[t]) or 0.0, 0.0) for t in range(n)], dtype=float)
-    discharge_arr = np.array([max(pulp.value(discharge[t]) or 0.0, 0.0) for t in range(n)], dtype=float)
-
-    return charge_arr, discharge_arr
-
-
-def get_next_day_guidance(
-    proj: BESSProject,
-    target_date: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Gera o guia de operação ótima para o DIA SEGUINTE baseado no PLD publicado.
-
-    O PLD do dia D é publicado no dia D-1. Esta função:
-    1. Resolve qual submercado usar (``proj.pld_submercado`` ou ``proj.submercado``).
-    2. Gera o vetor de PLD para as 24h do dia-alvo (D+1 a partir de hoje).
-    3. Roda o despacho LP para as 24 horas.
-    4. Retorna um plano hora-a-hora com ação recomendada e valor esperado.
-
-    Parâmetros
-    ----------
-    proj : BESSProject
-        Objeto de projeto já carregado.
-    target_date : str, opcional
-        Data-alvo no formato "AAAA-MM-DD". Padrão: amanhã.
-
-    Retorna
-    -------
-    dict com chaves:
-        - submercado_referencia: str
-        - data_operacao: str
-        - data_publicacao_pld: str
-        - plano_horario: list[dict]  (hora, acao, carga_mw, descarga_mw, soc_mwh, pld_r$_mwh, receita_esperada_r$)
-        - receita_total_esperada_rs: float
-        - energia_carregada_mwh: float
-        - energia_descarregada_mwh: float
-        - resumo_texto: str
-    """
-    from datetime import date, timedelta
-
-    today = date.today()
-    if target_date:
-        op_date = pd.to_datetime(target_date).date()
-    else:
-        op_date = today + timedelta(days=1)
-
-    pub_date = op_date - timedelta(days=1)
-    ref_sub = proj.pld_submercado if proj.pld_submercado else proj.submercado
-
-    # Gera PLD para 24h usando o motor existente (proj configurado para 24h)
-    _proj24 = BESSProject(
-        project_id=proj.project_id,
-        submercado=proj.submercado,
-        pld_submercado=ref_sub,
-        potencia_mw=proj.potencia_mw,
-        energia_mwh=proj.energia_mwh,
-        eficiencia_rt=proj.eficiencia_rt,
-        ciclos_dia_max=proj.ciclos_dia_max,
-        degradacao_anual=proj.degradacao_anual,
-        soc_min=proj.soc_min,
-        soc_max=proj.soc_max,
-        c_rate_max=proj.c_rate_max,
-        usar_pld_modelado=proj.usar_pld_modelado,
-        cenario_pld=proj.cenario_pld,
-        pld_fixo=proj.pld_fixo,
-        spread_tarifario=proj.spread_tarifario,
-        modo=proj.modo,
-        opex_variavel=proj.opex_variavel,
-        horizonte_horas=24,
-        data_inicio=str(op_date),
-    )
-
-    pld_24 = get_pld_path(_proj24)
-    load_24 = get_load_path(_proj24)
-
-    charge_arr, discharge_arr = optimize_dispatch_lp(_proj24, pld_24, load_24, year=1)
-
-    # Reconstrói SOC para o plano
-    degradation_factor = 1.0
-    energia_util = _proj24.energia_util_mwh
-    soc_min_mwh = _proj24.soc_min / 100.0 * _proj24.energia_mwh
-    soc_max_mwh = _proj24.soc_max / 100.0 * _proj24.energia_mwh
-    soc_cur = soc_min_mwh + 0.5 * energia_util
-    eta = _proj24.eficiencia_rt
-
-    plano = []
-    total_receita = 0.0
-    for h in range(24):
-        c = float(charge_arr[h])
-        d = float(discharge_arr[h])
-        soc_cur = float(np.clip(soc_cur + c * eta - d, soc_min_mwh, soc_max_mwh))
-        price = float(pld_24[h])
-        receita_h = d * price - c * price
-        total_receita += receita_h
-        if c > 1e-4:
-            acao = "CARREGAR"
-        elif d > 1e-4:
-            acao = "DESCARREGAR"
-        else:
-            acao = "OCIOSO"
-        plano.append(
-            {
-                "hora": h,
-                "acao": acao,
-                "carga_mw": round(c, 4),
-                "descarga_mw": round(d, 4),
-                "soc_mwh": round(soc_cur, 4),
-                "pld_rs_mwh": round(price, 2),
-                "receita_esperada_rs": round(receita_h, 2),
-            }
-        )
-
-    # Texto resumo
-    horas_carga = [p["hora"] for p in plano if p["acao"] == "CARREGAR"]
-    horas_desc = [p["hora"] for p in plano if p["acao"] == "DESCARREGAR"]
-
-    def _fmt_horas(lst):
-        if not lst:
-            return "–"
-        return ", ".join(f"{h:02d}h" for h in lst)
-
-    resumo = (
-        f"Submercado de referência: {ref_sub}. "
-        f"PLD publicado em {pub_date.strftime('%d/%m/%Y')} para operação de {op_date.strftime('%d/%m/%Y')}. "
-        f"Horas de carga: {_fmt_horas(horas_carga)}. "
-        f"Horas de descarga: {_fmt_horas(horas_desc)}. "
-        f"Receita esperada: R${total_receita:,.2f}."
-    )
-
-    return {
-        "submercado_referencia": ref_sub,
-        "data_operacao": str(op_date),
-        "data_publicacao_pld": str(pub_date),
-        "plano_horario": plano,
-        "receita_total_esperada_rs": round(total_receita, 2),
-        "energia_carregada_mwh": round(float(charge_arr.sum()), 4),
-        "energia_descarregada_mwh": round(float(discharge_arr.sum()), 4),
-        "resumo_texto": resumo,
-    }
-
-
-def optimize_for_irr(
-    proj: BESSProject,
-    pld: np.ndarray,
-    load: np.ndarray,
-    utilization_steps: Optional[List[float]] = None,
-) -> Dict[str, Any]:
-    """Outer-loop: itera sobre fatores de utilização para maximizar a TIR do equity.
-
-    Para cada fator ``u`` em ``utilization_steps``:
-      - Escala potencia_mw e energia_mwh por u
-      - Roda despacho LP
-      - Simula o ano e calcula a receita
-      - Computa TIR do equity
-
-    Retorna o melhor fator e o resultado completo da configuração ótima.
-    """
-    if utilization_steps is None:
-        utilization_steps = [round(u, 2) for u in np.arange(0.4, 1.01, 0.1)]
-
-    tariff = get_tariff_path(proj)
-    finance = FinanceInputs()
-    best: Dict[str, Any] = {"equity_irr_pct": None, "utilizacao": None}
-    all_results: List[Dict[str, Any]] = []
-
-    for u in utilization_steps:
-        # Clone com capacidade escalada
-        _p = BESSProject(**{
-            k: v for k, v in proj.__dict__.items() if k != "load_profile"
-        })
-        _p.load_profile = proj.load_profile
-        _p.potencia_mw = proj.potencia_mw * u
-        _p.energia_mwh = proj.energia_mwh * u
-
-        try:
-            charge_u, discharge_u = optimize_dispatch_lp(_p, pld, load, year=1)
-            _, summary_u = simulate_year(_p, pld, load, year=1, tariff_hourly=tariff, charge=charge_u, discharge=discharge_u)
-            receita_u = float(summary_u["receita_liquida_rs"])
-
-            # TIR simplificada (usa apenas receita do ano 1 replicada)
-            operating_df = _build_operating_case(_p, receita_u, finance)
-            annual_df, _ = _build_financing_schedule(operating_df, _p.capex_total, finance)
-            equity_outflow = _p.capex_total * (1.0 - finance.gearing_max_pct / 100.0)
-            equity_cf = [-equity_outflow] + annual_df["equity_cashflow_rs"].tolist()
-            irr = _irr(equity_cf)
-        except Exception as exc:
-            logger.warning("optimize_for_irr: erro em u=%.2f – %s", u, exc)
-            irr = None
-            receita_u = 0.0
-            summary_u = {}
-            charge_u = np.zeros(proj.horizonte_horas)
-            discharge_u = np.zeros(proj.horizonte_horas)
-
-        record = {
-            "utilizacao": u,
-            "potencia_mw": round(_p.potencia_mw, 3),
-            "energia_mwh": round(_p.energia_mwh, 3),
-            "receita_rs": round(receita_u, 2),
-            "equity_irr_pct": irr,
-        }
-        all_results.append(record)
-
-        if irr is not None and (best["equity_irr_pct"] is None or irr > best["equity_irr_pct"]):
-            best = {
-                **record,
-                "charge": charge_u,
-                "discharge": discharge_u,
-                "summary": summary_u,
-            }
-
-    return {
-        "best": best,
-        "all_utilization_results": all_results,
-        "optimal_utilizacao": best.get("utilizacao"),
-        "optimal_irr_pct": best.get("equity_irr_pct"),
-        "optimal_potencia_mw": best.get("potencia_mw"),
-        "optimal_energia_mwh": best.get("energia_mwh"),
-    }
-
-
 def simulate_year(
     proj: BESSProject,
     pld_hourly: np.ndarray,
     load_hourly: np.ndarray,
     year: int = 1,
     tariff_hourly: Optional[np.ndarray] = None,
-    charge: Optional[np.ndarray] = None,
-    discharge: Optional[np.ndarray] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, float]]:
-    """Simulate hourly BESS operation for one operating year.
-
-    Se ``charge`` e ``discharge`` forem fornecidos (e.g. pelo LP), eles são usados
-    diretamente e a lógica heurística interna é ignorada. O SOC ainda é rastreado
-    para validação e log.
-    """
+    """Simulate hourly BESS operation for one operating year."""
 
     n_hours = min(len(pld_hourly), len(load_hourly), proj.horizonte_horas)
     pld_hourly = np.asarray(pld_hourly, dtype=float)[:n_hours]
@@ -804,123 +488,97 @@ def simulate_year(
     opex_var = np.zeros(n_hours, dtype=float)
     actions: List[str] = ["idle"] * n_hours
 
-    # ── CAMINHO OTIMIZADO (LP) ─────────────────────────────────────────────────
-    # Se vetores pré-computados forem fornecidos, usa-os diretamente e rastreia o SOC.
-    if charge is not None and discharge is not None:
-        charge_in = np.asarray(charge, dtype=float)[:n_hours]
-        discharge_in = np.asarray(discharge, dtype=float)[:n_hours]
-        current_soc = soc_min + 0.5 * energia_util
-        eta = max(proj.eficiencia_rt, 0.01)
-        for hour in range(n_hours):
-            c = float(charge_in[hour])
-            d = float(discharge_in[hour])
-            price = float(pld_hourly[hour])
-            current_soc = float(np.clip(current_soc + c * eta - d, soc_min, soc_max))
-            charged[hour] = c
-            discharged[hour] = d
-            soc[hour] = current_soc
-            charge_cost[hour] = c * price
-            revenue[hour] = d * price
-            opex_var[hour] = (c + d) * proj.opex_variavel
-            if c > 1e-6:
-                actions[hour] = "charge"
-            elif d > 1e-6:
-                actions[hour] = "discharge"
-            else:
-                actions[hour] = "idle"
-    else:
-        # ── CAMINHO HEURÍSTICO (fallback / backward compat) ───────────────────
-        current_soc = soc_min + 0.5 * energia_util
-        daily_discharge_budget = max(energia_util * proj.ciclos_dia_max, 0.0)
-        discharged_today = 0.0
-        last_day = -1
-        spectral_peak = _get_spectral_peak_hour()
+    current_soc = soc_min + 0.5 * energia_util
+    daily_discharge_budget = max(energia_util * proj.ciclos_dia_max, 0.0)
+    discharged_today = 0.0
+    last_day = -1
+    spectral_peak = _get_spectral_peak_hour()
 
-        for hour in range(n_hours):
-            hod = hour % 24
-            day = hour // 24
-            price = float(pld_hourly[hour])
-            load = float(load_hourly[hour])
+    for hour in range(n_hours):
+        hod = hour % 24
+        day = hour // 24
+        price = float(pld_hourly[hour])
+        load = float(load_hourly[hour])
 
-            if day != last_day:
-                discharged_today = 0.0
-                last_day = day
+        if day != last_day:
+            discharged_today = 0.0
+            last_day = day
 
-            daily_headroom = max(daily_discharge_budget - discharged_today, 0.0)
-            action = "idle"
+        daily_headroom = max(daily_discharge_budget - discharged_today, 0.0)
+        action = "idle"
 
-            if proj.modo == "arbitragem":
-                can_charge = proj.carga_inicio <= hod <= proj.carga_fim
-                can_discharge = proj.descarga_inicio <= hod <= proj.descarga_fim
-                if can_charge and current_soc < soc_max and daily_headroom > 0:
-                    power = min(potencia_max, (soc_max - current_soc) / max(proj.eficiencia_rt, 0.01))
-                    current_soc += power * proj.eficiencia_rt
-                    charged[hour] = power
-                    charge_cost[hour] = power * price
-                    action = "charge"
-                elif can_discharge and current_soc > soc_min and daily_headroom > 0:
-                    power = min(potencia_max, current_soc - soc_min, daily_headroom)
-                    current_soc -= power
-                    discharged[hour] = power
-                    discharged_today += power
-                    revenue[hour] = power * price
-                    action = "discharge"
-            elif proj.modo == "peak_shaving":
-                demand_kw = load * 1000.0
-                if demand_kw > proj.limite_demanda_kw and current_soc > soc_min and daily_headroom > 0:
-                    excess_mw = min(
-                        (demand_kw - proj.limite_demanda_kw) / 1000.0,
-                        potencia_max,
-                        current_soc - soc_min,
-                        daily_headroom,
-                    )
-                    current_soc -= excess_mw
-                    discharged[hour] = excess_mw
-                    discharged_today += excess_mw
-                    cost_avoided[hour] = excess_mw * tariff_hourly[hour]
-                    action = "shave"
-                elif proj.carga_inicio <= hod <= proj.carga_fim and current_soc < soc_max:
-                    power = min(potencia_max, (soc_max - current_soc) / max(proj.eficiencia_rt, 0.01))
-                    current_soc += power * proj.eficiencia_rt
-                    charged[hour] = power
-                    charge_cost[hour] = power * price
-                    action = "charge"
-            else:
-                demand_kw = load * 1000.0
-                discharge_start = spectral_peak if spectral_peak is not None else proj.descarga_inicio
-                within_discharge = discharge_start <= hod <= proj.descarga_fim
-                hours_to_peak = (discharge_start - hod) % 24
-                reserve_soc = soc_max * 0.80 if not within_discharge and hours_to_peak <= 8 else soc_min
-                if within_discharge and current_soc > soc_min and daily_headroom > 0:
-                    power = min(potencia_max, current_soc - soc_min, daily_headroom)
-                    current_soc -= power
-                    discharged[hour] = power
-                    discharged_today += power
-                    revenue[hour] = power * price
-                    action = "discharge"
-                elif proj.carga_inicio <= hod <= proj.carga_fim and current_soc < soc_max:
-                    power = min(potencia_max, (soc_max - current_soc) / max(proj.eficiencia_rt, 0.01))
-                    current_soc += power * proj.eficiencia_rt
-                    charged[hour] = power
-                    charge_cost[hour] = power * price
-                    action = "charge"
-                elif demand_kw > proj.limite_demanda_kw and current_soc > reserve_soc and daily_headroom > 0:
-                    excess_mw = min(
-                        (demand_kw - proj.limite_demanda_kw) / 1000.0,
-                        potencia_max,
-                        current_soc - reserve_soc,
-                        daily_headroom,
-                    )
-                    current_soc -= excess_mw
-                    discharged[hour] = excess_mw
-                    discharged_today += excess_mw
-                    cost_avoided[hour] = excess_mw * tariff_hourly[hour]
-                    action = "shave"
+        if proj.modo == "arbitragem":
+            can_charge = proj.carga_inicio <= hod <= proj.carga_fim
+            can_discharge = proj.descarga_inicio <= hod <= proj.descarga_fim
+            if can_charge and current_soc < soc_max and daily_headroom > 0:
+                power = min(potencia_max, (soc_max - current_soc) / max(proj.eficiencia_rt, 0.01))
+                current_soc += power * proj.eficiencia_rt
+                charged[hour] = power
+                charge_cost[hour] = power * price
+                action = "charge"
+            elif can_discharge and current_soc > soc_min and daily_headroom > 0:
+                power = min(potencia_max, current_soc - soc_min, daily_headroom)
+                current_soc -= power
+                discharged[hour] = power
+                discharged_today += power
+                revenue[hour] = power * price
+                action = "discharge"
+        elif proj.modo == "peak_shaving":
+            demand_kw = load * 1000.0
+            if demand_kw > proj.limite_demanda_kw and current_soc > soc_min and daily_headroom > 0:
+                excess_mw = min(
+                    (demand_kw - proj.limite_demanda_kw) / 1000.0,
+                    potencia_max,
+                    current_soc - soc_min,
+                    daily_headroom,
+                )
+                current_soc -= excess_mw
+                discharged[hour] = excess_mw
+                discharged_today += excess_mw
+                cost_avoided[hour] = excess_mw * tariff_hourly[hour]
+                action = "shave"
+            elif proj.carga_inicio <= hod <= proj.carga_fim and current_soc < soc_max:
+                power = min(potencia_max, (soc_max - current_soc) / max(proj.eficiencia_rt, 0.01))
+                current_soc += power * proj.eficiencia_rt
+                charged[hour] = power
+                charge_cost[hour] = power * price
+                action = "charge"
+        else:
+            demand_kw = load * 1000.0
+            discharge_start = spectral_peak if spectral_peak is not None else proj.descarga_inicio
+            within_discharge = discharge_start <= hod <= proj.descarga_fim
+            hours_to_peak = (discharge_start - hod) % 24
+            reserve_soc = soc_max * 0.80 if not within_discharge and hours_to_peak <= 8 else soc_min
+            if within_discharge and current_soc > soc_min and daily_headroom > 0:
+                power = min(potencia_max, current_soc - soc_min, daily_headroom)
+                current_soc -= power
+                discharged[hour] = power
+                discharged_today += power
+                revenue[hour] = power * price
+                action = "discharge"
+            elif proj.carga_inicio <= hod <= proj.carga_fim and current_soc < soc_max:
+                power = min(potencia_max, (soc_max - current_soc) / max(proj.eficiencia_rt, 0.01))
+                current_soc += power * proj.eficiencia_rt
+                charged[hour] = power
+                charge_cost[hour] = power * price
+                action = "charge"
+            elif demand_kw > proj.limite_demanda_kw and current_soc > reserve_soc and daily_headroom > 0:
+                excess_mw = min(
+                    (demand_kw - proj.limite_demanda_kw) / 1000.0,
+                    potencia_max,
+                    current_soc - reserve_soc,
+                    daily_headroom,
+                )
+                current_soc -= excess_mw
+                discharged[hour] = excess_mw
+                discharged_today += excess_mw
+                cost_avoided[hour] = excess_mw * tariff_hourly[hour]
+                action = "shave"
 
-            current_soc = float(np.clip(current_soc, soc_min, soc_max))
-            soc[hour] = current_soc
-            opex_var[hour] = (charged[hour] + discharged[hour]) * proj.opex_variavel
-            actions[hour] = action
+        current_soc = float(np.clip(current_soc, soc_min, soc_max))
+        soc[hour] = current_soc
+        opex_var[hour] = (charged[hour] + discharged[hour]) * proj.opex_variavel
+        actions[hour] = action
 
     start_ts = pd.to_datetime(proj.data_inicio, errors="coerce")
     if pd.isna(start_ts):
@@ -1382,29 +1040,9 @@ def run_bess_simulation(
     pld = get_pld_path(proj)
     load = get_load_path(proj)
     tariff = get_tariff_path(proj)
-
-    # Despacho ótimo via LP (se habilitado) ou heurístico (fallback)
-    ref_sub = proj.pld_submercado if proj.pld_submercado else proj.submercado
-    if proj.usar_otimizacao_lp:
-        print(f"  Modo LP ativo | Submercado PLD de referência: {ref_sub}")
-        try:
-            charge_opt, discharge_opt = optimize_dispatch_lp(proj, pld, load, year=1)
-            det_hourly, det_summary = simulate_year(
-                proj, pld, load, year=1, tariff_hourly=tariff,
-                charge=charge_opt, discharge=discharge_opt,
-            )
-            det_summary["dispatch_mode"] = "lp_otimizado"
-        except Exception as exc:
-            logger.warning("LP dispatch falhou (%s) – usando heurística.", exc)
-            det_hourly, det_summary = simulate_year(proj, pld, load, year=1, tariff_hourly=tariff)
-            det_summary["dispatch_mode"] = "heuristico_fallback"
-    else:
-        det_hourly, det_summary = simulate_year(proj, pld, load, year=1, tariff_hourly=tariff)
-        det_summary["dispatch_mode"] = "heuristico"
-
+    det_hourly, det_summary = simulate_year(proj, pld, load, year=1, tariff_hourly=tariff)
     print(f"  Receita liquida ano 1: R${det_summary['receita_liquida_rs']:,.0f}")
     print(f"  Energia descarregada: {det_summary['energia_descarregada_mwh']:,.1f} MWh")
-    print(f"  Modo despacho: {det_summary['dispatch_mode']}")
 
     n = int(n_sims or proj.n_simulacoes)
     print(f"\n[4/5] Monte Carlo ({n} simulacoes)")
@@ -1421,27 +1059,6 @@ def run_bess_simulation(
     print(f"  Equity NPV base: R${base['equity_npv_rs']:,.0f}")
     print(f"  Min DSCR base: {base['min_dscr']}")
     print(f"  LLCR base: {base['llcr']}")
-
-    # Guia de operação para o dia seguinte (baseado no PLD publicado hoje)
-    print("\n[+] Guia de operação — dia seguinte")
-    try:
-        next_day = get_next_day_guidance(proj)
-        print(f"  {next_day['resumo_texto']}")
-    except Exception as exc:
-        logger.warning("next_day_guidance falhou: %s", exc)
-        next_day = {"erro": str(exc)}
-
-    # Otimização de TIR (se LP habilitado)
-    irr_opt: Dict[str, Any] = {}
-    if proj.usar_otimizacao_lp:
-        print("\n[+] Otimizacao de TIR por fator de utilizacao")
-        try:
-            irr_opt = optimize_for_irr(proj, pld, load)
-            print(f"  Melhor utilizacao: {irr_opt['optimal_utilizacao']:.0%} | TIR equity: {irr_opt['optimal_irr_pct']}%")
-        except Exception as exc:
-            logger.warning("optimize_for_irr falhou: %s", exc)
-            irr_opt = {"erro": str(exc)}
-
     print(f"\n{'=' * 68}\n")
 
     return {
@@ -1450,13 +1067,6 @@ def run_bess_simulation(
         "deterministic": {"summary": det_summary, "hourly": det_hourly},
         "monte_carlo": mc,
         "financials": financials,
-        "next_day_guidance": next_day,
-        "irr_optimization": {
-            k: v for k, v in irr_opt.items()
-            if k not in ("best",)  # exclui arrays numpy do JSON principal
-        } if irr_opt else {},
-        "dispatch_mode": det_summary.get("dispatch_mode", "heuristico"),
-        "pld_submercado_referencia": proj.pld_submercado if proj.pld_submercado else proj.submercado,
         "timestamp": datetime.now().isoformat(),
     }
 
