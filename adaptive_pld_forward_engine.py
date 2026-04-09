@@ -72,6 +72,12 @@ QUALITY_LOCAL_TABLE_NAME = "adaptive_pld_forward_quality_hourly"
 QUALITY_AUTH_TABLE_NAME = "maat_adaptive_pld_forward_quality_hourly"
 QUALITY_SUMMARY_LOCAL_TABLE_NAME = "adaptive_pld_forward_quality_summary"
 QUALITY_SUMMARY_AUTH_TABLE_NAME = "maat_adaptive_pld_forward_quality_summary"
+BACKTEST_LOCAL_TABLE_NAME = "adaptive_pld_backtest_hourly"
+BACKTEST_AUTH_TABLE_NAME = "maat_adaptive_pld_backtest_hourly"
+BACKTEST_QUALITY_LOCAL_TABLE_NAME = "adaptive_pld_backtest_quality_hourly"
+BACKTEST_QUALITY_AUTH_TABLE_NAME = "maat_adaptive_pld_backtest_quality_hourly"
+BACKTEST_SUMMARY_LOCAL_TABLE_NAME = "adaptive_pld_backtest_quality_summary"
+BACKTEST_SUMMARY_AUTH_TABLE_NAME = "maat_adaptive_pld_backtest_quality_summary"
 
 REGIME_LABEL_TO_ID = {"low": 0, "mid": 1, "high": 2}
 REGIME_ID_TO_LABEL = {value: key for key, value in REGIME_LABEL_TO_ID.items()}
@@ -2016,32 +2022,68 @@ class AdaptivePLDForwardEngine:
                 tables = set(con.execute("SHOW TABLES").df()["name"].str.lower().tolist())
             except Exception:
                 tables = set()
-            if LOCAL_TABLE_NAME.lower() not in tables:
+            available_sources: list[tuple[str, str]] = []
+            if LOCAL_TABLE_NAME.lower() in tables:
+                available_sources.append((LOCAL_TABLE_NAME, "adaptive_forward"))
+            if BACKTEST_LOCAL_TABLE_NAME.lower() in tables:
+                available_sources.append((BACKTEST_LOCAL_TABLE_NAME, "adaptive_backtest"))
+            if not available_sources:
                 return pd.DataFrame()
 
             cutoff_ts = (pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=self.feedback_lookback_days)).to_pydatetime()
-            query = f"""
-                SELECT
-                    run_id,
-                    generated_at,
-                    forecast_ts,
-                    horizon_hour,
-                    era_id,
-                    regime_prob_low,
-                    regime_prob_mid,
-                    regime_prob_high,
-                    expected_pld,
-                    pld_p10,
-                    pld_p50,
-                    pld_p90,
-                    expected_spdi,
-                    expected_custo_fisico,
-                    model_version
-                FROM {LOCAL_TABLE_NAME}
-                WHERE forecast_ts >= ?
-                ORDER BY generated_at, forecast_ts
-            """
-            return self._normalize_archive_frame(con.execute(query, [cutoff_ts]).df())
+            union_queries: list[str] = []
+            params: list[Any] = []
+            for table_name, source_name in available_sources:
+                if source_name == "adaptive_backtest":
+                    union_queries.append(
+                        f"""
+                        SELECT
+                            run_id,
+                            generated_at,
+                            forecast_ts,
+                            horizon_hour,
+                            era_id,
+                            regime_prob_low,
+                            regime_prob_mid,
+                            regime_prob_high,
+                            expected_pld,
+                            pld_p10,
+                            pld_p50,
+                            pld_p90,
+                            expected_spdi,
+                            expected_custo_fisico,
+                            model_version
+                        FROM {table_name}
+                        WHERE forecast_ts >= ?
+                          AND LOWER(COALESCE(phase_group, '')) = 'phase2'
+                        """
+                    )
+                else:
+                    union_queries.append(
+                        f"""
+                        SELECT
+                            run_id,
+                            generated_at,
+                            forecast_ts,
+                            horizon_hour,
+                            era_id,
+                            regime_prob_low,
+                            regime_prob_mid,
+                            regime_prob_high,
+                            expected_pld,
+                            pld_p10,
+                            pld_p50,
+                            pld_p90,
+                            expected_spdi,
+                            expected_custo_fisico,
+                            model_version
+                        FROM {table_name}
+                        WHERE forecast_ts >= ?
+                        """
+                    )
+                params.append(cutoff_ts)
+            query = "\nUNION ALL\n".join(union_queries) + "\nORDER BY generated_at, forecast_ts"
+            return self._normalize_archive_frame(con.execute(query, params).df())
         except Exception:
             return pd.DataFrame()
         finally:
@@ -2054,34 +2096,69 @@ class AdaptivePLDForwardEngine:
         conn = psycopg2.connect(auth_url)
         try:
             cur = conn.cursor()
-            cur.execute("SELECT to_regclass(%s)", (AUTH_TABLE_NAME,))
+            cur.execute("SELECT to_regclass(%s), to_regclass(%s)", (AUTH_TABLE_NAME, BACKTEST_AUTH_TABLE_NAME))
             exists = cur.fetchone()
             cur.close()
-            if not exists or not exists[0]:
+            if not exists:
+                return pd.DataFrame()
+            has_forward = bool(exists[0])
+            has_backtest = bool(exists[1])
+            if not has_forward and not has_backtest:
                 return pd.DataFrame()
             cutoff_ts = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=self.feedback_lookback_days)
-            query = f"""
-                SELECT
-                    run_id,
-                    generated_at,
-                    forecast_ts,
-                    horizon_hour,
-                    era_id,
-                    regime_prob_low,
-                    regime_prob_mid,
-                    regime_prob_high,
-                    expected_pld,
-                    pld_p10,
-                    pld_p50,
-                    pld_p90,
-                    expected_spdi,
-                    expected_custo_fisico,
-                    model_version
-                FROM {AUTH_TABLE_NAME}
-                WHERE forecast_ts >= %s
-                ORDER BY generated_at, forecast_ts
-            """
-            return self._normalize_archive_frame(pd.read_sql_query(query, conn, params=[cutoff_ts]))
+            union_queries: list[str] = []
+            params: list[Any] = []
+            if has_forward:
+                union_queries.append(
+                    f"""
+                    SELECT
+                        run_id,
+                        generated_at,
+                        forecast_ts,
+                        horizon_hour,
+                        era_id,
+                        regime_prob_low,
+                        regime_prob_mid,
+                        regime_prob_high,
+                        expected_pld,
+                        pld_p10,
+                        pld_p50,
+                        pld_p90,
+                        expected_spdi,
+                        expected_custo_fisico,
+                        model_version
+                    FROM {AUTH_TABLE_NAME}
+                    WHERE forecast_ts >= %s
+                    """
+                )
+                params.append(cutoff_ts)
+            if has_backtest:
+                union_queries.append(
+                    f"""
+                    SELECT
+                        run_id,
+                        generated_at,
+                        forecast_ts,
+                        horizon_hour,
+                        era_id,
+                        regime_prob_low,
+                        regime_prob_mid,
+                        regime_prob_high,
+                        expected_pld,
+                        pld_p10,
+                        pld_p50,
+                        pld_p90,
+                        expected_spdi,
+                        expected_custo_fisico,
+                        model_version
+                    FROM {BACKTEST_AUTH_TABLE_NAME}
+                    WHERE forecast_ts >= %s
+                      AND LOWER(COALESCE(phase_group, '')) = 'phase2'
+                    """
+                )
+                params.append(cutoff_ts)
+            query = "\nUNION ALL\n".join(union_queries) + "\nORDER BY generated_at, forecast_ts"
+            return self._normalize_archive_frame(pd.read_sql_query(query, conn, params=params))
         except Exception:
             return pd.DataFrame()
         finally:

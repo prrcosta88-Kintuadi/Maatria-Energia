@@ -51,6 +51,12 @@ except ImportError:
 try:
     from adaptive_pld_forward_engine import (
         AUTH_TABLE_NAME as _ADAPTIVE_AUTH_TABLE,
+        BACKTEST_AUTH_TABLE_NAME as _ADAPTIVE_BACKTEST_AUTH_TABLE,
+        BACKTEST_LOCAL_TABLE_NAME as _ADAPTIVE_BACKTEST_LOCAL_TABLE,
+        BACKTEST_QUALITY_AUTH_TABLE_NAME as _ADAPTIVE_BACKTEST_QUALITY_AUTH_TABLE,
+        BACKTEST_QUALITY_LOCAL_TABLE_NAME as _ADAPTIVE_BACKTEST_QUALITY_LOCAL_TABLE,
+        BACKTEST_SUMMARY_AUTH_TABLE_NAME as _ADAPTIVE_BACKTEST_SUMMARY_AUTH_TABLE,
+        BACKTEST_SUMMARY_LOCAL_TABLE_NAME as _ADAPTIVE_BACKTEST_SUMMARY_LOCAL_TABLE,
         LOCAL_TABLE_NAME as _ADAPTIVE_LOCAL_TABLE,
         QUALITY_AUTH_TABLE_NAME as _ADAPTIVE_QUALITY_AUTH_TABLE,
         QUALITY_LOCAL_TABLE_NAME as _ADAPTIVE_QUALITY_LOCAL_TABLE,
@@ -70,6 +76,21 @@ except Exception as _adaptive_err:
     _ADAPTIVE_QUALITY_AUTH_TABLE = "maat_adaptive_pld_forward_quality_hourly"
     _ADAPTIVE_QUALITY_SUMMARY_LOCAL_TABLE = "adaptive_pld_forward_quality_summary"
     _ADAPTIVE_QUALITY_SUMMARY_AUTH_TABLE = "maat_adaptive_pld_forward_quality_summary"
+    _ADAPTIVE_BACKTEST_LOCAL_TABLE = "adaptive_pld_backtest_hourly"
+    _ADAPTIVE_BACKTEST_AUTH_TABLE = "maat_adaptive_pld_backtest_hourly"
+    _ADAPTIVE_BACKTEST_QUALITY_LOCAL_TABLE = "adaptive_pld_backtest_quality_hourly"
+    _ADAPTIVE_BACKTEST_QUALITY_AUTH_TABLE = "maat_adaptive_pld_backtest_quality_hourly"
+    _ADAPTIVE_BACKTEST_SUMMARY_LOCAL_TABLE = "adaptive_pld_backtest_quality_summary"
+    _ADAPTIVE_BACKTEST_SUMMARY_AUTH_TABLE = "maat_adaptive_pld_backtest_quality_summary"
+
+try:
+    from adaptive_pld_backtest_engine import AdaptivePLDBacktestEngine
+    _ADAPTIVE_BACKTEST_OK = True
+    _ADAPTIVE_BACKTEST_ERR = ""
+except Exception as _adaptive_backtest_err:
+    AdaptivePLDBacktestEngine = None
+    _ADAPTIVE_BACKTEST_OK = False
+    _ADAPTIVE_BACKTEST_ERR = str(_adaptive_backtest_err)
 
 # ─── sklearn / scipy (opcionais) ─────────────────────────────────────────────
 try:
@@ -119,6 +140,13 @@ _ADAPTIVE_SUBMARKETS = {
     "S": {"history_col": "pld_s", "label": "Sul", "color": _COLORS["green"]},
     "NE": {"history_col": "pld_ne", "label": "Nordeste", "color": _COLORS["gold"]},
     "N": {"history_col": "pld_n", "label": "Norte", "color": _COLORS["purple"]},
+}
+_ADAPTIVE_BACKTEST_MARKETS = {
+    "SIN": {"label": "SIN"},
+    "SE": {"label": "SE/CO"},
+    "S": {"label": "Sul"},
+    "NE": {"label": "Nordeste"},
+    "N": {"label": "Norte"},
 }
 
 # ─── CCEE resource IDs ───────────────────────────────────────────────────────
@@ -1473,7 +1501,7 @@ def _normalize_adaptive_forward_table(frame: pd.DataFrame) -> pd.DataFrame:
 
     int_cols = ("horizon_hour", "era_id", "n_paths")
     dt_cols = {"generated_at", "forecast_ts"}
-    text_cols = {"run_id", "model_version", "history_source"}
+    text_cols = {"engine_name", "phase_name", "phase_group", "run_id", "model_version", "history_source"}
 
     for col in int_cols:
         if col in out.columns:
@@ -1504,6 +1532,10 @@ def _normalize_adaptive_quality_table(frame: pd.DataFrame) -> pd.DataFrame:
     }
     text_cols = {
         "engine_name",
+        "phase_name",
+        "phase_group",
+        "market",
+        "market_label",
         "run_id",
         "lead_bucket",
         "dominant_regime",
@@ -1722,6 +1754,152 @@ def _load_adaptive_quality_cached() -> tuple[pd.DataFrame, pd.DataFrame, str]:
         return obs_auth, summary_auth, "neon_auth"
 
     return pd.DataFrame(), pd.DataFrame(), "missing"
+
+
+def _load_adaptive_backtest_from_duckdb(
+    duckdb_path: str | Path = "data/kintuadi.duckdb",
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if duckdb is None:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    db_path = Path(duckdb_path)
+    if not db_path.exists():
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        try:
+            tables = set(con.execute("SHOW TABLES").df()["name"].str.lower().tolist())
+        except Exception:
+            tables = set()
+
+        forecast = pd.DataFrame()
+        obs = pd.DataFrame()
+        summary = pd.DataFrame()
+        if _ADAPTIVE_BACKTEST_LOCAL_TABLE.lower() in tables:
+            forecast = _normalize_adaptive_forward_table(
+                con.execute(
+                    f"""
+                    SELECT *
+                    FROM {_ADAPTIVE_BACKTEST_LOCAL_TABLE}
+                    ORDER BY generated_at, forecast_ts
+                    """
+                ).df()
+            )
+        if _ADAPTIVE_BACKTEST_QUALITY_LOCAL_TABLE.lower() in tables:
+            obs = _normalize_adaptive_quality_table(
+                con.execute(
+                    f"""
+                    SELECT *
+                    FROM {_ADAPTIVE_BACKTEST_QUALITY_LOCAL_TABLE}
+                    ORDER BY phase_name, market, forecast_ts, generated_at
+                    """
+                ).df()
+            )
+        if _ADAPTIVE_BACKTEST_SUMMARY_LOCAL_TABLE.lower() in tables:
+            summary = _normalize_adaptive_quality_table(
+                con.execute(
+                    f"""
+                    SELECT *
+                    FROM {_ADAPTIVE_BACKTEST_SUMMARY_LOCAL_TABLE}
+                    ORDER BY phase_name, market, window_days, lead_bucket
+                    """
+                ).df()
+            )
+        return forecast, obs, summary
+    finally:
+        con.close()
+
+
+def _load_adaptive_backtest_from_auth() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if psycopg2 is None:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    auth_url = _adaptive_auth_url()
+    if not auth_url:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    conn = psycopg2.connect(auth_url)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT to_regclass(%s), to_regclass(%s), to_regclass(%s)",
+            (
+                _ADAPTIVE_BACKTEST_AUTH_TABLE,
+                _ADAPTIVE_BACKTEST_QUALITY_AUTH_TABLE,
+                _ADAPTIVE_BACKTEST_SUMMARY_AUTH_TABLE,
+            ),
+        )
+        exists = cur.fetchone()
+        cur.close()
+        if not exists:
+            return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+        forecast = pd.DataFrame()
+        obs = pd.DataFrame()
+        summary = pd.DataFrame()
+        if exists[0]:
+            forecast = _normalize_adaptive_forward_table(
+                pd.read_sql_query(
+                    f"SELECT * FROM {_ADAPTIVE_BACKTEST_AUTH_TABLE} ORDER BY generated_at, forecast_ts",
+                    conn,
+                )
+            )
+        if len(exists) > 1 and exists[1]:
+            obs = _normalize_adaptive_quality_table(
+                pd.read_sql_query(
+                    f"SELECT * FROM {_ADAPTIVE_BACKTEST_QUALITY_AUTH_TABLE} ORDER BY phase_name, market, forecast_ts, generated_at",
+                    conn,
+                )
+            )
+        if len(exists) > 2 and exists[2]:
+            summary = _normalize_adaptive_quality_table(
+                pd.read_sql_query(
+                    f"SELECT * FROM {_ADAPTIVE_BACKTEST_SUMMARY_AUTH_TABLE} ORDER BY phase_name, market, window_days, lead_bucket",
+                    conn,
+                )
+            )
+        return forecast, obs, summary
+    except Exception:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    finally:
+        conn.close()
+
+
+@st.cache_data(show_spinner=False, ttl=_ADAPTIVE_FORWARD_CACHE_TTL)
+def _load_adaptive_backtest_cached() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
+    forecast_local, obs_local, summary_local = _load_adaptive_backtest_from_duckdb()
+    if not forecast_local.empty or not obs_local.empty or not summary_local.empty:
+        return forecast_local, obs_local, summary_local, "duckdb_local"
+
+    forecast_auth, obs_auth, summary_auth = _load_adaptive_backtest_from_auth()
+    if not forecast_auth.empty or not obs_auth.empty or not summary_auth.empty:
+        return forecast_auth, obs_auth, summary_auth, "neon_auth"
+
+    return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), "missing"
+
+
+def _run_adaptive_backtest_now(
+    persist: bool = True,
+    start_date: str = "2021-01-01",
+    short_stride_days: int = 1,
+    long_stride_days: int = 7,
+    phase2_n_paths: int = 250,
+):
+    if not _ADAPTIVE_BACKTEST_OK or AdaptivePLDBacktestEngine is None:
+        raise RuntimeError(
+            "AdaptivePLDBacktestEngine indisponivel."
+            + (f" Detalhe: {_ADAPTIVE_BACKTEST_ERR}" if _ADAPTIVE_BACKTEST_ERR else "")
+        )
+
+    engine = AdaptivePLDBacktestEngine(
+        duckdb_path="data/kintuadi.duckdb",
+        start_date=start_date,
+        short_stride_days=short_stride_days,
+        long_stride_days=long_stride_days,
+        phase2_n_paths=phase2_n_paths,
+    )
+    return engine.run(persist=persist)
 
 
 def _run_adaptive_forward_now(
@@ -2372,6 +2550,147 @@ def _plot_adaptive_quality_by_lead(quality_summary_df: pd.DataFrame, window_days
     return fig
 
 
+def _adaptive_backtest_phase_label(phase_name: str) -> str:
+    mapping = {
+        "phase1_structural": "Fase 1 - Hindcast estrutural",
+        "phase2_walkforward_short": "Fase 2 - Walk-forward curto",
+        "phase2_walkforward_long": "Fase 2 - Walk-forward longo",
+    }
+    return mapping.get(str(phase_name), str(phase_name))
+
+
+def _adaptive_backtest_latest_row(
+    backtest_summary_df: pd.DataFrame,
+    *,
+    phase_name: str,
+    market: str = "SIN",
+    window_days: int = 99999,
+    lead_bucket: str = "all",
+) -> Dict[str, Any]:
+    if backtest_summary_df.empty:
+        return {}
+    summary = backtest_summary_df.copy()
+    summary["window_days"] = pd.to_numeric(summary["window_days"], errors="coerce")
+    row = summary[
+        (summary["phase_name"].astype(str) == str(phase_name))
+        & (summary["market"].astype(str) == str(market))
+        & (summary["window_days"] == int(window_days))
+        & (summary["lead_bucket"].astype(str) == str(lead_bucket))
+    ]
+    if row.empty:
+        return {}
+    return row.iloc[0].to_dict()
+
+
+def _plot_adaptive_backtest_market_mae(
+    backtest_summary_df: pd.DataFrame,
+    *,
+    phase_name: str,
+    window_days: int = 99999,
+) -> go.Figure:
+    fig = go.Figure()
+    if backtest_summary_df.empty:
+        return fig
+
+    summary = backtest_summary_df.copy()
+    summary["window_days"] = pd.to_numeric(summary["window_days"], errors="coerce")
+    summary = summary[
+        (summary["phase_name"].astype(str) == str(phase_name))
+        & (summary["window_days"] == int(window_days))
+        & (summary["lead_bucket"].astype(str) == "all")
+    ].copy()
+    if summary.empty:
+        return fig
+
+    summary = summary.sort_values("weighted_mae")
+    fig.add_trace(go.Bar(
+        x=summary["market_label"],
+        y=summary["weighted_mae"],
+        marker_color=_COLORS["gold"],
+        name="MAE ponderado",
+        hovertemplate="Mercado: %{x}<br>MAE ponderado: R$ %{y:,.0f}<extra></extra>",
+    ))
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=_COLORS["bg"],
+        plot_bgcolor=_COLORS["panel"],
+        height=300,
+        margin=dict(l=40, r=20, t=42, b=26),
+        title=dict(
+            text=f"{_adaptive_backtest_phase_label(phase_name)} - erro por mercado",
+            font=dict(size=13, color="#e5e7eb"),
+        ),
+        xaxis=dict(gridcolor="#1f2937"),
+        yaxis=dict(title="MAE ponderado (R$/MWh)", gridcolor="#1f2937"),
+        showlegend=False,
+    )
+    return fig
+
+
+def _plot_adaptive_backtest_lead_profile(
+    backtest_summary_df: pd.DataFrame,
+    *,
+    phase_name: str,
+    market: str = "SIN",
+    window_days: int = 99999,
+) -> go.Figure:
+    fig = go.Figure()
+    if backtest_summary_df.empty:
+        return fig
+
+    summary = backtest_summary_df.copy()
+    summary["window_days"] = pd.to_numeric(summary["window_days"], errors="coerce")
+    summary = summary[
+        (summary["phase_name"].astype(str) == str(phase_name))
+        & (summary["market"].astype(str) == str(market))
+        & (summary["window_days"] == int(window_days))
+        & (summary["lead_bucket"].astype(str) != "all")
+    ].copy()
+    if summary.empty:
+        return fig
+
+    summary["lead_label"] = summary["lead_bucket"].map(_adaptive_quality_lead_label)
+    fig.add_trace(go.Bar(
+        x=summary["lead_label"],
+        y=summary["weighted_mae"],
+        name="MAE ponderado",
+        marker_color=_COLORS["gold"],
+        hovertemplate="Horizonte: %{x}<br>MAE: R$ %{y:,.0f}<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=summary["lead_label"],
+        y=summary["band_coverage"] * 100.0,
+        mode="lines+markers",
+        name="Cobertura P10-P90",
+        line=dict(color=_COLORS["blue"], width=2.0),
+        marker=dict(size=7),
+        yaxis="y2",
+        hovertemplate="Horizonte: %{x}<br>Cobertura: %{y:.1f}%<extra></extra>",
+    ))
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=_COLORS["bg"],
+        plot_bgcolor=_COLORS["panel"],
+        height=320,
+        margin=dict(l=40, r=40, t=45, b=30),
+        title=dict(
+            text=f"{_adaptive_backtest_phase_label(phase_name)} - perfil por horizonte ({market})",
+            font=dict(size=13, color="#e5e7eb"),
+        ),
+        xaxis=dict(gridcolor="#1f2937"),
+        yaxis=dict(title="MAE ponderado (R$/MWh)", gridcolor="#1f2937"),
+        yaxis2=dict(
+            title="Cobertura (%)",
+            overlaying="y",
+            side="right",
+            range=[0, 100],
+            showgrid=False,
+        ),
+        legend=dict(orientation="h", y=1.08, font=dict(size=10)),
+    )
+    return fig
+
+
 def _render_adaptive_forward_section(df: pd.DataFrame) -> None:
     st.markdown("""
     <div class='epje-card' style='border-left-color:#60a5fa'>
@@ -2399,13 +2718,15 @@ def _render_adaptive_forward_section(df: pd.DataFrame) -> None:
         if pd.notna(last_generated):
             stale_snapshot = (pd.Timestamp.utcnow().tz_localize(None) - last_generated) > pd.Timedelta(days=7)
 
-    action_col, info_col = st.columns([1, 2])
+    action_col, backtest_col, info_col = st.columns([1, 1, 2])
     with action_col:
         refresh_now = st.button("Atualizar forecast estrutural", key="btn_adaptive_forward_refresh")
+    with backtest_col:
+        run_backtest_now = st.button("Rodar backtest historico", key="btn_adaptive_backtest_refresh")
     with info_col:
         st.caption(
             "Horizonte: 6 meses horarios | Monte Carlo: 1000 trajetorias | "
-            "Retreino automatico semanal."
+            "Retreino automatico semanal. Backtest historico usa Fase 1 estrutural + Fase 2 walk-forward."
         )
 
     if stale_snapshot:
@@ -2430,12 +2751,32 @@ def _render_adaptive_forward_section(df: pd.DataFrame) -> None:
                     return
                 st.warning(f"Falha ao recalcular agora. Exibindo ultimo snapshot disponivel. Detalhe: {exc}")
 
+    if run_backtest_now:
+        with st.spinner("Executando backtest historico adaptativo... este processo pode demorar bastante."):
+            try:
+                _run_adaptive_backtest_now(
+                    persist=True,
+                    start_date="2021-01-01",
+                    short_stride_days=1,
+                    long_stride_days=7,
+                    phase2_n_paths=250,
+                )
+                _load_adaptive_backtest_cached.clear()
+                _load_latest_adaptive_forward_cached.clear()
+                _load_adaptive_quality_cached.clear()
+                st.success(
+                    "Backtest historico concluido. As tabelas de qualidade e a memoria de feedback do adaptive forward foram atualizadas."
+                )
+            except Exception as exc:
+                st.warning(f"Nao foi possivel executar o backtest agora. Detalhe: {exc}")
+
     if forward_df.empty:
         st.info("Nenhum snapshot estrutural disponivel ainda.")
         return
 
     forward_df = _derive_adaptive_submarket_forward(df, forward_df)
     quality_obs_df, quality_summary_df, quality_source = _load_adaptive_quality_cached()
+    backtest_forecast_df, backtest_obs_df, backtest_summary_df, backtest_source = _load_adaptive_backtest_cached()
     summary = _adaptive_run_summary(forward_df)
     generated_at = summary["generated_at"]
     generated_label = (
@@ -2617,6 +2958,128 @@ def _render_adaptive_forward_section(df: pd.DataFrame) -> None:
                     "Acima do P90",
                 ]
                 st.dataframe(detail[[col for col in cols if col in detail.columns]], use_container_width=True, height=260)
+
+        st.markdown("---")
+        st.markdown("##### Backtest historico do motor")
+        st.caption(
+            "Fase 1 usa a fisica realizada para medir a camada estrutural. "
+            "Fase 2 refaz previsoes walk-forward sem vazamento de informacao. "
+            "Os resultados alimentam a auto-recalibracao do adaptive forward."
+        )
+        if backtest_summary_df.empty:
+            st.info(
+                "Backtest historico ainda nao foi executado. Use o botao `Rodar backtest historico` acima "
+                "ou execute `python adaptive_pld_backtest_engine.py` no PowerShell."
+            )
+        else:
+            st.caption(f"Fonte do backtest: {backtest_source}.")
+            phase_options = [
+                "phase1_structural",
+                "phase2_walkforward_short",
+                "phase2_walkforward_long",
+            ]
+            selected_phase = st.radio(
+                "Camada do backtest",
+                options=phase_options,
+                format_func=_adaptive_backtest_phase_label,
+                horizontal=True,
+                key="adaptive_backtest_phase",
+            )
+            backtest_window = st.radio(
+                "Janela do backtest",
+                options=[99999, 365, 180, 90],
+                format_func=lambda value: "Historico completo" if int(value) >= 99999 else f"{int(value)} dias",
+                horizontal=True,
+                key="adaptive_backtest_window",
+            )
+            selected_market = st.selectbox(
+                "Mercado",
+                options=["SIN", "SE", "S", "NE", "N"],
+                format_func=lambda value: _ADAPTIVE_BACKTEST_MARKETS.get(value, {}).get("label", value),
+                key="adaptive_backtest_market",
+            )
+            backtest_row = _adaptive_backtest_latest_row(
+                backtest_summary_df,
+                phase_name=selected_phase,
+                market=selected_market,
+                window_days=backtest_window,
+                lead_bucket="all",
+            )
+            if backtest_row:
+                b1, b2, b3, b4 = st.columns(4)
+                b1.metric("MAE ponderado", f"R$ {float(backtest_row.get('weighted_mae', 0.0)):,.0f}")
+                b2.metric("MAPE ponderado", f"{float(backtest_row.get('weighted_mape_pct', 0.0)):.1f}%")
+                b3.metric("Bias ponderado", f"R$ {float(backtest_row.get('weighted_bias', 0.0)):+,.0f}")
+                b4.metric("Cobertura P10-P90", f"{float(backtest_row.get('band_coverage', 0.0)):.0%}")
+            else:
+                st.info("Nao ha observacoes suficientes para esta combinacao de fase, janela e mercado.")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.plotly_chart(
+                    _plot_adaptive_backtest_market_mae(
+                        backtest_summary_df,
+                        phase_name=selected_phase,
+                        window_days=backtest_window,
+                    ),
+                    use_container_width=True,
+                    key="adaptive_backtest_market_mae",
+                )
+            with c2:
+                st.plotly_chart(
+                    _plot_adaptive_backtest_lead_profile(
+                        backtest_summary_df,
+                        phase_name=selected_phase,
+                        market=selected_market,
+                        window_days=backtest_window,
+                    ),
+                    use_container_width=True,
+                    key="adaptive_backtest_lead_profile",
+                )
+
+            detail = backtest_summary_df[
+                (backtest_summary_df["phase_name"].astype(str) == str(selected_phase))
+                & (backtest_summary_df["market"].astype(str) == str(selected_market))
+                & (pd.to_numeric(backtest_summary_df["window_days"], errors="coerce") == int(backtest_window))
+            ].copy()
+            if not detail.empty:
+                detail["lead_bucket"] = detail["lead_bucket"].map(_adaptive_quality_lead_label)
+                detail = detail.rename(
+                    columns={
+                        "lead_bucket": "Horizonte",
+                        "n_obs": "Observacoes",
+                        "mae": "MAE",
+                        "rmse": "RMSE",
+                        "mape_pct": "MAPE (%)",
+                        "bias": "Bias",
+                        "weighted_mae": "MAE ponderado",
+                        "weighted_mape_pct": "MAPE ponderado (%)",
+                        "weighted_bias": "Bias ponderado",
+                        "band_coverage": "Cobertura P10-P90",
+                    }
+                )
+                st.dataframe(
+                    detail[
+                        [
+                            col
+                            for col in [
+                                "Horizonte",
+                                "Observacoes",
+                                "MAE",
+                                "RMSE",
+                                "MAPE (%)",
+                                "Bias",
+                                "MAE ponderado",
+                                "MAPE ponderado (%)",
+                                "Bias ponderado",
+                                "Cobertura P10-P90",
+                            ]
+                            if col in detail.columns
+                        ]
+                    ],
+                    use_container_width=True,
+                    height=260,
+                )
 
     with tabs[3]:
         export_cols = [
